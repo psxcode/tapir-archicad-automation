@@ -1510,6 +1510,17 @@ GS::Optional<GS::UniString> PrintViewCommand::GetInputParametersSchema () const
                 "type": "integer",
                 "description": "Print scale. The default is 100."
             },
+            "scaleToPaper": { "type": "boolean" },
+            "scaleFitToPage": { "type": "boolean" },
+            "allColorsToBlack": { "type": "boolean" },
+            "ditherOnPrinter": { "type": "boolean" },
+            "usePrinterRes": { "type": "boolean" },
+            "printGhost": { "type": "boolean" },
+            "newSheet": { "type": "boolean" },
+            "printAlignment": {
+                "type": "string",
+                "enum": ["leftTop", "middleTop", "rightTop", "leftMiddle", "center", "rightMiddle", "leftBottom", "middleBottom", "rightBottom"]
+            },
             "printArea": {
                 "type": "string",
                 "description": "The area to print. The default is 'currentView'.",
@@ -1553,6 +1564,28 @@ GS::ObjectState PrintViewCommand::Execute (const GS::ObjectState& parameters, GS
     if (!parameters.Get ("scale", pi.scale)) {
         pi.scale = 100;
     }
+    parameters.Get ("scaleToPaper", pi.scaleToPaper);
+    parameters.Get ("scaleFitToPage", pi.scaleFitToPage);
+    parameters.Get ("allColorsToBlack", pi.allColorsToBlack);
+    parameters.Get ("ditherOnPrinter", pi.ditherOnPrinter);
+    parameters.Get ("usePrinterRes", pi.usePrinterRes);
+    parameters.Get ("printGhost", pi.printGhost);
+    parameters.Get ("newSheet", pi.newSheet);
+
+    GS::UniString alignment;
+    if (parameters.Get ("printAlignment", alignment)) {
+        static const GS::UniString names[] = {
+            "leftTop", "middleTop", "rightTop", "leftMiddle", "center",
+            "rightMiddle", "leftBottom", "middleBottom", "rightBottom"
+        };
+        pi.printAlignment = APIAnc_MM;
+        for (UInt32 i = 0; i < sizeof (names) / sizeof (names[0]); ++i) {
+            if (alignment == names[i]) {
+                pi.printAlignment = static_cast<API_AnchorID> (i);
+                break;
+            }
+        }
+    }
 
     const GSErrCode err = ACAPI_ProjectOperation_Print (&pi);
     if (err != NoError) {
@@ -1560,6 +1593,370 @@ GS::ObjectState PrintViewCommand::Execute (const GS::ObjectState& parameters, GS
     }
 
     return CreateSuccessfulExecutionResult ();
+}
+
+RenderMarqueePdfProbeCommand::RenderMarqueePdfProbeCommand () :
+    CommandBase (CommonSchema::Used)
+{
+}
+
+RenderMarqueePrintCommand::RenderMarqueePrintCommand () :
+    CommandBase (CommonSchema::Used)
+{
+}
+
+GS::String RenderMarqueePrintCommand::GetName () const
+{
+    return "RenderMarqueePrint";
+}
+
+GS::Optional<GS::UniString> RenderMarqueePrintCommand::GetInputParametersSchema () const
+{
+    return R"({
+        "type": "object",
+        "properties": {
+            "storyIndex": { "type": "integer", "description": "Optional floor-plan storage story to render in the background." },
+            "xMin": { "type": "number" },
+            "yMin": { "type": "number" },
+            "xMax": { "type": "number" },
+            "yMax": { "type": "number" },
+            "multiStory": { "type": "boolean" },
+            "scale": { "type": "integer" },
+            "grid": { "type": "boolean" },
+            "fixText": { "type": "boolean" },
+            "allColorsToBlack": { "type": "boolean" },
+            "ditherOnPrinter": { "type": "boolean" },
+            "usePrinterRes": { "type": "boolean" },
+            "printGhost": { "type": "boolean" },
+            "newSheet": { "type": "boolean" },
+            "printAlignment": { "type": "string" }
+        },
+        "additionalProperties": false,
+        "required": ["xMin", "yMin", "xMax", "yMax"]
+    })";
+}
+
+GS::Optional<GS::UniString> RenderMarqueePrintCommand::GetResponseSchema () const
+{
+    return R"({
+        "type": "object",
+        "properties": {
+            "storyIndex": { "type": "integer" },
+            "backgroundDatabaseRestored": { "type": "boolean" },
+            "temporaryMarqueeCleared": { "type": "boolean" },
+            "focusChangedDuringRender": { "type": "boolean" }
+        },
+        "required": ["backgroundDatabaseRestored", "temporaryMarqueeCleared", "focusChangedDuringRender"]
+    })";
+}
+
+GS::ObjectState RenderMarqueePrintCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl& /*processControl*/) const
+{
+    Int32 requestedStory = -1;
+    double xMin = 0.0, yMin = 0.0, xMax = 0.0, yMax = 0.0;
+    bool multiStory = false;
+    if (!parameters.Get ("xMin", xMin) || !parameters.Get ("yMin", yMin) ||
+        !parameters.Get ("xMax", xMax) || !parameters.Get ("yMax", yMax)) {
+        return CreateFailedExecutionResult (APIERR_BADPARS, "xMin, yMin, xMax and yMax are required.");
+    }
+    parameters.Get ("storyIndex", requestedStory);
+    parameters.Get ("multiStory", multiStory);
+    if (xMin >= xMax || yMin >= yMax)
+        return CreateFailedExecutionResult (APIERR_BADPARS, "Marquee bounds must have positive area.");
+
+    API_SelectionInfo selectionBefore = {};
+    const GSErrCode selectionErr = ACAPI_Selection_Get (&selectionBefore, nullptr, false);
+    if (selectionErr == NoError && selectionBefore.typeID == API_SelElems) {
+        if (selectionBefore.marquee.coords != nullptr)
+            BMKillHandle (reinterpret_cast<GSHandle*> (&selectionBefore.marquee.coords));
+        return CreateFailedExecutionResult (APIERR_REFUSEDCMD, "Render refuses to change marquee while an element selection is active.");
+    }
+    const bool hadOriginalMarquee = selectionErr == NoError &&
+        (selectionBefore.typeID == API_MarqueePoly || selectionBefore.typeID == API_MarqueeHorBox || selectionBefore.typeID == API_MarqueeRotBox);
+
+    API_DatabaseInfo startingDatabase = {};
+    GSErrCode operationErr = ACAPI_Database_GetCurrentDatabase (&startingDatabase);
+    if (operationErr != NoError) {
+        if (selectionBefore.marquee.coords != nullptr)
+            BMKillHandle (reinterpret_cast<GSHandle*> (&selectionBefore.marquee.coords));
+        return CreateFailedExecutionResult (operationErr, "Failed to read the starting database.");
+    }
+
+    bool databaseChanged = false;
+    bool marqueeSet = false;
+    GS::UniString failureMessage;
+    if (requestedStory >= 0) {
+        API_DatabaseInfo targetDatabase = {};
+        targetDatabase.typeID = APIWind_FloorPlanID;
+        targetDatabase.index = requestedStory;
+        operationErr = ACAPI_Window_GetDatabaseInfo (&targetDatabase);
+        if (operationErr == NoError)
+            operationErr = ACAPI_Database_ChangeCurrentDatabase (&targetDatabase);
+        if (operationErr != NoError)
+            failureMessage = "Failed to change the current database in the background.";
+        else
+            databaseChanged = true;
+    }
+
+    API_SelectionInfo temporaryMarquee = {};
+    temporaryMarquee.typeID = API_MarqueeHorBox;
+    temporaryMarquee.multiStory = multiStory;
+    temporaryMarquee.marquee.box.xMin = xMin;
+    temporaryMarquee.marquee.box.yMin = yMin;
+    temporaryMarquee.marquee.box.xMax = xMax;
+    temporaryMarquee.marquee.box.yMax = yMax;
+    temporaryMarquee.marquee.boxRotAngle = 0.0;
+    if (operationErr == NoError) {
+        operationErr = ACAPI_Selection_SetMarquee (&temporaryMarquee);
+        if (operationErr == NoError)
+            marqueeSet = true;
+        else
+            failureMessage = "Failed to set the temporary marquee.";
+    }
+
+    if (operationErr == NoError) {
+        API_PrintPars printPars = {};
+        printPars.printArea = PrintArea_Marquee;
+        printPars.scale = 100;
+        printPars.grid = false;
+        printPars.fixText = false;
+        printPars.scaleToPaper = true;
+        printPars.scaleFitToPage = true;
+        printPars.printAlignment = APIAnc_MM;
+        parameters.Get ("scale", printPars.scale);
+        parameters.Get ("grid", printPars.grid);
+        parameters.Get ("fixText", printPars.fixText);
+        parameters.Get ("allColorsToBlack", printPars.allColorsToBlack);
+        parameters.Get ("ditherOnPrinter", printPars.ditherOnPrinter);
+        parameters.Get ("usePrinterRes", printPars.usePrinterRes);
+        parameters.Get ("printGhost", printPars.printGhost);
+        parameters.Get ("newSheet", printPars.newSheet);
+        GS::UniString alignment;
+        if (parameters.Get ("printAlignment", alignment)) {
+            static const GS::UniString names[] = {
+                "leftTop", "middleTop", "rightTop", "leftMiddle", "center",
+                "rightMiddle", "leftBottom", "middleBottom", "rightBottom"
+            };
+            for (UInt32 i = 0; i < sizeof (names) / sizeof (names[0]); ++i) {
+                if (alignment == names[i]) {
+                    printPars.printAlignment = static_cast<API_AnchorID> (i);
+                    break;
+                }
+            }
+        }
+        operationErr = ACAPI_ProjectOperation_Print (&printPars);
+        if (operationErr != NoError)
+            failureMessage = "Failed to print the temporary marquee.";
+    }
+
+    const GSErrCode restoreDatabaseErr = databaseChanged
+        ? ACAPI_Database_ChangeCurrentDatabase (&startingDatabase)
+        : NoError;
+    if (operationErr == NoError && restoreDatabaseErr != NoError) {
+        operationErr = restoreDatabaseErr;
+        failureMessage = "Print succeeded, but the starting background database could not be restored.";
+    }
+
+    bool focusChangedDuringRender = false;
+    if (marqueeSet && restoreDatabaseErr == NoError) {
+        API_SelectionInfo currentSelection = {};
+        const GSErrCode currentErr = ACAPI_Selection_Get (&currentSelection, nullptr, false);
+        if (currentErr == NoError && (currentSelection.typeID == API_MarqueeHorBox || currentSelection.typeID == API_MarqueeRotBox)) {
+            focusChangedDuringRender = currentSelection.marquee.box.xMin != xMin ||
+                currentSelection.marquee.box.yMin != yMin || currentSelection.marquee.box.xMax != xMax ||
+                currentSelection.marquee.box.yMax != yMax;
+        }
+        if (currentSelection.marquee.coords != nullptr)
+            BMKillHandle (reinterpret_cast<GSHandle*> (&currentSelection.marquee.coords));
+        if (!focusChangedDuringRender) {
+            API_SelectionInfo marqueeAfter = {};
+            if (hadOriginalMarquee)
+                marqueeAfter = selectionBefore;
+            else
+                marqueeAfter.typeID = API_SelEmpty;
+            const GSErrCode marqueeRestoreErr = ACAPI_Selection_SetMarquee (&marqueeAfter);
+            if (operationErr == NoError && marqueeRestoreErr != NoError) {
+                operationErr = marqueeRestoreErr;
+                failureMessage = "Print succeeded, but the original marquee could not be restored.";
+            }
+        }
+    }
+    if (selectionBefore.marquee.coords != nullptr)
+        BMKillHandle (reinterpret_cast<GSHandle*> (&selectionBefore.marquee.coords));
+    if (operationErr != NoError)
+        return CreateFailedExecutionResult (operationErr, failureMessage);
+
+    GS::ObjectState response;
+    if (requestedStory >= 0)
+        response.Add ("storyIndex", requestedStory);
+    response.Add ("backgroundDatabaseRestored", true);
+    response.Add ("temporaryMarqueeCleared", !focusChangedDuringRender);
+    response.Add ("focusChangedDuringRender", focusChangedDuringRender);
+    return response;
+}
+
+GS::String RenderMarqueePdfProbeCommand::GetName () const
+{
+    return "RenderMarqueePdfProbe";
+}
+
+GS::Optional<GS::UniString> RenderMarqueePdfProbeCommand::GetInputParametersSchema () const
+{
+    return R"({
+        "type": "object",
+        "properties": {
+            "storyIndex": { "type": "integer", "description": "Floor-plan storage story to render in the background." },
+            "xMin": { "type": "number" },
+            "yMin": { "type": "number" },
+            "xMax": { "type": "number" },
+            "yMax": { "type": "number" },
+            "pdfPath": { "type": "string", "description": "Absolute output path for the temporary PDF." },
+            "pageWidthMm": { "type": "number", "minimum": 1 },
+            "pageHeightMm": { "type": "number", "minimum": 1 }
+        },
+        "additionalProperties": false,
+        "required": ["storyIndex", "xMin", "yMin", "xMax", "yMax", "pdfPath"]
+    })";
+}
+
+GS::Optional<GS::UniString> RenderMarqueePdfProbeCommand::GetResponseSchema () const
+{
+    return R"({
+        "type": "object",
+        "properties": {
+            "pdfPath": { "type": "string" },
+            "storyIndex": { "type": "integer" },
+            "backgroundDatabaseRestored": { "type": "boolean" },
+            "temporaryMarqueeCleared": { "type": "boolean" }
+        },
+        "required": ["pdfPath", "storyIndex", "backgroundDatabaseRestored", "temporaryMarqueeCleared"]
+    })";
+}
+
+GS::ObjectState RenderMarqueePdfProbeCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl& /*processControl*/) const
+{
+    Int32 storyIndex = 0;
+    double xMin = 0.0, yMin = 0.0, xMax = 0.0, yMax = 0.0;
+    GS::UniString pdfPath;
+    if (!parameters.Get ("storyIndex", storyIndex) || !parameters.Get ("xMin", xMin) || !parameters.Get ("yMin", yMin) ||
+        !parameters.Get ("xMax", xMax) || !parameters.Get ("yMax", yMax) || !parameters.Get ("pdfPath", pdfPath)) {
+        return CreateFailedExecutionResult (APIERR_BADPARS, "storyIndex, bounds and pdfPath are required.");
+    }
+    if (xMin >= xMax || yMin >= yMax) {
+        return CreateFailedExecutionResult (APIERR_BADPARS, "Marquee bounds must have positive area.");
+    }
+
+    // A selection can hide an existing marquee from ACAPI_Selection_Get.  This first
+    // proof is intentionally conservative: do not disturb a user's element selection.
+    // Retain an exposed marquee's coordinate handle until cleanup so a polygonal or
+    // rotated user marquee can be restored exactly.
+    API_SelectionInfo selectionBefore = {};
+    const GSErrCode selectionErr = ACAPI_Selection_Get (&selectionBefore, nullptr, false);
+    if (selectionErr == NoError && selectionBefore.typeID == API_SelElems) {
+        if (selectionBefore.marquee.coords != nullptr)
+            BMKillHandle (reinterpret_cast<GSHandle*> (&selectionBefore.marquee.coords));
+        return CreateFailedExecutionResult (APIERR_REFUSEDCMD, "Render probe refuses to change marquee while an element selection is active.");
+    }
+    const bool hadOriginalMarquee = selectionErr == NoError &&
+        (selectionBefore.typeID == API_MarqueePoly || selectionBefore.typeID == API_MarqueeHorBox || selectionBefore.typeID == API_MarqueeRotBox);
+
+    API_DatabaseInfo startingDatabase = {};
+    GSErrCode err = ACAPI_Database_GetCurrentDatabase (&startingDatabase);
+    if (err != NoError) {
+        if (selectionBefore.marquee.coords != nullptr)
+            BMKillHandle (reinterpret_cast<GSHandle*> (&selectionBefore.marquee.coords));
+        return CreateFailedExecutionResult (err, "Failed to read the starting database.");
+    }
+
+    API_DatabaseInfo targetDatabase = {};
+    targetDatabase.typeID = APIWind_FloorPlanID;
+    targetDatabase.index = storyIndex;
+    err = ACAPI_Window_GetDatabaseInfo (&targetDatabase);
+    if (err != NoError) {
+        if (selectionBefore.marquee.coords != nullptr)
+            BMKillHandle (reinterpret_cast<GSHandle*> (&selectionBefore.marquee.coords));
+        return CreateFailedExecutionResult (err, "Failed to resolve the requested floor-plan story.");
+    }
+
+    bool databaseChanged = false;
+    bool marqueeSet = false;
+    GSErrCode operationErr = NoError;
+    GS::UniString failureMessage;
+
+    err = ACAPI_Database_ChangeCurrentDatabase (&targetDatabase);
+    if (err != NoError) {
+        if (selectionBefore.marquee.coords != nullptr)
+            BMKillHandle (reinterpret_cast<GSHandle*> (&selectionBefore.marquee.coords));
+        return CreateFailedExecutionResult (err, "Failed to change the current database in the background.");
+    }
+    databaseChanged = true;
+
+    API_SelectionInfo temporaryMarquee = {};
+    temporaryMarquee.typeID = API_MarqueeHorBox;
+    temporaryMarquee.multiStory = false;
+    temporaryMarquee.marquee.box.xMin = xMin;
+    temporaryMarquee.marquee.box.yMin = yMin;
+    temporaryMarquee.marquee.box.xMax = xMax;
+    temporaryMarquee.marquee.box.yMax = yMax;
+    temporaryMarquee.marquee.boxRotAngle = 0.0;
+    operationErr = ACAPI_Selection_SetMarquee (&temporaryMarquee);
+    if (operationErr == NoError)
+        marqueeSet = true;
+    else
+        failureMessage = "Failed to set the temporary marquee.";
+
+    if (operationErr == NoError) {
+        float pageWidthMm = 420.0f;
+        float pageHeightMm = 297.0f;
+        parameters.Get ("pageWidthMm", pageWidthMm);
+        parameters.Get ("pageHeightMm", pageHeightMm);
+        if (pageWidthMm <= 0.0f || pageHeightMm <= 0.0f) {
+            operationErr = APIERR_BADPARS;
+            failureMessage = "PDF page dimensions must be positive.";
+        } else {
+            IO::Location pdfLocation (pdfPath);
+            API_FileSavePars savePars = {};
+            savePars.fileTypeID = APIFType_PdfFile;
+            savePars.file = &pdfLocation;
+            API_SavePars_Pdf pdfPars = {};
+            pdfPars.sizeX = pageWidthMm;
+            pdfPars.sizeY = pageHeightMm;
+            operationErr = ACAPI_ProjectOperation_Save (&savePars, &pdfPars);
+            if (operationErr != NoError)
+                failureMessage = "Failed to export the temporary marquee PDF.";
+        }
+    }
+
+    // Restore the background database first, then restore the exact original marquee
+    // (or clear ours when there was none). Neither operation changes the front window.
+    const GSErrCode restoreErr = databaseChanged ? ACAPI_Database_ChangeCurrentDatabase (&startingDatabase) : NoError;
+    if (operationErr == NoError && restoreErr != NoError) {
+        operationErr = restoreErr;
+        failureMessage = "PDF was exported, but the starting background database could not be restored.";
+    }
+    if (restoreErr == NoError && marqueeSet) {
+        API_SelectionInfo marqueeAfter = {};
+        if (hadOriginalMarquee)
+            marqueeAfter = selectionBefore;
+        else
+            marqueeAfter.typeID = API_SelEmpty;
+        const GSErrCode marqueeRestoreErr = ACAPI_Selection_SetMarquee (&marqueeAfter);
+        if (operationErr == NoError && marqueeRestoreErr != NoError) {
+            operationErr = marqueeRestoreErr;
+            failureMessage = "PDF was exported, but the original marquee could not be restored.";
+        }
+    }
+    if (selectionBefore.marquee.coords != nullptr)
+        BMKillHandle (reinterpret_cast<GSHandle*> (&selectionBefore.marquee.coords));
+    if (operationErr != NoError)
+        return CreateFailedExecutionResult (operationErr, failureMessage);
+
+    return GS::ObjectState (
+        "pdfPath", pdfPath,
+        "storyIndex", storyIndex,
+        "backgroundDatabaseRestored", true,
+        "temporaryMarqueeCleared", true
+    );
 }
 
 RebuildViewCommand::RebuildViewCommand () :

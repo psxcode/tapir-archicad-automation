@@ -153,6 +153,30 @@ public:
     virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
 };
 
+// Internal capability probe for the MCP-native rendering pipeline.  It deliberately
+// switches only Archicad's background database; it never calls ChangeWindow.
+class RenderMarqueePdfProbeCommand : public CommandBase
+{
+public:
+    RenderMarqueePdfProbeCommand ();
+    virtual GS::String GetName () const override;
+    virtual GS::Optional<GS::UniString> GetInputParametersSchema () const override;
+    virtual GS::Optional<GS::UniString> GetResponseSchema () const override;
+    virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
+};
+
+// Product render command: temporarily changes only the current database and
+// marquee, prints through Archicad's native print engine, then restores both.
+class RenderMarqueePrintCommand : public CommandBase
+{
+public:
+    RenderMarqueePrintCommand ();
+    virtual GS::String GetName () const override;
+    virtual GS::Optional<GS::UniString> GetInputParametersSchema () const override;
+    virtual GS::Optional<GS::UniString> GetResponseSchema () const override;
+    virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
+};
+
 class RebuildViewCommand : public CommandBase
 {
 public:
