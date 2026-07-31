@@ -13,6 +13,9 @@
 #endif
 
 #include <algorithm>
+#include <cfloat>
+#include <cmath>
+#include <optional>
 
 static API_ElemFilterFlags ConvertFilterStringToFlag (const GS::UniString& filter)
 {
@@ -67,6 +70,121 @@ static GS::UniString StructureTypeToString (API_ModelElemStructureType structure
         default:
             return "Basic";
     }
+}
+
+static GS::UniString HatchTypeToString (API_HatchSubType hatchType)
+{
+    switch (hatchType) {
+        case API_FillHatch:
+            return "Fill";
+        case API_BuildingMaterialHatch:
+            return "BuildingMaterial";
+        default:
+            return "Fill";
+    }
+}
+
+static GS::UniString HatchDeterminationToString (short determination)
+{
+    switch (determination) {
+        case APIHatch_CutFills:
+            return "Cut";
+        case APIHatch_CoverFills:
+            return "Cover";
+        case APIHatch_DraftingFills:
+        default:
+            return "Drafting";
+    }
+}
+
+static GS::UniString OpeningBasePolygonTypeToString (API_OpeningBasePolygonTypeTypeID type)
+{
+    switch (type) {
+        case API_OpeningBasePolygonCircular:
+            return "Circular";
+        case API_OpeningBasePolygonCustom:
+            return "Custom";
+        case API_OpeningBasePolygonRectangular:
+        default:
+            return "Rectangular";
+    }
+}
+
+static GS::UniString OpeningConstraintToString (API_OpeningConstraintTypeID constraint)
+{
+    switch (constraint) {
+        case API_OpeningForcedHorizontal:
+            return "ForcedHorizontal";
+        case API_OpeningAligned:
+            return "Aligned";
+        case API_OpeningFree:
+            return "Free";
+        case API_OpeningForcedVertical:
+        default:
+            return "ForcedVertical";
+    }
+}
+
+static GS::UniString OpeningLimitTypeToString (API_OpeningLimitTypeTypeID limitType)
+{
+    switch (limitType) {
+        case API_OpeningLimitFinite:
+            return "Finite";
+        case API_OpeningLimitHalfInfinite:
+            return "HalfInfinite";
+        case API_OpeningLimitInfinite:
+        default:
+            return "Infinite";
+    }
+}
+
+static GS::UniString ArrowTypeToString (API_ArrowID arrowType)
+{
+    switch (arrowType) {
+        case APIArr_EmptyCirc:       return "EmptyCirc";
+        case APIArr_CrossCircIs:     return "CrossCircIs";
+        case APIArr_FullCirc:        return "FullCirc";
+        case APIArr_SlashLine15:     return "SlashLine15";
+        case APIArr_OpenArrow15:     return "OpenArrow15";
+        case APIArr_ClosArrow15:     return "ClosArrow15";
+        case APIArr_FullArrow15:     return "FullArrow15";
+        case APIArr_SlashLine30:     return "SlashLine30";
+        case APIArr_OpenArrow30:     return "OpenArrow30";
+        case APIArr_ClosArrow30:     return "ClosArrow30";
+        case APIArr_FullArrow30:     return "FullArrow30";
+        case APIArr_SlashLine45:     return "SlashLine45";
+        case APIArr_OpenArrow45:     return "OpenArrow45";
+        case APIArr_ClosArrow45:     return "ClosArrow45";
+        case APIArr_FullArrow45:     return "FullArrow45";
+        case APIArr_SlashLine60:     return "SlashLine60";
+        case APIArr_OpenArrow60:     return "OpenArrow60";
+        case APIArr_ClosArrow60:     return "ClosArrow60";
+        case APIArr_FullArrow60:     return "FullArrow60";
+        case APIArr_SlashLine90:     return "SlashLine90";
+        case APIArr_PepitaCirc:      return "PepitaCirc";
+        case APIArr_BandArrow:       return "BandArrow";
+        case APIArr_HalfArrowCcw15:  return "HalfArrowCcw15";
+        case APIArr_HalfArrowCw15:   return "HalfArrowCw15";
+        case APIArr_HalfArrowCcw30:  return "HalfArrowCcw30";
+        case APIArr_HalfArrowCw30:   return "HalfArrowCw30";
+        case APIArr_HalfArrowCcw45:  return "HalfArrowCcw45";
+        case APIArr_HalfArrowCw45:   return "HalfArrowCw45";
+        case APIArr_HalfArrowCcw60:  return "HalfArrowCcw60";
+        case APIArr_HalfArrowCw60:   return "HalfArrowCw60";
+        case APIArr_SlashLine75:     return "SlashLine75";
+        default:                     return "EmptyCirc";
+    }
+}
+
+static GS::ObjectState CreateArrowDataObjectState (const API_ArrowData& arrowData)
+{
+    return GS::ObjectState (
+        "arrowType", ArrowTypeToString (arrowData.arrowType),
+        "begArrow", arrowData.begArrow,
+        "endArrow", arrowData.endArrow,
+        "arrowPen", static_cast<Int32> (arrowData.arrowPen),
+        "arrowSize", arrowData.arrowSize
+    );
 }
 
 template <typename ListProxyType>
@@ -268,6 +386,10 @@ GS::Optional<GS::UniString> GetDetailsOfElementsCommand::GetResponseSchema () co
                         "id": {
                             "type": "string"
                         },
+                        "elementId": {
+                            "$ref": "#/ElementId",
+                            "description": "Stable Archicad GUID of the returned element."
+                        },
                         "floorIndex": {
                             "type": "number"
                         },
@@ -276,6 +398,10 @@ GS::Optional<GS::UniString> GetDetailsOfElementsCommand::GetResponseSchema () co
                         },
                         "drawIndex": {
                             "type": "number"
+                        },
+                        "bounds": {
+                            "$ref": "#/Bounds2D",
+                            "description": "Axis-aligned element bounds in Archicad model coordinates. Absent when Archicad cannot calculate bounds for the element in the current database."
                         },
                         "details": {
                             "$ref": "#/TypeSpecificDetails"
@@ -299,6 +425,7 @@ GS::Optional<GS::UniString> GetDetailsOfElementsCommand::GetResponseSchema () co
                     "additionalProperties": false,
                     "required": [
                         "type",
+                        "elementId",
                         "id",
                         "floorIndex",
                         "layerIndex",
@@ -402,6 +529,7 @@ static void AddFloorPlanPolygonsIfAvailable (const API_Guid& guid, GS::ObjectSta
 
 static void AddLibPartBasedElementDetails (GS::ObjectState& os, const Int32 libInd, const API_Guid& owner, API_ElemTypeID ownerType = API_ZombieElemID)
 {
+    os.Add ("libPartIndex", libInd);
     API_LibPart	lp = {};
     lp.index = libInd;
     ACAPI_LibraryPart_Get (&lp);
@@ -482,6 +610,26 @@ static const API_CWFrameType* FindNextFrameOfPanel (std::vector<const API_CWFram
 
 using CWSegmentGridCellID = std::pair<UInt32, API_GridElemID>;
 
+// Do not emit CreateErrorResponse / ErrorItem here: the response schema for
+// detailsOfElements items is the success detail object only. Top-level ErrorItem
+// previously failed validation; allowing it via oneOf crashed Archicad's schema
+// validator on large marquee batches (E-026). Keep positional slots with a
+// schema-valid stub whose TypeSpecificDetails carries a string error instead.
+static GS::ObjectState CreateUnavailableElementDetails (const GS::ObjectState* elementId, const GS::UniString& message)
+{
+    GS::ObjectState detailsOfElement;
+    detailsOfElement.Add ("type", "Object");
+    detailsOfElement.Add ("elementId", elementId != nullptr
+        ? *elementId
+        : CreateGuidObjectState (APINULLGuid));
+    detailsOfElement.Add ("id", GS::EmptyUniString);
+    detailsOfElement.Add ("floorIndex", static_cast<Int32> (0));
+    detailsOfElement.Add ("layerIndex", static_cast<Int32> (0));
+    detailsOfElement.Add ("drawIndex", static_cast<short> (0));
+    detailsOfElement.Add ("details", GS::ObjectState ("error", message));
+    return detailsOfElement;
+}
+
 GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl& /*processControl*/) const
 {
     GS::Array<GS::ObjectState> elements;
@@ -495,7 +643,7 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
     for (const GS::ObjectState& element : elements) {
         const GS::ObjectState* elementId = element.Get ("elementId");
         if (elementId == nullptr) {
-            detailsOfElements (CreateErrorResponse (APIERR_BADPARS, "elementId is missing"));
+            detailsOfElements (CreateUnavailableElementDetails (nullptr, "elementId is missing"));
             continue;
         }
 
@@ -504,7 +652,7 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
         GSErrCode err = ACAPI_Element_Get (&elem);
 
         if (err != NoError) {
-            detailsOfElements (CreateErrorResponse (err, "Failed to get the details of element"));
+            detailsOfElements (CreateUnavailableElementDetails (elementId, "Failed to get the details of element"));
             continue;
         }
 
@@ -512,6 +660,7 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
         const API_ElemTypeID typeID = GetElemTypeId (elem.header);
 
         detailsOfElement.Add ("type", GetElementTypeNonLocalizedName (typeID));
+        detailsOfElement.Add ("elementId", CreateGuidObjectState (elem.header.guid));
         detailsOfElement.Add ("floorIndex", elem.header.floorInd);
         detailsOfElement.Add ("layerIndex", GetAttributeIndex (elem.header.layer));
         detailsOfElement.Add ("drawIndex", static_cast<short> (elem.header.drwIndex));
@@ -522,6 +671,19 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
             ACAPI_Element_GetMemo (elem.header.guid, &memo, APIMemoMask_ElemInfoString);
 
             detailsOfElement.Add ("id", memo.elemInfoString != nullptr ? *memo.elemInfoString : GS::EmptyUniString);
+        }
+
+        {
+            API_Elem_Head elemHead = {};
+            elemHead.guid = elem.header.guid;
+            API_Box3D bounds = {};
+            if (ACAPI_Element_CalcBounds (&elemHead, &bounds) == NoError) {
+                detailsOfElement.Add ("bounds", GS::ObjectState (
+                    "xMin", bounds.xMin,
+                    "yMin", bounds.yMin,
+                    "xMax", bounds.xMax,
+                    "yMax", bounds.yMax));
+            }
         }
 
         GS::ObjectState typeSpecificDetails;
@@ -595,6 +757,38 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                 AddPolygonWithHolesFromMemoCoords (elem.header.guid, typeSpecificDetails, "polygonOutline", "polygonArcs", "holes", "polygonOutline", "polygonArcs");
                 break;
 
+            case API_HatchID:
+                // Hand-drafted sheets often use Hatch as their only semantic
+                // area primitive (unit diagrams, coloured zones, legends).
+                // Keep its geometry and effective display attributes explicit.
+                typeSpecificDetails.Add ("hatchType", HatchTypeToString (elem.hatch.hatchType));
+                typeSpecificDetails.Add ("determination", HatchDeterminationToString (elem.hatch.determination));
+                typeSpecificDetails.Add ("contourPen", (Int32) elem.hatch.contPen.GetEffectiveColorIndex ());
+                typeSpecificDetails.Add ("fillPen", (Int32) elem.hatch.fillPen.GetEffectiveColorIndex ());
+                typeSpecificDetails.Add ("fillBackgroundPen", (Int32) elem.hatch.fillBGPen);
+                typeSpecificDetails.Add ("fillAttributeIndex", GetAttributeIndex (elem.hatch.fillInd));
+                typeSpecificDetails.Add ("buildingMaterialIndex", GetAttributeIndex (elem.hatch.buildingMaterial));
+                typeSpecificDetails.Add ("hasForegroundRGB", (elem.hatch.hatchFlags & APIHatch_HasFgRGBColor) != 0);
+                typeSpecificDetails.Add ("hasBackgroundRGB", (elem.hatch.hatchFlags & APIHatch_HasBkgRGBColor) != 0);
+                AddPolygonWithHolesFromMemoCoords (elem.header.guid, typeSpecificDetails, "polygonOutline", "polygonArcs", "holes", "polygonOutline", "polygonArcs");
+                break;
+
+            case API_OpeningID:
+                // Generic Opening is the native void used for late shaft and
+                // service penetrations. It needs a host and explicit geometry
+                // before an agent can audit downstream drawing impact.
+                typeSpecificDetails.Add ("ownerElementId", CreateGuidObjectState (elem.opening.owner));
+                typeSpecificDetails.Add ("basePolygonType", OpeningBasePolygonTypeToString (elem.opening.extrusionGeometryData.parameters.basePolygonType));
+                typeSpecificDetails.Add ("width", elem.opening.extrusionGeometryData.parameters.width);
+                typeSpecificDetails.Add ("height", elem.opening.extrusionGeometryData.parameters.height);
+                typeSpecificDetails.Add ("constraint", OpeningConstraintToString (elem.opening.extrusionGeometryData.parameters.constraint));
+                typeSpecificDetails.Add ("anchorAltitude", elem.opening.extrusionGeometryData.parameters.anchorAltitude);
+                typeSpecificDetails.Add ("limitType", OpeningLimitTypeToString (elem.opening.extrusionGeometryData.parameters.limitType));
+                typeSpecificDetails.Add ("extrusionStartOffset", elem.opening.extrusionGeometryData.parameters.extrusionStartOffset);
+                typeSpecificDetails.Add ("finiteBodyLength", elem.opening.extrusionGeometryData.parameters.finiteBodyLength);
+                typeSpecificDetails.Add ("linked", elem.opening.extrusionGeometryData.parameters.linkedStatus == API_OpeningLinked);
+                break;
+
             case API_ColumnID:
                 typeSpecificDetails.Add ("origin", Create2DCoordinateObjectState (elem.column.origoPos));
                 typeSpecificDetails.Add ("zCoordinate", GetZPos (elem.header.floorInd, elem.column.bottomOffset, stories));
@@ -608,6 +802,19 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                 typeSpecificDetails.Add ("width", elem.window.openingBase.width);
                 typeSpecificDetails.Add ("height", elem.window.openingBase.height);
                 typeSpecificDetails.Add ("sillHeight", elem.window.lower);
+                // `objLoc` is longitudinal placement on the wall. Reveal
+                // depth is separate and determines the interior/exterior
+                // jamb areas needed for finishes and quantity checks.
+                typeSpecificDetails.Add ("hasReveal", elem.window.reveal);
+                typeSpecificDetails.Add ("revealDepthReference", elem.window.revealDepthLocation == APIWDRevealDepth_Core ? "Core" : "Side");
+                typeSpecificDetails.Add ("revealDepthOffset", elem.window.revealDepthOffset);
+                typeSpecificDetails.Add ("revealDepthFromSide", elem.window.revealDepthFromSide);
+                typeSpecificDetails.Add ("jambDepthHead", elem.window.jambDepthHead);
+                typeSpecificDetails.Add ("jambDepthSill", elem.window.jambDepthSill);
+                typeSpecificDetails.Add ("jambDepthLeft", elem.window.jambDepth);
+                typeSpecificDetails.Add ("jambDepthRight", elem.window.jambDepth2);
+                typeSpecificDetails.Add ("openingStartPoint", Create2DCoordinateObjectState (elem.window.startPoint));
+                typeSpecificDetails.Add ("openingDirection", Create2DCoordinateObjectState (elem.window.dirVector));
                 typeSpecificDetails.Add ("centerOffset", elem.window.objLoc);
                 typeSpecificDetails.Add ("reflected", elem.window.openingBase.reflected);
                 typeSpecificDetails.Add ("refSide", elem.window.openingBase.refSide);
@@ -679,6 +886,7 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
             case API_PolyLineID: {
                 AddPolygonFromMemoCoords (elem.header.guid, typeSpecificDetails, "coordinates", "arcs");
                 typeSpecificDetails.Add ("zCoordinate", GetZPos (elem.header.floorInd, 0, stories));
+                typeSpecificDetails.Add ("arrowData", CreateArrowDataObjectState (elem.polyLine.arrowData));
             } break;
 
             case API_CurtainWallID: {
@@ -843,6 +1051,11 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
             } break;
 
             case API_DrawingID: {
+                // `drawingGuid` is the Navigator item ID of the drawing's
+                // source. Keep this native relation so the MCP can resolve a
+                // placed drawing through Navigator instead of guessing from
+                // its rendered title.
+                typeSpecificDetails.Add ("sourceNavigatorItemId", CreateGuidObjectState (elem.drawing.drawingGuid));
                 typeSpecificDetails.Add ("pos",           Create2DCoordinateObjectState (elem.drawing.pos));
                 typeSpecificDetails.Add ("angle",         elem.drawing.angle);
                 typeSpecificDetails.Add ("ratio",         elem.drawing.ratio);
@@ -856,6 +1069,56 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                     "yMax", elem.drawing.bounds.yMax));
                 if (elem.drawing.isCutWithFrame) {
                     AddPolygonFromMemoCoords (elem.header.guid, typeSpecificDetails, "clipPolygon");
+                }
+            } break;
+
+            case API_LineID: {
+                typeSpecificDetails.Add ("begCoordinate", Create2DCoordinateObjectState (elem.line.begC));
+                typeSpecificDetails.Add ("endCoordinate", Create2DCoordinateObjectState (elem.line.endC));
+                typeSpecificDetails.Add ("lineTypeIndex", GetAttributeIndex (elem.line.ltypeInd));
+                typeSpecificDetails.Add ("linePen", static_cast<Int32> (elem.line.linePen.penIndex));
+                typeSpecificDetails.Add ("roomSeparator", elem.line.roomSeparator);
+                typeSpecificDetails.Add ("arrowData", CreateArrowDataObjectState (elem.line.arrowData));
+            } break;
+
+            case API_ArcID:
+            case API_CircleID: {
+                typeSpecificDetails.Add ("origin", Create2DCoordinateObjectState (elem.arc.origC));
+                typeSpecificDetails.Add ("radius", elem.arc.r);
+                typeSpecificDetails.Add ("axisAngle", elem.arc.angle);
+                typeSpecificDetails.Add ("ratio", elem.arc.ratio);
+                typeSpecificDetails.Add ("beginAngle", elem.arc.begAng);
+                typeSpecificDetails.Add ("endAngle", elem.arc.endAng);
+                typeSpecificDetails.Add ("reflected", elem.arc.reflected);
+                typeSpecificDetails.Add ("whole", elem.arc.whole);
+                typeSpecificDetails.Add ("lineTypeIndex", GetAttributeIndex (elem.arc.ltypeInd));
+                typeSpecificDetails.Add ("linePen", static_cast<Int32> (elem.arc.linePen.penIndex));
+                typeSpecificDetails.Add ("roomSeparator", elem.arc.roomSeparator);
+                typeSpecificDetails.Add ("arrowData", CreateArrowDataObjectState (elem.arc.arrowData));
+            } break;
+
+            case API_TextID: {
+                typeSpecificDetails.Add ("anchorCoordinate", Create2DCoordinateObjectState (elem.text.loc));
+                typeSpecificDetails.Add ("angle", elem.text.angle);
+                typeSpecificDetails.Add ("width", elem.text.width);
+                typeSpecificDetails.Add ("height", elem.text.height);
+                typeSpecificDetails.Add ("size", elem.text.size);
+                typeSpecificDetails.Add ("fontIndex", static_cast<Int32> (elem.text.font));
+                typeSpecificDetails.Add ("anchor", static_cast<Int32> (elem.text.anchor));
+                typeSpecificDetails.Add ("justification", static_cast<Int32> (elem.text.just));
+                typeSpecificDetails.Add ("fixedAngle", elem.text.fixedAngle);
+                typeSpecificDetails.Add ("fixedSize", elem.text.fixedSize);
+                typeSpecificDetails.Add ("lineCount", elem.text.nLine);
+                typeSpecificDetails.Add ("pen", static_cast<Int32> (elem.text.pen));
+
+                API_ElementMemo memo = {};
+                const GS::OnExit guard ([&memo] () { ACAPI_DisposeElemMemoHdls (&memo); });
+                if (ACAPI_Element_GetMemo (elem.header.guid, &memo, APIMemoMask_TextContent) == NoError && memo.textContent != nullptr) {
+#ifdef ServerMainVers_2800
+                    typeSpecificDetails.Add ("content", *memo.textContent);
+#else
+                    typeSpecificDetails.Add ("content", GS::UniString (reinterpret_cast<GS::uchar_t*> (*memo.textContent)));
+#endif
                 }
             } break;
 
@@ -1397,18 +1660,211 @@ GS::Optional<GS::UniString> GetSelectedElementsCommand::GetResponseSchema () con
         "properties": {
             "elements": {
                 "$ref": "#/Elements"
+            },
+            "focusElements": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "elementId": { "$ref": "#/ElementId" },
+                        "elementType": { "type": "string" },
+                        "bounds": {
+                            "type": "object",
+                            "properties": {
+                                "xMin": { "type": "number" }, "yMin": { "type": "number" },
+                                "xMax": { "type": "number" }, "yMax": { "type": "number" }
+                            },
+                            "additionalProperties": false,
+                            "required": ["xMin", "yMin", "xMax", "yMax"]
+                        }
+                    },
+                    "additionalProperties": false,
+                    "required": ["elementId", "elementType"]
+                }
+            },
+            "selectionType": {
+                "type": "string",
+                "enum": ["empty", "elements", "marquee_polygon", "marquee_horizontal_box", "marquee_rotated_box"]
+            },
+            "elementRelationship": {
+                "type": "string",
+                "enum": ["none", "individually_selected", "inside_or_intersecting_marquee"]
+            },
+            "selectedElementCount": { "type": "integer" },
+            "editableElementCount": { "type": "integer" },
+            "marquee": {
+                "type": "object",
+                "properties": {
+                    "shape": { "type": "string" },
+                    "source": { "type": "string", "enum": ["live_query", "event_tracker"] },
+                    "multiStory": { "type": "boolean" },
+                    "rotation": { "type": "number" },
+                    "bounds": {
+                        "type": "object",
+                        "properties": {
+                            "xMin": { "type": "number" }, "yMin": { "type": "number" },
+                            "xMax": { "type": "number" }, "yMax": { "type": "number" }
+                        },
+                        "additionalProperties": false,
+                        "required": ["xMin", "yMin", "xMax", "yMax"]
+                    },
+                    "points": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": { "x": { "type": "number" }, "y": { "type": "number" } },
+                            "additionalProperties": false,
+                            "required": ["x", "y"]
+                        }
+                    }
+                },
+                "additionalProperties": false,
+                "required": ["shape", "source", "multiStory", "rotation", "bounds", "points"]
             }
         },
         "additionalProperties": false,
         "required": [
-            "elements"
+            "elements", "focusElements", "selectionType", "elementRelationship", "selectedElementCount", "editableElementCount"
         ]
     })";
 }
 
+static GS::UniString SelectionTypeToString (API_SelTypeID type)
+{
+    switch (type) {
+        case API_SelElems:       return "elements";
+        case API_MarqueePoly:    return "marquee_polygon";
+        case API_MarqueeHorBox:  return "marquee_horizontal_box";
+        case API_MarqueeRotBox:  return "marquee_rotated_box";
+        default:                 return "empty";
+    }
+}
+
+static bool IsMarqueeSelection (API_SelTypeID type)
+{
+    return type == API_MarqueePoly || type == API_MarqueeHorBox || type == API_MarqueeRotBox;
+}
+
+struct MarqueeFocusSnapshot {
+    API_SelTypeID type = API_SelEmpty;
+    bool multiStory = false;
+    double rotation = 0.0;
+    double xMin = 0.0;
+    double yMin = 0.0;
+    double xMax = 0.0;
+    double yMax = 0.0;
+    GS::Array<API_Coord> polygonPoints;
+    GS::UniString source;
+};
+
+static std::optional<MarqueeFocusSnapshot> trackedMarquee;
+static std::optional<API_Guid> marqueeEventHandlerId;
+
+static MarqueeFocusSnapshot CaptureMarqueeSnapshot (const API_SelectionInfo& selectionInfo, const GS::UniString& source)
+{
+    MarqueeFocusSnapshot snapshot;
+    snapshot.type = selectionInfo.typeID;
+    snapshot.multiStory = selectionInfo.multiStory;
+    snapshot.rotation = selectionInfo.marquee.boxRotAngle;
+    snapshot.xMin = selectionInfo.marquee.box.xMin;
+    snapshot.yMin = selectionInfo.marquee.box.yMin;
+    snapshot.xMax = selectionInfo.marquee.box.xMax;
+    snapshot.yMax = selectionInfo.marquee.box.yMax;
+    snapshot.source = source;
+    if (selectionInfo.typeID == API_MarqueePoly && selectionInfo.marquee.coords != nullptr) {
+        for (Int32 index = 1; index <= selectionInfo.marquee.nCoords; ++index)
+            snapshot.polygonPoints.Push ((*selectionInfo.marquee.coords)[index]);
+    }
+    return snapshot;
+}
+
+static void TrackMarquee (const API_SelectionInfo& selectionInfo, const GS::UniString& source)
+{
+    if (IsMarqueeSelection (selectionInfo.typeID))
+        trackedMarquee = CaptureMarqueeSnapshot (selectionInfo, source);
+    else
+        trackedMarquee.reset ();
+}
+
+class MarqueeFocusEventHandler final : public API_IMarqueeEventHandler {
+public:
+    virtual void OnMarqueeChanged (const API_SelectionInfo& selectionInfo) const override
+    {
+        TrackMarquee (selectionInfo, "event_tracker");
+    }
+};
+
+GSErrCode RegisterMarqueeFocusTracker ()
+{
+    API_SelectionInfo selectionInfo = {};
+    const GSErrCode selectionError = ACAPI_Selection_Get (&selectionInfo, nullptr, false);
+    if (selectionError == NoError && IsMarqueeSelection (selectionInfo.typeID)) {
+        TrackMarquee (selectionInfo, "live_query");
+        BMKillHandle (reinterpret_cast<GSHandle*> (&selectionInfo.marquee.coords));
+    }
+
+    API_Guid handlerId;
+    const GSErrCode err = ACAPI_Notification_RegisterEventHandler (GS::NewOwned<MarqueeFocusEventHandler> (), handlerId);
+    if (err == NoError)
+        marqueeEventHandlerId = handlerId;
+    return err;
+}
+
+void UnregisterMarqueeFocusTracker ()
+{
+    if (marqueeEventHandlerId.has_value ()) {
+        ACAPI_Notification_UnregisterEventHandler (*marqueeEventHandlerId);
+        marqueeEventHandlerId.reset ();
+    }
+    trackedMarquee.reset ();
+}
+
+static void AddMarqueeToResponse (GS::ObjectState& response, const MarqueeFocusSnapshot& snapshot)
+{
+    GS::ObjectState marquee;
+    marquee.Add ("shape", SelectionTypeToString (snapshot.type));
+    marquee.Add ("source", snapshot.source);
+    marquee.Add ("multiStory", snapshot.multiStory);
+    marquee.Add ("rotation", snapshot.rotation);
+    const auto& points = marquee.AddList<GS::ObjectState> ("points");
+
+    double xMin = snapshot.xMin;
+    double yMin = snapshot.yMin;
+    double xMax = snapshot.xMax;
+    double yMax = snapshot.yMax;
+    if (snapshot.type == API_MarqueePoly && !snapshot.polygonPoints.IsEmpty ()) {
+        xMin = DBL_MAX; yMin = DBL_MAX;
+        xMax = -DBL_MAX; yMax = -DBL_MAX;
+        for (const API_Coord& coord : snapshot.polygonPoints) {
+            points (GS::ObjectState ("x", coord.x, "y", coord.y));
+            xMin = std::min (xMin, coord.x); yMin = std::min (yMin, coord.y);
+            xMax = std::max (xMax, coord.x); yMax = std::max (yMax, coord.y);
+        }
+    } else {
+        const double centerX = (xMin + xMax) / 2.0;
+        const double centerY = (yMin + yMax) / 2.0;
+        const double cosine = std::cos (snapshot.rotation);
+        const double sine = std::sin (snapshot.rotation);
+        const API_Coord corners[] = { { xMin, yMin }, { xMax, yMin }, { xMax, yMax }, { xMin, yMax } };
+        xMin = DBL_MAX; yMin = DBL_MAX;
+        xMax = -DBL_MAX; yMax = -DBL_MAX;
+        for (const API_Coord& corner : corners) {
+            const double dx = corner.x - centerX;
+            const double dy = corner.y - centerY;
+            const double x = centerX + dx * cosine - dy * sine;
+            const double y = centerY + dx * sine + dy * cosine;
+            points (GS::ObjectState ("x", x, "y", y));
+            xMin = std::min (xMin, x); yMin = std::min (yMin, y);
+            xMax = std::max (xMax, x); yMax = std::max (yMax, y);
+        }
+    }
+    marquee.Add ("bounds", GS::ObjectState ("xMin", xMin, "yMin", yMin, "xMax", xMax, "yMax", yMax));
+    response.Add ("marquee", marquee);
+}
+
 GS::ObjectState GetSelectedElementsCommand::Execute (const GS::ObjectState& /*parameters*/, GS::ProcessControl& /*processControl*/) const
 {
-    API_SelectionInfo selectionInfo;
+    API_SelectionInfo selectionInfo = {};
     GS::Array<API_Neig> selectedNeigs;
     GSErrCode err = ACAPI_Selection_Get (&selectionInfo, &selectedNeigs, false);
     if (err != NoError && err != APIERR_NOSEL) {
@@ -1417,15 +1873,226 @@ GS::ObjectState GetSelectedElementsCommand::Execute (const GS::ObjectState& /*pa
 
     GS::ObjectState response;
     const auto& elementsList = response.AddList<GS::ObjectState> ("elements");
-    if (err == APIERR_NOSEL || selectionInfo.typeID == API_SelEmpty) {
-        return response;
-    }
+    const auto& focusElements = response.AddList<GS::ObjectState> ("focusElements");
+    const API_SelTypeID selectionType = err == APIERR_NOSEL ? API_SelEmpty : selectionInfo.typeID;
+    response.Add ("selectionType", SelectionTypeToString (selectionType));
+    response.Add ("elementRelationship",
+        selectionType == API_SelElems ? "individually_selected" :
+        IsMarqueeSelection (selectionType) ? "inside_or_intersecting_marquee" : "none");
+    response.Add ("selectedElementCount", err == APIERR_NOSEL ? 0 : selectionInfo.sel_nElem);
+    response.Add ("editableElementCount", err == APIERR_NOSEL ? 0 : selectionInfo.sel_nElemEdit);
 
-    GS::Array<API_Guid> selElemGuids;
+    if (IsMarqueeSelection (selectionType)) {
+        const GS::OnExit marqueeGuard ([&selectionInfo] () {
+            BMKillHandle (reinterpret_cast<GSHandle*> (&selectionInfo.marquee.coords));
+        });
+        TrackMarquee (selectionInfo, "live_query");
+    }
+    if (trackedMarquee.has_value ())
+        AddMarqueeToResponse (response, *trackedMarquee);
+
+    if (selectionType == API_SelEmpty) return response;
+
     for (API_Neig& selectedNeig : selectedNeigs) {
-        elementsList (CreateElementIdObjectState (GetParentElemOfSectElem (selectedNeig.guid)));
+        const API_Guid guid = GetParentElemOfSectElem (selectedNeig.guid);
+        elementsList (CreateElementIdObjectState (guid));
+
+        API_Elem_Head elemHead = {};
+        elemHead.guid = guid;
+        if (ACAPI_Element_GetHeader (&elemHead) != NoError) continue;
+        GS::ObjectState focusElement (
+            "elementId", CreateGuidObjectState (guid),
+            "elementType", GetElementTypeNonLocalizedName (GetElemTypeId (elemHead)));
+        API_Box3D bounds = {};
+        if (ACAPI_Element_CalcBounds (&elemHead, &bounds) == NoError) {
+            focusElement.Add ("bounds", GS::ObjectState (
+                "xMin", bounds.xMin, "yMin", bounds.yMin,
+                "xMax", bounds.xMax, "yMax", bounds.yMax));
+        }
+        focusElements (focusElement);
     }
 
+    return response;
+}
+
+GetElementsInRectCommand::GetElementsInRectCommand () :
+    CommandBase (CommonSchema::Used)
+{
+}
+
+GS::String GetElementsInRectCommand::GetName () const
+{
+    return "GetElementsInRect";
+}
+
+GS::Optional<GS::UniString> GetElementsInRectCommand::GetInputParametersSchema () const
+{
+    return R"({
+        "type": "object",
+        "properties": {
+            "bounds": {
+                "type": "object",
+                "properties": {
+                    "xMin": { "type": "number" },
+                    "yMin": { "type": "number" },
+                    "xMax": { "type": "number" },
+                    "yMax": { "type": "number" }
+                },
+                "additionalProperties": false,
+                "required": ["xMin", "yMin", "xMax", "yMax"]
+            },
+            "multiStory": { "type": "boolean", "default": false }
+        },
+        "additionalProperties": false,
+        "required": ["bounds"]
+    })";
+}
+
+GS::Optional<GS::UniString> GetElementsInRectCommand::GetResponseSchema () const
+{
+    return R"({
+        "type": "object",
+        "properties": {
+            "elements": { "$ref": "#/Elements" },
+            "focusElements": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "elementId": { "$ref": "#/ElementId" },
+                        "elementType": { "type": "string" },
+                        "bounds": {
+                            "type": "object",
+                            "properties": {
+                                "xMin": { "type": "number" }, "yMin": { "type": "number" },
+                                "xMax": { "type": "number" }, "yMax": { "type": "number" }
+                            },
+                            "additionalProperties": false,
+                            "required": ["xMin", "yMin", "xMax", "yMax"]
+                        }
+                    },
+                    "additionalProperties": false,
+                    "required": ["elementId", "elementType"]
+                }
+            },
+            "elementCount": { "type": "integer" },
+            "focusRestored": { "type": "boolean" }
+        },
+        "additionalProperties": false,
+        "required": ["elements", "focusElements", "elementCount", "focusRestored"]
+    })";
+}
+
+GS::ObjectState GetElementsInRectCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl& /*processControl*/) const
+{
+    const GS::ObjectState* bounds = parameters.Get ("bounds");
+    double xMin = 0.0, yMin = 0.0, xMax = 0.0, yMax = 0.0;
+    if (bounds == nullptr || !bounds->Get ("xMin", xMin) || !bounds->Get ("yMin", yMin) ||
+        !bounds->Get ("xMax", xMax) || !bounds->Get ("yMax", yMax)) {
+        return CreateErrorResponse (APIERR_BADPARS, "bounds.xMin, bounds.yMin, bounds.xMax and bounds.yMax are required.");
+    }
+    if (xMin >= xMax || yMin >= yMax) {
+        return CreateErrorResponse (APIERR_BADPARS, "Rectangle bounds must have positive area.");
+    }
+
+    bool multiStory = false;
+    parameters.Get ("multiStory", multiStory);
+
+    API_SelectionInfo selectionBefore = {};
+    const GSErrCode selectionBeforeErr = ACAPI_Selection_Get (&selectionBefore, nullptr, false);
+    if (selectionBeforeErr != NoError && selectionBeforeErr != APIERR_NOSEL) {
+        return CreateErrorResponse (selectionBeforeErr, "Failed to inspect the operator focus before the bounded read.");
+    }
+    const bool hadOriginalMarquee = selectionBeforeErr == NoError && IsMarqueeSelection (selectionBefore.typeID);
+    if (selectionBeforeErr == NoError && selectionBefore.typeID == API_SelElems) {
+        if (selectionBefore.marquee.coords != nullptr)
+            BMKillHandle (reinterpret_cast<GSHandle*> (&selectionBefore.marquee.coords));
+        return CreateErrorResponse (APIERR_REFUSEDCMD, "Bounded rect read refuses to replace an active individual selection.");
+    }
+
+    API_SelectionInfo temporaryMarquee = {};
+    temporaryMarquee.typeID = API_MarqueeHorBox;
+    temporaryMarquee.multiStory = multiStory;
+    temporaryMarquee.marquee.box.xMin = xMin;
+    temporaryMarquee.marquee.box.yMin = yMin;
+    temporaryMarquee.marquee.box.xMax = xMax;
+    temporaryMarquee.marquee.box.yMax = yMax;
+    temporaryMarquee.marquee.boxRotAngle = 0.0;
+
+    const GSErrCode setErr = ACAPI_Selection_SetMarquee (&temporaryMarquee);
+    if (setErr != NoError) {
+        if (selectionBefore.marquee.coords != nullptr)
+            BMKillHandle (reinterpret_cast<GSHandle*> (&selectionBefore.marquee.coords));
+        return CreateErrorResponse (setErr, "Failed to set the temporary bounded read rectangle.");
+    }
+
+    API_SelectionInfo boundedSelection = {};
+    GS::Array<API_Neig> selectedNeigs;
+    const GSErrCode boundedErr = ACAPI_Selection_Get (&boundedSelection, &selectedNeigs, false);
+
+    GS::ObjectState response;
+    const auto& elements = response.AddList<GS::ObjectState> ("elements");
+    const auto& focusElements = response.AddList<GS::ObjectState> ("focusElements");
+    Int32 elementCount = 0;
+    if (boundedErr == NoError) {
+        for (const API_Neig& selectedNeig : selectedNeigs) {
+            const API_Guid guid = GetParentElemOfSectElem (selectedNeig.guid);
+            elements (CreateElementIdObjectState (guid));
+            ++elementCount;
+
+            API_Elem_Head elemHead = {};
+            elemHead.guid = guid;
+            if (ACAPI_Element_GetHeader (&elemHead) != NoError) continue;
+            GS::ObjectState focusElement (
+                "elementId", CreateGuidObjectState (guid),
+                "elementType", GetElementTypeNonLocalizedName (GetElemTypeId (elemHead)));
+            API_Box3D elementBounds = {};
+            if (ACAPI_Element_CalcBounds (&elemHead, &elementBounds) == NoError) {
+                focusElement.Add ("bounds", GS::ObjectState (
+                    "xMin", elementBounds.xMin, "yMin", elementBounds.yMin,
+                    "xMax", elementBounds.xMax, "yMax", elementBounds.yMax));
+            }
+            focusElements (focusElement);
+        }
+    } else if (boundedErr != APIERR_NOSEL) {
+        if (boundedSelection.marquee.coords != nullptr)
+            BMKillHandle (reinterpret_cast<GSHandle*> (&boundedSelection.marquee.coords));
+        if (selectionBefore.marquee.coords != nullptr)
+            BMKillHandle (reinterpret_cast<GSHandle*> (&selectionBefore.marquee.coords));
+        return CreateErrorResponse (boundedErr, "Failed to read the temporary bounded rectangle.");
+    }
+
+    API_SelectionInfo selectionAfter = {};
+    const GSErrCode selectionAfterErr = ACAPI_Selection_Get (&selectionAfter, nullptr, false);
+    const bool focusChangedDuringRead = selectionAfterErr == NoError &&
+        (!IsMarqueeSelection (selectionAfter.typeID) ||
+         selectionAfter.marquee.box.xMin != xMin || selectionAfter.marquee.box.yMin != yMin ||
+         selectionAfter.marquee.box.xMax != xMax || selectionAfter.marquee.box.yMax != yMax);
+    if (selectionAfter.marquee.coords != nullptr)
+        BMKillHandle (reinterpret_cast<GSHandle*> (&selectionAfter.marquee.coords));
+
+    API_SelectionInfo restoreMarquee = {};
+    if (hadOriginalMarquee) {
+        restoreMarquee = selectionBefore;
+    } else {
+        restoreMarquee.typeID = API_SelEmpty;
+    }
+    const GSErrCode restoreErr = ACAPI_Selection_SetMarquee (&restoreMarquee);
+    if (boundedSelection.marquee.coords != nullptr)
+        BMKillHandle (reinterpret_cast<GSHandle*> (&boundedSelection.marquee.coords));
+    if (selectionBefore.marquee.coords != nullptr)
+        BMKillHandle (reinterpret_cast<GSHandle*> (&selectionBefore.marquee.coords));
+
+    if (restoreErr != NoError || focusChangedDuringRead) {
+        return CreateErrorResponse (
+            restoreErr != NoError ? restoreErr : APIERR_REFUSEDCMD,
+            restoreErr != NoError
+                ? "Bounded read succeeded but the operator focus could not be restored."
+                : "Operator focus changed during the bounded read; refusing to report a potentially stale result.");
+    }
+
+    response.Add ("elementCount", elementCount);
+    response.Add ("focusRestored", true);
     return response;
 }
 

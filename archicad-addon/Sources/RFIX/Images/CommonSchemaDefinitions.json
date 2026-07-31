@@ -58,6 +58,7 @@
             "ZoneCategory",
             "Profile",
             "PenTable",
+            "Font",
             "MEPSystem",
             "OperationProfile",
             "BuildingMaterial"
@@ -3991,6 +3992,10 @@
             "libPart": {
                 "$ref": "#/LibPartDetails"
             },
+            "libPartIndex": {
+                "type": "integer",
+                "description": "Archicad library part index; zero means an empty Door/Window hole."
+            },
             "ownerElementId": {
                 "$ref": "#/ElementId"
             },
@@ -4038,6 +4043,29 @@
                 "type": "number",
                 "description": "Sill height (window) or threshold height (door)."
             },
+            "hasReveal": {
+                "type": "boolean",
+                "description": "Whether Archicad applies a reveal/jamb to the opening."
+            },
+            "revealDepthReference": {
+                "type": "string",
+                "enum": ["Side", "Core"],
+                "description": "Whether the reveal offset is measured from the clicked wall side or composite core."
+            },
+            "revealDepthOffset": {
+                "type": "number",
+                "description": "Configured reveal inset from the selected side or core."
+            },
+            "revealDepthFromSide": {
+                "type": "number",
+                "description": "Calculated frame inset from the clicked wall side."
+            },
+            "jambDepthHead": { "type": "number" },
+            "jambDepthSill": { "type": "number" },
+            "jambDepthLeft": { "type": "number" },
+            "jambDepthRight": { "type": "number" },
+            "openingStartPoint": { "$ref": "#/Coordinate2D" },
+            "openingDirection": { "$ref": "#/Coordinate2D" },
             "centerOffset": {
                 "type": "number",
                 "description": "Center offset along the owner wall reference line."
@@ -4057,11 +4085,135 @@
             "width",
             "height",
             "sillHeight",
+            "hasReveal",
+            "revealDepthReference",
+            "revealDepthOffset",
+            "revealDepthFromSide",
+            "jambDepthHead",
+            "jambDepthSill",
+            "jambDepthLeft",
+            "jambDepthRight",
+            "openingStartPoint",
+            "openingDirection",
             "centerOffset",
             "reflected",
             "refSide",
             "oSide"
         ]
+    },
+    "Bounds2D": {
+        "type": "object",
+        "properties": {
+            "xMin": { "type": "number" },
+            "yMin": { "type": "number" },
+            "xMax": { "type": "number" },
+            "yMax": { "type": "number" }
+        },
+        "additionalProperties": false,
+        "required": ["xMin", "yMin", "xMax", "yMax"]
+    },
+    "ArrowData": {
+        "type": "object",
+        "description": "Line/arc/polyline ending markers (API_ArrowData). Circle types (EmptyCirc, FullCirc, CrossCircIs, PepitaCirc) are common axis bubbles.",
+        "properties": {
+            "arrowType": {
+                "type": "string",
+                "enum": [
+                    "EmptyCirc",
+                    "CrossCircIs",
+                    "FullCirc",
+                    "SlashLine15",
+                    "OpenArrow15",
+                    "ClosArrow15",
+                    "FullArrow15",
+                    "SlashLine30",
+                    "OpenArrow30",
+                    "ClosArrow30",
+                    "FullArrow30",
+                    "SlashLine45",
+                    "OpenArrow45",
+                    "ClosArrow45",
+                    "FullArrow45",
+                    "SlashLine60",
+                    "OpenArrow60",
+                    "ClosArrow60",
+                    "FullArrow60",
+                    "SlashLine90",
+                    "PepitaCirc",
+                    "BandArrow",
+                    "HalfArrowCcw15",
+                    "HalfArrowCw15",
+                    "HalfArrowCcw30",
+                    "HalfArrowCw30",
+                    "HalfArrowCcw45",
+                    "HalfArrowCw45",
+                    "HalfArrowCcw60",
+                    "HalfArrowCw60",
+                    "SlashLine75"
+                ]
+            },
+            "begArrow": { "type": "boolean" },
+            "endArrow": { "type": "boolean" },
+            "arrowPen": { "type": "integer" },
+            "arrowSize": {
+                "type": "number",
+                "description": "Marker size in millimeters."
+            }
+        },
+        "additionalProperties": false,
+        "required": ["arrowType", "begArrow", "endArrow", "arrowPen", "arrowSize"]
+    },
+    "LineDetails": {
+        "type": "object",
+        "properties": {
+            "begCoordinate": { "$ref": "#/Coordinate2D" },
+            "endCoordinate": { "$ref": "#/Coordinate2D" },
+            "lineTypeIndex": { "type": "integer" },
+            "linePen": { "type": "integer" },
+            "roomSeparator": { "type": "boolean" },
+            "arrowData": { "$ref": "#/ArrowData" }
+        },
+        "additionalProperties": false,
+        "required": ["begCoordinate", "endCoordinate", "lineTypeIndex", "linePen", "roomSeparator", "arrowData"]
+    },
+    "ArcDetails": {
+        "type": "object",
+        "properties": {
+            "origin": { "$ref": "#/Coordinate2D" },
+            "radius": { "type": "number" },
+            "axisAngle": { "type": "number" },
+            "ratio": { "type": "number" },
+            "beginAngle": { "type": "number" },
+            "endAngle": { "type": "number" },
+            "reflected": { "type": "boolean" },
+            "whole": { "type": "boolean" },
+            "lineTypeIndex": { "type": "integer" },
+            "linePen": { "type": "integer" },
+            "roomSeparator": { "type": "boolean" },
+            "arrowData": { "$ref": "#/ArrowData" }
+        },
+        "additionalProperties": false,
+        "required": ["origin", "radius", "axisAngle", "ratio", "beginAngle", "endAngle", "reflected", "whole", "lineTypeIndex", "linePen", "roomSeparator", "arrowData"]
+    },
+    "TextDetails": {
+        "type": "object",
+        "properties": {
+            "anchorCoordinate": { "$ref": "#/Coordinate2D" },
+            "angle": { "type": "number" },
+            "width": { "type": "number" },
+            "height": { "type": "number" },
+            "size": { "type": "number" },
+            "fontIndex": { "type": "integer" },
+            "anchor": { "type": "integer" },
+            "justification": { "type": "integer" },
+            "fixedAngle": { "type": "boolean" },
+            "fixedSize": { "type": "boolean" },
+            "lineCount": { "type": "integer" },
+            "pen": { "type": "integer" },
+            "content": { "type": "string" }
+        },
+        "additionalProperties": false,
+        "required": ["anchorCoordinate", "angle", "width", "height", "size", "fontIndex", "anchor", "justification", "fixedAngle", "fixedSize", "lineCount", "pen"]
     },
     "PolylineDetails": {
         "type": "object",
@@ -4081,12 +4233,14 @@
             },
             "zCoordinate": {
                 "type": "number"
-            }
+            },
+            "arrowData": { "$ref": "#/ArrowData" }
         },
         "additionalProperties": false,
         "required": [
             "coordinates",
-            "zCoordinate"
+            "zCoordinate",
+            "arrowData"
         ]
     },
     "ZoneDetails": {
@@ -4441,6 +4595,10 @@
     "DrawingDetails": {
         "type": "object",
         "properties": {
+            "sourceNavigatorItemId": {
+                "$ref": "#/NavigatorItemId",
+                "description": "Navigator item that is the source of this placed drawing."
+            },
             "pos": {
                 "$ref": "#/Coordinate2D",
                 "description": "Position of the drawing's reference point on the layout."
@@ -4495,6 +4653,74 @@
             "modelOffset",
             "isCutWithFrame",
             "bounds"
+        ]
+    },
+    "HatchDetails": {
+        "type": "object",
+        "properties": {
+            "hatchType": { "type": "string", "enum": ["Fill", "BuildingMaterial"] },
+            "determination": { "type": "string", "enum": ["Drafting", "Cut", "Cover"] },
+            "contourPen": { "type": "integer" },
+            "fillPen": { "type": "integer" },
+            "fillBackgroundPen": { "type": "integer" },
+            "fillAttributeIndex": { "type": "integer" },
+            "buildingMaterialIndex": { "type": "integer" },
+            "hasForegroundRGB": { "type": "boolean" },
+            "hasBackgroundRGB": { "type": "boolean" },
+            "polygonOutline": {
+                "type": "array",
+                "items": { "$ref": "#/Coordinate2D" }
+            },
+            "polygonArcs": {
+                "type": "array",
+                "items": { "$ref": "#/PolyArc" }
+            },
+            "holes": {
+                "type": "array",
+                "items": { "$ref": "#/Hole2D" }
+            }
+        },
+        "additionalProperties": false,
+        "required": [
+            "hatchType",
+            "determination",
+            "contourPen",
+            "fillPen",
+            "fillBackgroundPen",
+            "fillAttributeIndex",
+            "buildingMaterialIndex",
+            "hasForegroundRGB",
+            "hasBackgroundRGB",
+            "polygonOutline",
+            "holes"
+        ]
+    },
+    "OpeningDetails": {
+        "type": "object",
+        "properties": {
+            "ownerElementId": { "$ref": "#/ElementId" },
+            "basePolygonType": { "type": "string", "enum": ["Rectangular", "Circular", "Custom"] },
+            "width": { "type": "number" },
+            "height": { "type": "number" },
+            "constraint": { "type": "string", "enum": ["ForcedVertical", "ForcedHorizontal", "Aligned", "Free"] },
+            "anchorAltitude": { "type": "number" },
+            "limitType": { "type": "string", "enum": ["Infinite", "Finite", "HalfInfinite"] },
+            "extrusionStartOffset": { "type": "number" },
+            "finiteBodyLength": { "type": "number" },
+            "linked": { "type": "boolean" }
+        },
+        "additionalProperties": false,
+        "required": [
+            "ownerElementId",
+            "basePolygonType",
+            "width",
+            "height",
+            "constraint",
+            "anchorAltitude",
+            "limitType",
+            "extrusionStartOffset",
+            "finiteBodyLength",
+            "linked"
         ]
     },
     "LabelDetails": {
@@ -4562,6 +4788,15 @@
                 "$ref": "#/PolylineDetails"
             },
             {
+                "$ref": "#/LineDetails"
+            },
+            {
+                "$ref": "#/ArcDetails"
+            },
+            {
+                "$ref": "#/TextDetails"
+            },
+            {
                 "$ref": "#/ZoneDetails"
             },
             {
@@ -4581,6 +4816,12 @@
             },
             {
                 "$ref": "#/DrawingDetails"
+            },
+            {
+                "$ref": "#/HatchDetails"
+            },
+            {
+                "$ref": "#/OpeningDetails"
             },
             {
                 "$ref": "#/LabelDetails"

@@ -39,6 +39,26 @@
 #include "IFCCommands.hpp"
 #include "SolidElementOperationCommands.hpp"
 
+#include "InstanceInfoFile.hpp"
+
+// Project lifecycle events used to refresh the per-instance info file written
+// by InstanceInfoFile::WriteInstanceInfo so the MCP server always sees the
+// current project identity without polling Tapir.
+static GSErrCode InstanceInfoProjectEventHandler (API_NotifyEventID notifID, Int32 /*param*/)
+{
+    switch (notifID) {
+        case APINotify_New:
+        case APINotify_NewAndReset:
+        case APINotify_Open:
+        case APINotify_Save:
+            InstanceInfoFile::WriteInstanceInfo ();
+            break;
+        default:
+            break;
+    }
+    return NoError;
+}
+
 template <typename CommandType>
 GSErrCode RegisterCommand (CommandGroup& group, const GS::UniString& version, const GS::UniString& description)
 {
@@ -134,6 +154,7 @@ GSErrCode Initialize (void)
     err |= ACAPI_MenuItem_InstallMenuHandler (ID_ADDON_MENU_FOR_UPDATE, MenuCommandHandler);
     err |= ACAPI_MenuItem_InstallMenuHandler (ID_ADDON_MENU, MenuCommandHandler);
     err |= TapirPalette::RegisterPaletteControlCallBack ();
+    err |= RegisterMarqueeFocusTracker ();
 
     { // Application Commands
         CommandGroup applicationCommands ("Application Commands");
@@ -222,6 +243,14 @@ GSErrCode Initialize (void)
             projectCommands, "1.3.1",
             "Prints from the current view."
         );
+        err |= RegisterCommand<RenderMarqueePdfProbeCommand> (
+            projectCommands, "1.5.10",
+            "Internal proof probe: exports a rectangular floor-plan marquee to PDF from a background story without changing the visible window."
+        );
+        err |= RegisterCommand<RenderMarqueePrintCommand> (
+            projectCommands, "1.5.12",
+            "Prints a temporary rectangular marquee through Archicad's native print engine and restores the operator focus."
+        );
         err |= RegisterCommand<RebuildViewCommand> (
             projectCommands, "1.5.0",
             "Rebuilds the current view."
@@ -232,8 +261,12 @@ GSErrCode Initialize (void)
     { // Element Commands
         CommandGroup elementCommands ("Element Commands");
         err |= RegisterCommand<GetSelectedElementsCommand> (
-            elementCommands, "0.1.0",
-            "Gets the list of the currently selected elements."
+            elementCommands, "1.5.6",
+            "Gets individual selection and independently tracked marquee focus, including geometry and returned-element relationship."
+        );
+        err |= RegisterCommand<GetElementsInRectCommand> (
+            elementCommands, "1.5.13",
+            "Returns elements intersecting a bounded model-coordinate rectangle without enumerating the whole database. The command temporarily uses Archicad's native marquee selection and restores the prior focus."
         );
         err |= RegisterCommand<GetElementsByTypeCommand> (
             elementCommands, "1.0.7",
@@ -989,10 +1022,21 @@ GSErrCode Initialize (void)
         AddCommandGroup (developerCommands);
     }
 
+    // Publish this instance's JSON server port and current project identity to
+    // a per-pid file so the MCP server can discover and bind instances without
+    // HTTP port scanning. Refreshed on project lifecycle events.
+    err |= InstanceInfoFile::WriteInstanceInfo ();
+    err |= ACAPI_ProjectOperation_CatchProjectEvent (
+        APINotify_New | APINotify_NewAndReset | APINotify_Open | APINotify_Save,
+        InstanceInfoProjectEventHandler);
+
     return err;
 }
 
 GSErrCode FreeData (void)
 {
+    ACAPI_ProjectOperation_CatchProjectEvent (0, nullptr);
+    InstanceInfoFile::Delete ();
+    UnregisterMarqueeFocusTracker ();
     return NoError;
 }

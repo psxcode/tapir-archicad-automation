@@ -141,14 +141,31 @@ GS::ObjectState GetAttributesByTypeCommand::Execute (const GS::ObjectState& para
     GS::UniString typeStr;
     parameters.Get ("attributeType", typeStr);
 
+    GS::ObjectState response;
+    const auto& attributes = response.AddList<GS::ObjectState> ("attributes");
+
+    // Fonts are environment resources, not API_Attribute entries in AC28.
+    // Keep them on the same compact index/name response so callers can resolve
+    // API_TextType::font without exposing a second native command.
+    if (typeStr == "Font") {
+        const Int32 fontCount = ACAPI_Font_GetFontNum ();
+        for (Int32 index = 1; index <= fontCount; ++index) {
+            API_FontType font = {};
+            font.head.index = index;
+            if (ACAPI_Font_GetFont (font) != NoError) continue;
+            attributes (GS::ObjectState (
+                "attributeId", CreateGuidObjectState (APINULLGuid),
+                "index", index,
+                "name", GS::UniString (font.head.name)));
+        }
+        return response;
+    }
+
     API_AttrTypeID typeID = ConvertAttributeTypeStringToID (typeStr);
     if (typeID == API_ZombieAttrID) {
         return CreateErrorResponse (APIERR_BADPARS,
             GS::UniString::Printf ("Invalid attributeType '%T'.", typeStr.ToPrintf ()));
     }
-
-    GS::ObjectState response;
-    const auto& attributes = response.AddList<GS::ObjectState> ("attributes");
 
     GS::Array<API_Attribute> attrs;
     ACAPI_Attribute_GetAttributesByType (typeID, attrs);

@@ -2,6 +2,9 @@
 
 #include "CommandBase.hpp"
 
+GSErrCode RegisterMarqueeFocusTracker ();
+void UnregisterMarqueeFocusTracker ();
+
 class GetElementsByTypeCommand : public CommandBase
 {
 public:
@@ -44,6 +47,16 @@ class GetSelectedElementsCommand : public CommandBase
 public:
     GetSelectedElementsCommand ();
     virtual GS::String GetName () const override;
+    virtual GS::Optional<GS::UniString> GetResponseSchema () const override;
+    virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
+};
+
+class GetElementsInRectCommand : public CommandBase
+{
+public:
+    GetElementsInRectCommand ();
+    virtual GS::String GetName () const override;
+    virtual GS::Optional<GS::UniString> GetInputParametersSchema () const override;
     virtual GS::Optional<GS::UniString> GetResponseSchema () const override;
     virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
 };
