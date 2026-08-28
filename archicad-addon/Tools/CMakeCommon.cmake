@@ -24,7 +24,7 @@ function (SetCompilerOptions target acVersion)
     endif ()
     target_compile_options (${target} PUBLIC "$<$<CONFIG:Debug>:-DDEBUG>")
     if (WIN32)
-        target_compile_options (${target} PUBLIC /W4 /WX
+        target_compile_options (${target} PUBLIC /W4 /WX /FS
             /Zc:wchar_t-
             /wd4499
             /EHsc

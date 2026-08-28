@@ -2,6 +2,8 @@
 
 #include "ACAPinc.h"
 
+#include <memory>
+
 #ifdef ServerMainVers_2800
 #define CaseInsensitive GS::CaseInsensitive
 #else
@@ -51,6 +53,14 @@
 
 #define ACAPI_Element_CalcBounds(par1,par2) ACAPI_Database (APIDb_CalcBoundsID, par1, par2)
 #define ACAPI_View_GetZoom(par1, par2) ACAPI_Database (APIDb_GetZoomID, par1, par2)
+
+// AC25 exposes the 2D zoom setter through the legacy database dispatcher,
+// while AC27+ provides the typed ACAPI_View_SetZoom function. Keep the
+// command implementation and response contract identical across both SDKs.
+inline GSErrCode TAPIR_View_SetZoom (API_Box* zoomBox)
+{
+    return ACAPI_Database (APIDb_SetZoomID, zoomBox, nullptr);
+}
 
 #define ACAPI_Revision_GetRVMIssues(par1) ACAPI_Database (APIDb_GetRVMIssuesID, par1)
 #define ACAPI_Revision_GetRVMChanges(par1) ACAPI_Database (APIDb_GetRVMChangesID, par1)
@@ -365,6 +375,31 @@ inline GSErrCode ACAPI_Navigator_GetLayoutBook (API_LayoutBook* book)
 
 #endif
 
+#ifdef ServerMainVers_2700
+inline GSErrCode TAPIR_View_SetZoom (API_Box* zoomBox)
+{
+    return ACAPI_View_SetZoom (zoomBox, nullptr);
+}
+#endif
+
+inline GSErrCode TAPIR_ProjectOperation_SavePdf (const API_FileSavePars* savePars, const API_SavePars_Pdf* pdfPars)
+{
+#ifdef ServerMainVers_2700
+    return ACAPI_ProjectOperation_Save (savePars, pdfPars);
+#else
+    return ACAPI_Automate (APIDo_SaveID, (void*) savePars, (void*) pdfPars);
+#endif
+}
+
+inline GSErrCode TAPIR_ProjectOperation_CatchProjectEvent (GSFlags eventTypes, APIProjectEventHandlerProc* handlerProc)
+{
+#ifdef ServerMainVers_2700
+    return ACAPI_ProjectOperation_CatchProjectEvent (eventTypes, handlerProc);
+#else
+    return ACAPI_Notify_CatchProjectEvent (eventTypes, handlerProc);
+#endif
+}
+
 #ifndef ServerMainVers_2600
 
 inline GSErrCode ACAPI_IFC_GetIFCRelationshipData (API_IFCTranslatorIdentifier ifcTranslator, API_IFCRelationshipData ifcRelationshipData)
@@ -543,6 +578,7 @@ inline GSErrCode ACAPI_Element_SolidLink_GetFlags (API_Guid /*guid_Target*/, API
 inline void DisposeAttribute (API_Attribute& attr)
 {
     if (attr.header.typeID == API_MaterialID) {
-        delete attr.material.texture.fileLoc;
+        std::unique_ptr<IO::Location> location (attr.material.texture.fileLoc);
+        attr.material.texture.fileLoc = nullptr;
     }
 }

@@ -38,6 +38,9 @@ private:
 GS::ObjectState CreateErrorResponse (GSErrCode errorCode, const GS::UniString& errorMessage);
 GS::ObjectState CreateFailedExecutionResult (GSErrCode errorCode, const GS::UniString& errorMessage);
 GS::ObjectState CreateSuccessfulExecutionResult ();
+GS::ObjectState CreateNativePageRequiredResponse (const GS::UniString& message, Int32 enumerated, Int32 emitted);
+GS::ObjectState CreateNativeResourceLimitResponse (const GS::UniString& message, Int32 enumerated, Int32 emitted);
+bool ReadNativePageSize (const GS::ObjectState& parameters, Int32 defaultValue, Int32& pageSize);
 
 API_Guid    GetGuidFromObjectState (const GS::ObjectState& os);
 API_Guid    GetGuidFromArrayItem (const GS::String& idFieldName, const GS::ObjectState& os);
@@ -127,6 +130,8 @@ GSErrCode ExecuteActionForEachDatabase (
 template<std::size_t N>
 bool SetCharProperty (const GS::ObjectState* os, const char* propertyKey, char (&targetProperty)[N])
 {
+    if (os == nullptr)
+        return false;
     GS::UniString propertyValue;
     if (os->Get (propertyKey, propertyValue)) {
         CHTruncate (propertyValue.ToCStr ().Get (), targetProperty, N);
@@ -139,6 +144,8 @@ bool SetCharProperty (const GS::ObjectState* os, const char* propertyKey, char (
 template<std::size_t N>
 bool SetUCharProperty (const GS::ObjectState* os, const char* propertyKey, GS::uchar_t (&targetProperty)[N])
 {
+    if (os == nullptr)
+        return false;
     GS::UniString propertyValue;
     if (os->Get (propertyKey, propertyValue)) {
 
@@ -155,7 +162,7 @@ bool SetUCharProperty (const GS::ObjectState* os, const char* propertyKey, GS::u
 
 GS::Array<API_PolyArc> GetPolyArcs (const GS::Array<GS::ObjectState>& arcs, Int32 startIndex);
 
-void AddPolyToMemo (
+GSErrCode AddPolyToMemo (
     const GS::Array<GS::ObjectState>& coords,
     const GS::Array<GS::ObjectState>& arcs,
     Int32& iCoord,

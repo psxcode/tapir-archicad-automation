@@ -105,6 +105,16 @@ public:
     virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
 };
 
+class SaveProjectAsVersionCommand : public CommandBase
+{
+public:
+    SaveProjectAsVersionCommand ();
+    virtual GS::String GetName () const override;
+    virtual GS::Optional<GS::UniString> GetInputParametersSchema () const override;
+    virtual GS::Optional<GS::UniString> GetResponseSchema () const override;
+    virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
+};
+
 class GetGeoLocationCommand : public CommandBase
 {
 public:
@@ -153,8 +163,9 @@ public:
     virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
 };
 
-// Internal capability probe for the MCP-native rendering pipeline.  It deliberately
-// switches only Archicad's background database; it never calls ChangeWindow.
+// Internal capability probe for the MCP-native rendering pipeline. It deliberately
+// switches only Archicad's background database; active-story orchestration and
+// verification belong to the TypeScript render wrapper.
 class RenderMarqueePdfProbeCommand : public CommandBase
 {
 public:
@@ -165,12 +176,26 @@ public:
     virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
 };
 
-// Product render command: temporarily changes only the current database and
-// marquee, prints through Archicad's native print engine, then restores both.
+// Product render command: temporarily changes the requested background database
+// and marquee, prints through Archicad's native print engine, then restores both.
+// TypeScript activates/verifies a non-current story before calling this command
+// and restores the operator story after the PDF has been collected.
 class RenderMarqueePrintCommand : public CommandBase
 {
 public:
     RenderMarqueePrintCommand ();
+    virtual GS::String GetName () const override;
+    virtual GS::Optional<GS::UniString> GetInputParametersSchema () const override;
+    virtual GS::Optional<GS::UniString> GetResponseSchema () const override;
+    virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
+};
+
+// Explicit benchmark/UI-focus command.  Unlike the render commands this keeps
+// the requested marquee in Archicad after the call returns.
+class SetMarqueeCommand : public CommandBase
+{
+public:
+    SetMarqueeCommand ();
     virtual GS::String GetName () const override;
     virtual GS::Optional<GS::UniString> GetInputParametersSchema () const override;
     virtual GS::Optional<GS::UniString> GetResponseSchema () const override;

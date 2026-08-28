@@ -309,7 +309,7 @@ GS::Optional<GS::UniString> GetElementsOfDesignOptionsCommand::GetResponseSchema
             "elementsOfDesignOptions": {
                 "type": "array",
                 "items": {
-                    "#ref": "#/ElementsOfDesignOptionOrError"
+                    "$ref": "#/ElementsOfDesignOptionOrError"
                 }
             }
         },

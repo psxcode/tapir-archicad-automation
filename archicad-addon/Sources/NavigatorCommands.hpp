@@ -70,6 +70,18 @@ public:
     virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
 };
 
+// Sets only the axis-aligned model-coordinate zoom of the active FloorPlan.
+// Story/window selection remains a Node-side, verified operation.
+class SetView2DZoomCommand : public CommandBase
+{
+public:
+    SetView2DZoomCommand ();
+    virtual GS::String GetName () const override;
+    virtual GS::Optional<GS::UniString> GetInputParametersSchema () const override;
+    virtual GS::Optional<GS::UniString> GetResponseSchema () const override;
+    virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
+};
+
 class SetViewRotationCommand : public CommandBase
 {
 public:

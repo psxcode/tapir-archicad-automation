@@ -62,9 +62,9 @@ static GS::UniString GetVersionFromExecutable (const GS::UniString& executablePa
         GS::UniString output;
         if (channel.GetAvailable () > 0) {
             const GS::USize uSize = static_cast<GS::USize>(channel.GetAvailable ());
-            std::unique_ptr<char[]> buffer (new char[uSize]);
-            channel.Read (buffer.get (), uSize);
-            output = GS::UniString (buffer.get (), uSize, CC_UTF8);
+            std::vector<char> buffer (uSize, '\0');
+            channel.Read (buffer.data (), uSize);
+            output = GS::UniString (buffer.data (), uSize, CC_UTF8);
             output.ReplaceAll ("\n", "");
             output.ReplaceAll ("\r\n", "");
         }

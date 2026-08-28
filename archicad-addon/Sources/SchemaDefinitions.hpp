@@ -1,5 +1,6 @@
 #pragma once
 
 #include "UniString.hpp"
+#include "Optional.hpp"
 
-const GS::UniString& GetCommonSchemaDefinitions ();
+GS::Optional<GS::UniString> GetCommonSchemaDefinitions ();

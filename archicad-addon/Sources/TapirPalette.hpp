@@ -8,6 +8,10 @@
 #include "Config.hpp"
 #include "UvManager.hpp"
 
+#include <cstdint>
+#include <memory>
+#include <mutex>
+
 class TapirPalette final : public DG::Palette,
     public DG::PanelObserver,
     public DG::ButtonItemObserver,
@@ -28,6 +32,12 @@ public:
     static GSErrCode RegisterPaletteControlCallBack ();
 
 private:
+    struct ProcessState {
+        std::mutex mutex;
+        GS::Process process;
+        UInt64 generation = 0;
+    };
+
     struct PopUpItemData : public GS::Object
     {
         IO::Location fileLocation;
@@ -48,7 +58,7 @@ private:
     DG::IconButton addScriptButton;
     DG::IconButton delScriptButton;
 
-    GS::Process process;
+    std::shared_ptr<ProcessState> processState;
     GS::ThreadedExecutor executor;
     bool hasCustomScript = false;
     bool hasAddedScript = false;
@@ -69,9 +79,8 @@ private:
     bool IsSelectedScriptFromGitHub () const;
     void SetDeleteScriptButtonStatus ();
     void SetRunButtonIcon ();
-    bool IsProcessRunning () {
-        return process.IsValid ();
-    }
+    bool IsProcessRunning () const;
+    void KillProcess ();
 
 
     template<typename... Args>

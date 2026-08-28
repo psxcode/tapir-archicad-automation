@@ -1583,7 +1583,7 @@ var gCommands = [{
                         "height": {
                             "type": "number",
                             "description": "Optional column height.",
-                            "exclusiveMinimum": 0.0
+                            "minimum": 0.0, "exclusiveMinimum": true
                         },
                         "axisRotationAngle": {
                             "type": "number",
@@ -1592,12 +1592,12 @@ var gCommands = [{
                         "width": {
                             "type": "number",
                             "description": "Cross section width of the column. Applied to all segments.",
-                            "exclusiveMinimum": 0.0
+                            "minimum": 0.0, "exclusiveMinimum": true
                         },
                         "depth": {
                             "type": "number",
                             "description": "Cross section depth (height) of the column. Applied to all segments. Only effective for rectangular columns.",
-                            "exclusiveMinimum": 0.0
+                            "minimum": 0.0, "exclusiveMinimum": true
                         },
                         "coreAnchor": {
                             "type": "string",
@@ -1644,8 +1644,8 @@ var gCommands = [{
                         "begCoordinate": { "$ref": "#/Coordinate2D" },
                         "endCoordinate": { "$ref": "#/Coordinate2D" },
                         "zCoordinate": { "type": "number" },
-                        "height": { "type": "number", "exclusiveMinimum": 0.0 },
-                        "thickness": { "type": "number", "exclusiveMinimum": 0.0 },
+                        "height": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
+                        "thickness": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
                         "offset": { "type": "number" },
                         "referenceLineLocation": {
                             "type": "string",
@@ -1701,12 +1701,12 @@ var gCommands = [{
                         "width": {
                             "type": "number",
                             "description": "Cross section width of the beam. Applied to all segments.",
-                            "exclusiveMinimum": 0.0
+                            "minimum": 0.0, "exclusiveMinimum": true
                         },
                         "height": {
                             "type": "number",
                             "description": "Cross section height of the beam. Applied to all segments.",
-                            "exclusiveMinimum": 0.0
+                            "minimum": 0.0, "exclusiveMinimum": true
                         },
                         "anchorPoint": {
                             "type": "string",
@@ -1761,12 +1761,12 @@ var gCommands = [{
                         "totalHeight": {
                             "type": "number",
                             "description": "Total height of the stair.",
-                            "exclusiveMinimum": 0.0
+                            "minimum": 0.0, "exclusiveMinimum": true
                         },
                         "flightWidth": {
                             "type": "number",
                             "description": "Width of the stair flight.",
-                            "exclusiveMinimum": 0.0
+                            "minimum": 0.0, "exclusiveMinimum": true
                         },
                         "stepNum": {
                             "type": "integer",
@@ -1776,12 +1776,12 @@ var gCommands = [{
                         "riserHeight": {
                             "type": "number",
                             "description": "Height of each riser.",
-                            "exclusiveMinimum": 0.0
+                            "minimum": 0.0, "exclusiveMinimum": true
                         },
                         "treadDepth": {
                             "type": "number",
                             "description": "Depth (going) of each tread.",
-                            "exclusiveMinimum": 0.0
+                            "minimum": 0.0, "exclusiveMinimum": true
                         }
                     },
                     "additionalProperties": false,
@@ -1825,7 +1825,7 @@ var gCommands = [{
                     "thickness": {
                         "type": "number",
                         "description": "Optional slab thickness.",
-                        "exclusiveMinimum": 0.0
+                        "minimum": 0.0, "exclusiveMinimum": true
                     },
                     "referencePlaneLocation": {
                         "type": "string",
@@ -1891,8 +1891,8 @@ var gCommands = [{
                         "ownerWallId": { "$ref": "#/ElementId" },
                         "centerOffset": { "type": "number", "minimum": 0.0 },
                         "sillHeight": { "type": "number" },
-                        "width": { "type": "number", "exclusiveMinimum": 0.0 },
-                        "height": { "type": "number", "exclusiveMinimum": 0.0 },
+                        "width": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
+                        "height": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
                         "reflected": { "type": "boolean" },
                         "refSide": { "type": "boolean" },
                         "oSide": { "type": "boolean" },
@@ -1934,8 +1934,8 @@ var gCommands = [{
                         "ownerWallId": { "$ref": "#/ElementId" },
                         "centerOffset": { "type": "number", "minimum": 0.0 },
                         "sillHeight": { "type": "number" },
-                        "width": { "type": "number", "exclusiveMinimum": 0.0 },
-                        "height": { "type": "number", "exclusiveMinimum": 0.0 },
+                        "width": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
+                        "height": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
                         "reflected": { "type": "boolean" },
                         "refSide": { "type": "boolean" },
                         "oSide": { "type": "boolean" },
@@ -1976,8 +1976,8 @@ var gCommands = [{
                     "properties": {
                         "ownerElementId": { "$ref": "#/ElementId" },
                         "basePoint": { "$ref": "#/Coordinate3D" },
-                        "width": { "type": "number", "exclusiveMinimum": 0.0 },
-                        "height": { "type": "number", "exclusiveMinimum": 0.0 }
+                        "width": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
+                        "height": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true }
                     },
                     "additionalProperties": false,
                     "required": ["ownerElementId", "basePoint"]
@@ -2044,7 +2044,7 @@ var gCommands = [{
                     "type": "object",
                     "properties": {
                         "level": { "type": "number" },
-                        "thickness": { "type": "number", "exclusiveMinimum": 0.0 },
+                        "thickness": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
                         "polygonCoordinates": {
                             "type": "array",
                             "items": { "$ref": "#/Coordinate2D" },
@@ -2064,7 +2064,7 @@ var gCommands = [{
                                 "type": "object",
                                 "properties": {
                                     "levelHeight": { "type": "number" },
-                                    "levelAngle": { "type": "number", "exclusiveMinimum": 0.0 }
+                                    "levelAngle": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true }
                                 },
                                 "additionalProperties": false,
                                 "required": ["levelHeight", "levelAngle"]
@@ -2768,8 +2768,8 @@ var gCommands = [{
                         "elementId": { "$ref": "#/ElementId" },
                         "begCoordinate": { "$ref": "#/Coordinate2D" },
                         "endCoordinate": { "$ref": "#/Coordinate2D" },
-                        "height": { "type": "number", "exclusiveMinimum": 0.0 },
-                        "thickness": { "type": "number", "exclusiveMinimum": 0.0 },
+                        "height": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
+                        "thickness": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
                         "bottomOffset": { "type": "number" },
                         "offset": { "type": "number" },
                         "structureType": {
@@ -2833,7 +2833,7 @@ var gCommands = [{
                     "properties": {
                         "elementId": { "$ref": "#/ElementId" },
                         "zCoordinate": { "type": "number" },
-                        "thickness": { "type": "number", "exclusiveMinimum": 0.0 },
+                        "thickness": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
                         "structureType": {
                             "type": "string",
                             "enum": ["Basic", "Composite"]
@@ -2875,7 +2875,7 @@ var gCommands = [{
                         "elementId": { "$ref": "#/ElementId" },
                         "origin": { "$ref": "#/Coordinate2D" },
                         "zCoordinate": { "type": "number" },
-                        "height": { "type": "number", "exclusiveMinimum": 0.0 },
+                        "height": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
                         "bottomOffset": { "type": "number" },
                         "axisRotationAngle": { "type": "number" }
                     },
@@ -2901,8 +2901,8 @@ var gCommands = [{
                     "type": "object",
                     "properties": {
                         "elementId": { "$ref": "#/ElementId" },
-                        "width": { "type": "number", "exclusiveMinimum": 0.0 },
-                        "height": { "type": "number", "exclusiveMinimum": 0.0 },
+                        "width": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
+                        "height": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
                         "sillHeight": { "type": "number" },
                         "centerOffset": { "type": "number", "minimum": 0.0 },
                         "reflected": { "type": "boolean" },
@@ -2931,8 +2931,8 @@ var gCommands = [{
                     "type": "object",
                     "properties": {
                         "elementId": { "$ref": "#/ElementId" },
-                        "width": { "type": "number", "exclusiveMinimum": 0.0 },
-                        "height": { "type": "number", "exclusiveMinimum": 0.0 },
+                        "width": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
+                        "height": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
                         "sillHeight": { "type": "number" },
                         "centerOffset": { "type": "number", "minimum": 0.0 },
                         "reflected": { "type": "boolean" },
@@ -2988,7 +2988,7 @@ var gCommands = [{
                     "properties": {
                         "elementId": { "$ref": "#/ElementId" },
                         "level": { "type": "number" },
-                        "thickness": { "type": "number", "exclusiveMinimum": 0.0 },
+                        "thickness": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
                         "eavesOverhang": { "type": "number" },
                         "levels": {
                             "type": "array",
@@ -2998,7 +2998,7 @@ var gCommands = [{
                                 "type": "object",
                                 "properties": {
                                     "levelHeight": { "type": "number" },
-                                    "levelAngle": { "type": "number", "exclusiveMinimum": 0.0 }
+                                    "levelAngle": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true }
                                 },
                                 "additionalProperties": false,
                                 "required": ["levelHeight", "levelAngle"]
@@ -5027,7 +5027,7 @@ var gCommands = [{
                         "layoutDatabaseId": { "$ref": "#/DatabaseId" },
                         "name": { "type": "string", "minLength": 1 },
                         "position": { "$ref": "#/Coordinate2D" },
-                        "scale": { "type": "number", "exclusiveMinimum": 0.0 }
+                        "scale": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true }
                     },
                     "additionalProperties": false,
                     "required": ["navigatorItemId", "name", "position"]
@@ -5890,7 +5890,7 @@ var gCommands = [{
             "elementsOfDesignOptions": {
                 "type": "array",
                 "items": {
-                    "#ref": "#/ElementsOfDesignOptionOrError"
+                    "$ref": "#/ElementsOfDesignOptionOrError"
                 }
             }
         },

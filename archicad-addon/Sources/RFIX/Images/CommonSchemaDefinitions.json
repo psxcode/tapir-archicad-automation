@@ -3443,6 +3443,17 @@
             "guid"
         ]
     },
+    "NavigatorItemIdOrError": {
+        "description": "A navigator item identifier or an item-level execution error.",
+        "oneOf": [
+            {
+                "$ref": "#/NavigatorItemId"
+            },
+            {
+                "$ref": "#/ErrorItem"
+            }
+        ]
+    },
     "Databases": {
         "type": "array",
         "description": "A list of Archicad databases.",
@@ -3728,6 +3739,38 @@
             "offset": {
                 "type": "number",
                 "description": "wall's base line's offset from ref. line"
+            },
+            "referenceLineLocation": {
+                "type": "string",
+                "description": "The Archicad wall reference-line placement used by the wall axis.",
+                "enum": [
+                    "Outside",
+                    "Center",
+                    "Inside",
+                    "CoreOutside",
+                    "CoreCenter",
+                    "CoreInside",
+                    "Unknown"
+                ]
+            },
+            "offsetFromOutside": {
+                "type": "number",
+                "description": "The signed offset of the reference line from the wall outside surface."
+            },
+            "sequence": {
+                "type": "integer",
+                "description": "The Archicad wall intersection priority sequence."
+            },
+            "zoneRelation": {
+                "type": "string",
+                "description": "How the wall participates in automatic zone calculation.",
+                "enum": [
+                    "Boundary",
+                    "ReduceArea",
+                    "None",
+                    "SubtractFromZone",
+                    "Unknown"
+                ]
             },
             "arcAngle": {
                 "type": "number",
@@ -5303,7 +5346,7 @@
                 "type": "array",
                 "description": "Polygon (in model coordinates) used to clip the drawing view. At least 3 points. Setting this also enables polygon clipping (useDrawingPolyClip).",
                 "items": {
-                    "$ref": "#/2DCoordinate"
+                    "$ref": "#/Coordinate2D"
                 },
                 "minItems": 3
             }
@@ -5731,6 +5774,82 @@
         "required": [
             "connectedElements"
         ]
+    },
+    "WallRelationItems": {
+        "type": "array",
+        "description": "Native wall connection relations returned by ACAPI_Element_GetRelations.",
+        "items": {
+            "type": "object",
+            "properties": {
+                "elementId": {
+                    "$ref": "#/ElementId"
+                },
+                "connectedWithBeginning": {
+                    "type": "boolean",
+                    "description": "Whether the related wall connects with its beginning point."
+                }
+            },
+            "additionalProperties": false,
+            "required": [
+                "elementId",
+                "connectedWithBeginning"
+            ]
+        }
+    },
+    "RoomRelationElementGroup": {
+        "type": "object",
+        "properties": {
+            "elementType": { "type": "string" },
+            "elementIds": {
+                "type": "array",
+                "items": { "$ref": "#/ElementId" }
+            }
+        },
+        "additionalProperties": false,
+        "required": ["elementType", "elementIds"]
+    },
+    "RoomRelationWallPart": {
+        "type": "object",
+        "properties": {
+            "wallElementId": { "$ref": "#/ElementId" },
+            "roomEdge": { "type": "integer" },
+            "tBeg": { "type": "number" },
+            "tEnd": { "type": "number" }
+        },
+        "additionalProperties": false,
+        "required": ["wallElementId", "roomEdge", "tBeg", "tEnd"]
+    },
+    "ZoneRoomRelation": {
+        "type": "object",
+        "properties": {
+            "elementId": { "$ref": "#/ElementId" },
+            "status": { "type": "string", "enum": ["success", "error"] },
+            "error": { "type": "string" },
+            "relatedElements": {
+                "type": "array",
+                "items": { "$ref": "#/RoomRelationElementGroup" }
+            },
+            "wallParts": {
+                "type": "array",
+                "items": { "$ref": "#/RoomRelationWallPart" }
+            }
+        },
+        "additionalProperties": false,
+        "required": ["status"]
+    },
+    "DoorRoomRelation": {
+        "type": "object",
+        "properties": {
+            "elementId": { "$ref": "#/ElementId" },
+            "status": { "type": "string", "enum": ["success", "error"] },
+            "error": { "type": "string" },
+            "zoneElementIds": {
+                "type": "array",
+                "items": { "$ref": "#/ElementId" }
+            }
+        },
+        "additionalProperties": false,
+        "required": ["status"]
     },
     "ConnectedElementsOrError": {
         "type": "object",

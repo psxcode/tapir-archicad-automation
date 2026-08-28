@@ -2,6 +2,8 @@
 #include "3DCutPlaneCommands.hpp"
 #include "MigrationHelper.hpp"
 
+#include <limits>
+
 GS::String Set3DCutPlanesCommand::GetName () const
 {
     return "Set3DCutPlanes";
@@ -17,34 +19,38 @@ Set3DCutPlanesCommand::Set3DCutPlanesCommand () :
 
 static GSErrCode _Set3DCutPlanes (const GS::Array<GS::ObjectState>& cutPlanes)
 {
+    if (cutPlanes.IsEmpty () || static_cast<GSSize> (cutPlanes.GetSize ()) > static_cast<GSSize> (std::numeric_limits<short>::max ())) {
+        return APIERR_BADPARS;
+    }
+
     API_3DCutPlanesInfo cutInfo {};
 
     GSErrCode err = ACAPI_View_Get3DCuttingPlanes (&cutInfo);
     if (err == NoError) {
-        if (cutInfo.shapes != nullptr)
-            BMKillHandle ((GSHandle*) &(cutInfo.shapes));
-
         cutInfo.isCutPlanes = true;
         cutInfo.useCustom = false;
         cutInfo.nShapes = (short) cutPlanes.GetSize ();
-        cutInfo.shapes = reinterpret_cast<API_3DCutShapeType**> (BMAllocateHandle (cutInfo.nShapes * sizeof (API_3DCutShapeType), ALLOCATE_CLEAR, 0));
-        if (cutInfo.shapes != nullptr) {
-            // it is possible to define further attributes like cutStatus and cutPen
-            // you can look it up here:
-            // https://graphisoft.github.io/archicad-api-devkit/struct_a_p_i__3_d_cut_shape_type.html
-            // for now, we only pass coordinates
-            if (!cutPlanes.IsEmpty ()) {
-                for (int i = 0; i < cutInfo.nShapes; ++i) {
-                    cutPlanes[i].Get ("pa", (*cutInfo.shapes)[i].pa);
-                    cutPlanes[i].Get ("pb", (*cutInfo.shapes)[i].pb);
-                    cutPlanes[i].Get ("pc", (*cutInfo.shapes)[i].pc);
-                    cutPlanes[i].Get ("pd", (*cutInfo.shapes)[i].pd);
-                }
-            } else {
-                return APIERR_BADPARS;;
-            }
-        } else {
+        API_3DCutShapeType** newShapes = reinterpret_cast<API_3DCutShapeType**> (BMAllocateHandle (
+            static_cast<GSSize> (cutInfo.nShapes) * sizeof (API_3DCutShapeType), ALLOCATE_CLEAR, 0));
+        if (newShapes == nullptr || *newShapes == nullptr) {
+            if (newShapes != nullptr)
+                BMKillHandle (reinterpret_cast<GSHandle*> (&newShapes));
+            if (cutInfo.shapes != nullptr)
+                BMKillHandle (reinterpret_cast<GSHandle*> (&cutInfo.shapes));
             return APIERR_MEMFULL;
+        }
+
+        if (cutInfo.shapes != nullptr)
+            BMKillHandle (reinterpret_cast<GSHandle*> (&cutInfo.shapes));
+        cutInfo.shapes = newShapes;
+
+        // It is possible to define further attributes like cutStatus and cutPen;
+        // for now, only the plane coefficients are supplied.
+        for (int i = 0; i < cutInfo.nShapes; ++i) {
+            cutPlanes[i].Get ("pa", (*cutInfo.shapes)[i].pa);
+            cutPlanes[i].Get ("pb", (*cutInfo.shapes)[i].pb);
+            cutPlanes[i].Get ("pc", (*cutInfo.shapes)[i].pc);
+            cutPlanes[i].Get ("pd", (*cutInfo.shapes)[i].pd);
         }
 
         err = ACAPI_View_Change3DCuttingPlanes (&cutInfo);

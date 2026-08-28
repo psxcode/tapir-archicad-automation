@@ -5,6 +5,7 @@
 #include "File.hpp"
 #include "FileSystem.hpp"
 #include "GSUnID.hpp"
+#include "NativeOwnership.hpp"
 
 AddFilesToEmbeddedLibraryCommand::AddFilesToEmbeddedLibraryCommand () :
     CommandBase (CommonSchema::Used)
@@ -409,6 +410,7 @@ GS::ObjectState GetAvailableLibraryPartsCommand::Execute (const GS::ObjectState&
 
     for (Int32 i = 1; i <= partCount; ++i) {
         API_LibPart libPart = {};
+        LibraryPartLocationGuard libPartLocationGuard (libPart);
         libPart.index = i;
         err = ACAPI_LibraryPart_Get (&libPart);
         if (err != NoError) {
@@ -436,11 +438,6 @@ GS::ObjectState GetAvailableLibraryPartsCommand::Execute (const GS::ObjectState&
             libpartAdder (entry);
         }
 
-        // ACAPI_LibraryPart_Get allocates libPart.location; free it on
-        // every successful Get to avoid leaking ~one IO::Location per
-        // libpart (thousands per call).
-        delete libPart.location;
-        libPart.location = nullptr;
     }
 
     response.Add ("skippedCount", skippedCount);

@@ -27,7 +27,11 @@ static bool GenerateDocumentation (const IO::Location& folder, const std::vector
     static const GS::UniString NullString ("null");
     IO::Location commonSchemaLocation = folder;
     commonSchemaLocation.AppendToLocal (IO::Name ("common_schema_definitions.js"));
-    GS::UniString commonSchemaContent = "var gSchemaDefinitions = " + GetCommonSchemaDefinitions () + ";";
+    const GS::Optional<GS::UniString> commonSchemaDefinitions = GetCommonSchemaDefinitions ();
+    if (commonSchemaDefinitions.IsEmpty ()) {
+        return false;
+    }
+    GS::UniString commonSchemaContent = "var gSchemaDefinitions = " + *commonSchemaDefinitions + ";";
     if (!WriteStringToFile (commonSchemaLocation, commonSchemaContent)) {
         return false;
     }

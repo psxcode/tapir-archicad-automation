@@ -8,6 +8,8 @@
 #include <set>
 #include <map>
 #include <atomic>
+#include <memory>
+#include <mutex>
 #include <vector>
 
 namespace HTTP {
@@ -65,6 +67,8 @@ public:
     static void SendEventToNotificationClient (ElementEventType eventType, const GS::ObjectState& os);
     static void SendQueuedEventsToNotificationClient ();
     static void SendMessageToNotificationClient (Client& client, const GS::ObjectState& os);
+    /** Unregister callbacks, detach element observers, and join the sender. */
+    static GSErrCode Shutdown ();
     static GSErrCode ElementEventHandlerProc (const API_NotifyElementType *elemType);
     static GSErrCode ElementReservationChangeHandler (const GS::HashTable<API_Guid, short>& reserved,
                                                       const GS::HashSet<API_Guid>&          released,
@@ -74,14 +78,17 @@ private:
     friend class MessageSenderTask;
     friend class RemoveElementNotificationClientCommand;
     static std::map<GS::UniString, Client> clients;
-    static bool hasClientToNotifyOnNew;
-    static bool hasClientToNotifyOnModification;
-    static bool hasClientToNotifyOnReservationChanges;
+    static std::mutex stateMutex;
+    static std::atomic_bool hasClientToNotifyOnNew;
+    static std::atomic_bool hasClientToNotifyOnModification;
+    static std::atomic_bool hasClientToNotifyOnReservationChanges;
 
     using EventQueue = std::map<ElementEventType, std::vector<GS::ObjectState>>;
     static std::unique_ptr<EventQueue> queuedEvents;
 
     static GS::Thread messageSenderThread;
+    static std::mutex messageSenderMutex;
+    static std::atomic_bool messageSenderStarted;
 };
 
 class RemoveElementNotificationClientCommand : public CommandBase

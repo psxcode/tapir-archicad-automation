@@ -4,6 +4,9 @@
 #include "Matrix2.hpp"
 #include "TM.h"
 
+#include <cmath>
+#include <memory>
+
 static GS::HashTable<GS::UniString, API_Guid> GetPublisherSetNameGuidTable()
 {
     GS::HashTable<GS::UniString, API_Guid> table;
@@ -72,11 +75,13 @@ GS::ObjectState PublishPublisherSetCommand::Execute(const GS::ObjectState& param
 
     API_PublishPars publishPars = {};
     publishPars.guid = publisherSetNameGuidTable.Get(publisherSetName);
+    std::unique_ptr<IO::Location> outputPathLocation;
 
     if (parameters.Contains("outputPath")) {
         GS::UniString outputPath;
         parameters.Get("outputPath", outputPath);
-        publishPars.path = new IO::Location(outputPath);
+        outputPathLocation = std::make_unique<IO::Location>(outputPath);
+        publishPars.path = outputPathLocation.get();
     }
 
     GS::Array<API_Guid> selectedLinks;
@@ -88,7 +93,6 @@ GS::ObjectState PublishPublisherSetCommand::Execute(const GS::ObjectState& param
         for (const GS::ObjectState& navigatorItemIdArrayItem : selectedNavigatorItemIds) {
             const API_Guid selectedGuid = GetGuidFromNavigatorItemIdArrayItem(navigatorItemIdArrayItem);
             if (selectedGuid == APINULLGuid) {
-                delete publishPars.path;
                 return CreateErrorResponse(APIERR_BADPARS, "selectedNavigatorItemId is corrupt or missing.");
             }
             selectedLinks.Push(selectedGuid);
@@ -100,7 +104,6 @@ GS::ObjectState PublishPublisherSetCommand::Execute(const GS::ObjectState& param
     }
 
     GSErrCode err = ACAPI_ProjectOperation_Publish(&publishPars, selectedLinksPtr);
-    delete publishPars.path;
 
     if (err != NoError) {
         return CreateErrorResponse(err, "Publishing failed. Check output path!");
@@ -738,6 +741,150 @@ GS::ObjectState GetView2DTransformationsCommand::Execute (const GS::ObjectState&
     return response;
 }
 
+SetView2DZoomCommand::SetView2DZoomCommand () :
+    CommandBase (CommonSchema::Used)
+{}
+
+GS::String SetView2DZoomCommand::GetName () const
+{
+    return "SetView2DZoom";
+}
+
+GS::Optional<GS::UniString> SetView2DZoomCommand::GetInputParametersSchema () const
+{
+    return R"({
+        "type": "object",
+        "properties": {
+            "zoom": {
+                "type": "object",
+                "properties": {
+                    "xMin": { "type": "number" },
+                    "yMin": { "type": "number" },
+                    "xMax": { "type": "number" },
+                    "yMax": { "type": "number" }
+                },
+                "additionalProperties": false,
+                "required": ["xMin", "yMin", "xMax", "yMax"]
+            }
+        },
+        "additionalProperties": false,
+        "required": ["zoom"]
+    })";
+}
+
+GS::Optional<GS::UniString> SetView2DZoomCommand::GetResponseSchema () const
+{
+    return R"({
+        "type": "object",
+        "properties": {
+            "status": { "type": "string", "enum": ["set", "set_unverified"] },
+            "verificationStatus": { "type": "string", "enum": ["verified", "unavailable", "mismatch"] },
+            "requested": {
+                "type": "object",
+                "properties": {
+                    "zoom": {
+                        "type": "object",
+                        "properties": {
+                            "xMin": { "type": "number" },
+                            "yMin": { "type": "number" },
+                            "xMax": { "type": "number" },
+                            "yMax": { "type": "number" }
+                        },
+                        "additionalProperties": false,
+                        "required": ["xMin", "yMin", "xMax", "yMax"]
+                    }
+                },
+                "additionalProperties": false,
+                "required": ["zoom"]
+            },
+            "currentZoom": {
+                "type": "object",
+                "properties": {
+                    "xMin": { "type": "number" },
+                    "yMin": { "type": "number" },
+                    "xMax": { "type": "number" },
+                    "yMax": { "type": "number" }
+                },
+                "additionalProperties": false,
+                "required": ["xMin", "yMin", "xMax", "yMax"]
+            }
+        },
+        "additionalProperties": false,
+        "required": ["status", "verificationStatus", "requested"]
+    })";
+}
+
+namespace {
+
+static GS::ObjectState ZoomObjectState (const API_Box& zoom)
+{
+    return GS::ObjectState (
+        "xMin", zoom.xMin,
+        "yMin", zoom.yMin,
+        "xMax", zoom.xMax,
+        "yMax", zoom.yMax);
+}
+
+}
+
+GS::ObjectState SetView2DZoomCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl& /*processControl*/) const
+{
+    const GS::ObjectState* zoomObject = parameters.Get ("zoom");
+    API_Box requested = {};
+    if (zoomObject == nullptr
+        || !zoomObject->Get ("xMin", requested.xMin)
+        || !zoomObject->Get ("yMin", requested.yMin)
+        || !zoomObject->Get ("xMax", requested.xMax)
+        || !zoomObject->Get ("yMax", requested.yMax)
+        || !std::isfinite (requested.xMin) || !std::isfinite (requested.yMin)
+        || !std::isfinite (requested.xMax) || !std::isfinite (requested.yMax)
+        || !(requested.xMin < requested.xMax && requested.yMin < requested.yMax)) {
+        return CreateFailedExecutionResult (APIERR_BADPARS, "zoom must contain finite coordinates with positive area.");
+    }
+
+    API_WindowInfo windowInfo = {};
+    const GSErrCode windowErr = ACAPI_Window_GetCurrentWindow (&windowInfo);
+    if (windowErr != NoError) {
+        return CreateErrorResponse (windowErr, "Failed to inspect the current window before setting the viewport.");
+    }
+    if (windowInfo.typeID != APIWind_FloorPlanID) {
+        return CreateFailedExecutionResult (APIERR_REFUSEDCMD, "SetView2DZoom is supported only for the active FloorPlan window.");
+    }
+
+    API_Box previous = {};
+    API_Tranmat previousTranmat = {};
+    const GSErrCode previousErr = ACAPI_View_GetZoom (&previous, &previousTranmat);
+    if (previousErr != NoError) {
+        return CreateErrorResponse (previousErr, "Failed to read the current FloorPlan viewport.");
+    }
+
+    const GSErrCode setErr = TAPIR_View_SetZoom (&requested);
+    if (setErr != NoError) {
+        return CreateErrorResponse (setErr, "Failed to set the active FloorPlan viewport.");
+    }
+
+    API_Box current = {};
+    API_Tranmat currentTranmat = {};
+    const GSErrCode currentErr = ACAPI_View_GetZoom (&current, &currentTranmat);
+    // Archicad may expand one axis to preserve the active window aspect
+    // ratio. Treat the requested rectangle as verified when the actual
+    // readback fully contains it; a clipped/shrunk readback remains unverified.
+    const bool verified = currentErr == NoError
+        && current.xMin <= requested.xMin + 1.0e-9
+        && current.yMin <= requested.yMin + 1.0e-9
+        && current.xMax + 1.0e-9 >= requested.xMax
+        && current.yMax + 1.0e-9 >= requested.yMax;
+
+    GS::ObjectState response;
+    response.Add ("status", verified ? "set" : "set_unverified");
+    response.Add ("verificationStatus", verified ? "verified" : currentErr == NoError ? "mismatch" : "unavailable");
+    response.Add ("requested", GS::ObjectState ("zoom", ZoomObjectState (requested)));
+    if (currentErr == NoError) {
+        response.Add ("currentZoom", ZoomObjectState (current));
+    }
+    return response;
+}
+
 SetViewRotationCommand::SetViewRotationCommand () :
     CommandBase (CommonSchema::Used)
 {}
@@ -1147,7 +1294,8 @@ GS::ObjectState CreateViewsInViewMapCommand::Execute (const GS::ObjectState& par
 
         GS::UniString newName;
         if (item.Get ("name", newName) && !newName.IsEmpty ()) {
-            GS::ucscpy (createdItem.uName, newName.ToUStr ());
+            GS::ucsncpy (createdItem.uName, newName.ToUStr (), GS::ArraySize (createdItem.uName));
+            createdItem.uName[GS::ArraySize (createdItem.uName) - 1] = 0;
             createdItem.customName = true;
         }
 
@@ -1222,7 +1370,8 @@ GS::ObjectState CreateViewMapFolderCommand::Execute (const GS::ObjectState& para
     folderItem.itemType   = API_FolderNavItem;
     folderItem.mapId      = API_PublicViewMap;
     folderItem.customName = true;
-    GS::ucscpy (folderItem.uName, folderName.ToUStr ());
+    GS::ucsncpy (folderItem.uName, folderName.ToUStr (), GS::ArraySize (folderItem.uName));
+    folderItem.uName[GS::ArraySize (folderItem.uName) - 1] = 0;
 
     const GSErrCode err = ACAPI_Navigator_NewNavigatorView (&folderItem, nullptr, parentGuidPtr, nullptr);
     if (err != NoError) {
@@ -1360,11 +1509,11 @@ GS::ObjectState RenameNavigatorItemCommand::Execute (const GS::ObjectState& para
         API_LayoutInfo layoutInfo = {};
         BNZeroMemory (&layoutInfo, sizeof (layoutInfo));
         if (ACAPI_Navigator_GetLayoutSets (&layoutInfo, &navItem.db.databaseUnId) == NoError) {
+            std::unique_ptr<GS::HashTable<API_Guid, GS::UniString>> customData (layoutInfo.customData);
             CHTruncate (newId.ToCStr ().Get (), layoutInfo.customLayoutNumber,
                         GS::ArraySize (layoutInfo.customLayoutNumber));
             layoutInfo.customLayoutNumbering = true;
             ACAPI_Navigator_ChangeLayoutSets (&layoutInfo, &navItem.db.databaseUnId);
-            delete layoutInfo.customData;
             layoutInfo.customData = nullptr;
         }
     }
