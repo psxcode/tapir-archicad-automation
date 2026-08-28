@@ -3,6 +3,11 @@
 #include "ObjectState.hpp"
 #include "MigrationHelper.hpp"
 #include "NotificationCommands.hpp"
+#include "NativeOwnership.hpp"
+
+#include <limits>
+#include <memory>
+#include <new>
 
 CreateElementsCommandBase::CreateElementsCommandBase (const GS::String& commandNameIn, API_ElemTypeID elemTypeIDIn, const GS::String& arrayFieldNameIn)
     : CommandBase (CommonSchema::Used)
@@ -49,23 +54,38 @@ GS::ObjectState	CreateElementsCommandBase::Execute (const GS::ObjectState& param
     AddElementNotificationClientCommand::ElementEventHandlerProc (&notification);
 
     ACAPI_CallUndoableCommand ("Create " + elemTypeName, [&] () -> GSErrCode {
-        API_Element element = {};
-        API_ElementMemo memo = {};
-        const GS::OnExit guard ([&memo] () { ACAPI_DisposeElemMemoHdls (&memo); });
-
-#ifdef ServerMainVers_2600
-        element.header.type   = elemTypeID;
-#else
-        element.header.typeID = elemTypeID;
-#endif
-        GSErrCode err = ACAPI_Element_GetDefaults (&element, &memo);
-
-        bool savedAutoTextFlag;
-        ACAPI_AutoText_GetAutoTextFlag (&savedAutoTextFlag);
+        bool savedAutoTextFlag = false;
+        const GSErrCode autoTextErr = ACAPI_AutoText_GetAutoTextFlag (&savedAutoTextFlag);
+        if (autoTextErr != NoError) {
+            elements (CreateErrorResponse (autoTextErr, "Failed to read the AutoText flag."));
+            return NoError;
+        }
+        const GS::OnExit autoTextGuard ([&savedAutoTextFlag] () {
+            ACAPI_AutoText_ChangeAutoTextFlag (&savedAutoTextFlag);
+        });
         bool setAutoTextFlag = false;
-        ACAPI_AutoText_ChangeAutoTextFlag (&setAutoTextFlag);
+        const GSErrCode disableAutoTextErr = ACAPI_AutoText_ChangeAutoTextFlag (&setAutoTextFlag);
+        if (disableAutoTextErr != NoError) {
+            elements (CreateErrorResponse (disableAutoTextErr, "Failed to disable the AutoText flag."));
+            return NoError;
+        }
 
         for (const GS::ObjectState& data : dataArray) {
+            API_Element element = {};
+            API_ElementMemo memo = {};
+            const GS::OnExit memoGuard ([&memo] () { ACAPI_DisposeElemMemoHdls (&memo); });
+
+#ifdef ServerMainVers_2600
+            element.header.type = elemTypeID;
+#else
+            element.header.typeID = elemTypeID;
+#endif
+            GSErrCode err = ACAPI_Element_GetDefaults (&element, &memo);
+            if (err != NoError) {
+                elements (CreateErrorResponse (err, "Failed to get defaults for new " + elemTypeName));
+                continue;
+            }
+
             auto os = SetTypeSpecificParameters (element, memo, stories, data);
             if (os.HasValue ()) {
                 elements (*os);
@@ -85,8 +105,6 @@ GS::ObjectState	CreateElementsCommandBase::Execute (const GS::ObjectState& param
 
             elements (CreateElementIdObjectState (element.header.guid));
         }
-
-        ACAPI_AutoText_ChangeAutoTextFlag (&savedAutoTextFlag);
 
         return NoError;
     });
@@ -142,7 +160,7 @@ GS::Optional<GS::UniString> CreateColumnsCommand::GetInputParametersSchema () co
                         "height": {
                             "type": "number",
                             "description": "Optional column height.",
-                            "exclusiveMinimum": 0.0
+                            "minimum": 0.0, "exclusiveMinimum": true
                         },
                         "axisRotationAngle": {
                             "type": "number",
@@ -151,12 +169,12 @@ GS::Optional<GS::UniString> CreateColumnsCommand::GetInputParametersSchema () co
                         "width": {
                             "type": "number",
                             "description": "Cross section width of the column. Applied to all segments.",
-                            "exclusiveMinimum": 0.0
+                            "minimum": 0.0, "exclusiveMinimum": true
                         },
                         "depth": {
                             "type": "number",
                             "description": "Cross section depth (height) of the column. Applied to all segments. Only effective for rectangular columns.",
-                            "exclusiveMinimum": 0.0
+                            "minimum": 0.0, "exclusiveMinimum": true
                         },
                         "coreAnchor": {
                             "type": "string",
@@ -247,7 +265,7 @@ GS::Optional<GS::UniString> CreateSlabsCommand::GetInputParametersSchema () cons
                     "thickness": {
                         "type": "number",
                         "description": "Optional slab thickness.",
-                        "exclusiveMinimum": 0.0
+                        "minimum": 0.0, "exclusiveMinimum": true
                     },
                     "referencePlaneLocation": {
                         "type": "string",
@@ -300,6 +318,10 @@ GS::Array<API_PolyArc> GetPolyArcs (const GS::Array<GS::ObjectState>& arcs, Int3
         if (arc.Get ("begIndex", polyArc.begIndex) &&
             arc.Get ("endIndex", polyArc.endIndex) &&
             arc.Get ("arcAngle", polyArc.arcAngle)) {
+            if (polyArc.begIndex < 0 || polyArc.endIndex < polyArc.begIndex || iStart < 0 ||
+                polyArc.begIndex > std::numeric_limits<Int32>::max () - iStart ||
+                polyArc.endIndex > std::numeric_limits<Int32>::max () - iStart)
+                continue;
             polyArc.begIndex += iStart;
             polyArc.endIndex += iStart;
             polyArcs.Push (polyArc);
@@ -308,7 +330,7 @@ GS::Array<API_PolyArc> GetPolyArcs (const GS::Array<GS::ObjectState>& arcs, Int3
     return polyArcs;
 }
 
-void AddPolyToMemo (const GS::Array<GS::ObjectState>& coords,
+GSErrCode AddPolyToMemo (const GS::Array<GS::ObjectState>& coords,
                            const GS::Array<GS::ObjectState>& arcs,
                            Int32&                            iCoord,
                            Int32&                            iArc,
@@ -318,6 +340,46 @@ void AddPolyToMemo (const GS::Array<GS::ObjectState>& coords,
                            const API_OverriddenAttribute*    sideMat,
                            bool                              processVertexIDs)
 {
+    if (memo.coords == nullptr || *memo.coords == nullptr || memo.pends == nullptr || *memo.pends == nullptr)
+        return APIERR_MEMFULL;
+    const GSSize coordCapacity = BMhGetSize (reinterpret_cast<GSHandle> (memo.coords)) / sizeof (API_Coord);
+    const GSSize pendsCapacity = BMhGetSize (reinterpret_cast<GSHandle> (memo.pends)) / sizeof (Int32);
+    const GSSize coordinateCount = static_cast<GSSize> (coords.GetSize ());
+    if (coordinateCount < 1 || iCoord < 1 || iPends < 1 ||
+        coordinateCount > static_cast<GSSize> (std::numeric_limits<Int32>::max ()) - static_cast<GSSize> (iCoord) - 1 ||
+        static_cast<GSSize> (iCoord) + coordinateCount + 1 > coordCapacity ||
+        static_cast<GSSize> (iPends) >= pendsCapacity)
+        return APIERR_BADPARS;
+    if (edgeTrimSideType != nullptr &&
+        (memo.edgeTrims == nullptr || *memo.edgeTrims == nullptr || static_cast<GSSize> (iCoord) + coordinateCount + 1 >
+            BMhGetSize (reinterpret_cast<GSHandle> (memo.edgeTrims)) / sizeof (API_EdgeTrim)))
+        return APIERR_MEMFULL;
+    if (processVertexIDs &&
+        (memo.vertexIDs == nullptr || *memo.vertexIDs == nullptr ||
+         static_cast<GSSize> (iCoord) + coordinateCount + 1 >
+             BMhGetSize (reinterpret_cast<GSHandle> (memo.vertexIDs)) / sizeof (UInt32)))
+        return APIERR_MEMFULL;
+    if (memo.sideMaterials != nullptr &&
+        static_cast<GSSize> (iCoord) + coordinateCount + 1 >
+            BMGetPtrSize (reinterpret_cast<GSPtr> (memo.sideMaterials)) / sizeof (API_OverriddenAttribute)) {
+        return APIERR_MEMFULL;
+    }
+    if (sideMat != nullptr && memo.sideMaterials == nullptr)
+        return APIERR_MEMFULL;
+    if (memo.meshPolyZ != nullptr &&
+        *memo.meshPolyZ == nullptr)
+        return APIERR_MEMFULL;
+    if (memo.meshPolyZ != nullptr &&
+        static_cast<GSSize> (iCoord) + coordinateCount + 1 >
+            BMhGetSize (reinterpret_cast<GSHandle> (memo.meshPolyZ)) / sizeof (double))
+        return APIERR_MEMFULL;
+
+    const GS::Array<API_PolyArc> polyArcs = GetPolyArcs (arcs, iCoord);
+    if (!polyArcs.IsEmpty () && (memo.parcs == nullptr || *memo.parcs == nullptr ||
+        static_cast<GS::USize> (iArc) + polyArcs.GetSize () >
+            BMhGetSize (reinterpret_cast<GSHandle> (memo.parcs)) / sizeof (API_PolyArc)))
+        return APIERR_MEMFULL;
+
     Int32 iStart = iCoord;
     for (const GS::ObjectState& coord : coords) {
         (*memo.coords)[iCoord] = Get2DCoordinateFromObjectState (coord);
@@ -352,10 +414,10 @@ void AddPolyToMemo (const GS::Array<GS::ObjectState>& coords,
     }
     ++iCoord;
 
-    const GS::Array<API_PolyArc> polyArcs = GetPolyArcs (arcs, iStart);
     for (const API_PolyArc& a : polyArcs) {
         (*memo.parcs)[iArc++] = a;
     }
+    return NoError;
 }
 
 GS::Optional<GS::ObjectState> CreateSlabsCommand::SetTypeSpecificParameters (API_Element& element, API_ElementMemo& memo, const Stories& stories, const GS::ObjectState& parameters) const
@@ -514,44 +576,64 @@ GS::Optional<GS::ObjectState> CreateZonesCommand::SetTypeSpecificParameters (API
         if (IsSame2DCoordinate (polygonCoordinates.GetFirst (), polygonCoordinates.GetLast ())) {
             polygonCoordinates.Pop ();
         }
-        element.zone.poly.nCoords	= polygonCoordinates.GetSize() + 1;
-        element.zone.poly.nSubPolys	= 1;
-        element.zone.poly.nArcs		= polygonArcs.GetSize ();
+        const GSSize maxInt32 = static_cast<GSSize> (std::numeric_limits<Int32>::max ());
+        const GSSize outerCoordinateCount = static_cast<GSSize> (polygonCoordinates.GetSize ());
+        const GSSize outerArcCount = static_cast<GSSize> (polygonArcs.GetSize ());
+        if (outerCoordinateCount < 3 || outerCoordinateCount > maxInt32 - 1 || outerArcCount > maxInt32)
+            return CreateErrorResponse (APIERR_BADPARS, "Zone polygon dimensions exceed the supported range.");
+
+        GSSize totalCoordinateCount = outerCoordinateCount + 1;
+        GSSize totalSubPolygonCount = 1;
+        GSSize totalArcCount = outerArcCount;
 
         for (const GS::ObjectState& hole : holes) {
             GS::Array<GS::ObjectState> holePolygonOutline;
             GS::Array<GS::ObjectState> holePolygonArcs;
-            if (GetHoleGeometry (hole, holePolygonOutline, holePolygonArcs)) {
-                element.zone.poly.nCoords += holePolygonOutline.GetSize () + 1;
-                ++element.zone.poly.nSubPolys;
-                element.zone.poly.nArcs += holePolygonArcs.GetSize ();
+            if (GetHoleGeometry (hole, holePolygonOutline, holePolygonArcs) && holePolygonOutline.GetSize () >= 3) {
+                const GSSize holeCoordinateCount = static_cast<GSSize> (holePolygonOutline.GetSize ());
+                const GSSize holeArcCount = static_cast<GSSize> (holePolygonArcs.GetSize ());
+                if (totalCoordinateCount > maxInt32 - 1 || totalSubPolygonCount >= maxInt32 || totalArcCount > maxInt32 ||
+                    holeCoordinateCount > maxInt32 - totalCoordinateCount - 1 || holeArcCount > maxInt32 - totalArcCount)
+                    return CreateErrorResponse (APIERR_BADPARS, "Zone polygon dimensions exceed the supported range.");
+                totalCoordinateCount += holeCoordinateCount + 1;
+                ++totalSubPolygonCount;
+                totalArcCount += holeArcCount;
             }
         }
 
-        memo.coords = reinterpret_cast<API_Coord**> (BMAllocateHandle ((element.zone.poly.nCoords + 1) * sizeof (API_Coord), ALLOCATE_CLEAR, 0));
-        memo.pends = reinterpret_cast<Int32**> (BMAllocateHandle ((element.zone.poly.nSubPolys + 1) * sizeof (Int32), ALLOCATE_CLEAR, 0));
-        memo.parcs = reinterpret_cast<API_PolyArc**> (BMAllocateHandle (element.zone.poly.nArcs * sizeof (API_PolyArc), ALLOCATE_CLEAR, 0));
+        element.zone.poly.nCoords = static_cast<Int32> (totalCoordinateCount);
+        element.zone.poly.nSubPolys = static_cast<Int32> (totalSubPolygonCount);
+        element.zone.poly.nArcs = static_cast<Int32> (totalArcCount);
+        const GSSize coordMemoCount = totalCoordinateCount + 1;
+        const GSSize pendMemoCount = totalSubPolygonCount + 1;
+        if (coordMemoCount > std::numeric_limits<GSSize>::max () / sizeof (API_Coord) ||
+            pendMemoCount > std::numeric_limits<GSSize>::max () / sizeof (Int32) ||
+            totalArcCount > std::numeric_limits<GSSize>::max () / sizeof (API_PolyArc))
+            return CreateErrorResponse (APIERR_BADPARS, "Zone polygon memo dimensions exceed the supported range.");
+
+        memo.coords = reinterpret_cast<API_Coord**> (BMAllocateHandle (coordMemoCount * sizeof (API_Coord), ALLOCATE_CLEAR, 0));
+        memo.pends = reinterpret_cast<Int32**> (BMAllocateHandle (pendMemoCount * sizeof (Int32), ALLOCATE_CLEAR, 0));
+        if (totalArcCount > 0)
+            memo.parcs = reinterpret_cast<API_PolyArc**> (BMAllocateHandle (totalArcCount * sizeof (API_PolyArc), ALLOCATE_CLEAR, 0));
+        if (memo.coords == nullptr || *memo.coords == nullptr || memo.pends == nullptr || *memo.pends == nullptr ||
+            (element.zone.poly.nArcs > 0 && (memo.parcs == nullptr || *memo.parcs == nullptr))) {
+            return CreateErrorResponse (APIERR_MEMFULL, "Failed to allocate zone polygon memo data.");
+        }
 
         Int32 iCoord = 1;
         Int32 iArc = 0;
         Int32 iPends = 1;
-        AddPolyToMemo(polygonCoordinates,
-                      polygonArcs,
-                      iCoord,
-                      iArc,
-                      iPends,
-                      memo);
+        GSErrCode memoErr = AddPolyToMemo (polygonCoordinates, polygonArcs, iCoord, iArc, iPends, memo);
+        if (memoErr != NoError)
+            return CreateErrorResponse (memoErr, "Failed to populate zone polygon memo data.");
 
         for (const GS::ObjectState& hole : holes) {
             GS::Array<GS::ObjectState> holePolygonOutline;
             GS::Array<GS::ObjectState> holePolygonArcs;
-            if (GetHoleGeometry (hole, holePolygonOutline, holePolygonArcs)) {
-                AddPolyToMemo (holePolygonOutline,
-                              holePolygonArcs,
-                              iCoord,
-                              iArc,
-                              iPends,
-                              memo);
+            if (GetHoleGeometry (hole, holePolygonOutline, holePolygonArcs) && holePolygonOutline.GetSize () >= 3) {
+                memoErr = AddPolyToMemo (holePolygonOutline, holePolygonArcs, iCoord, iArc, iPends, memo);
+                if (memoErr != NoError)
+                    return CreateErrorResponse (memoErr, "Failed to populate zone hole memo data.");
             }
         }
 
@@ -628,19 +710,36 @@ GS::Optional<GS::UniString> CreatePolylinesCommand::GetInputParametersSchema () 
 })";
 }
 
-static void AddPolyToMemo (const GS::Array<GS::ObjectState>& coordinates,
+static GSErrCode AddPolyToMemo (const GS::Array<GS::ObjectState>& coordinates,
                            const GS::Array<GS::ObjectState>& arcs,
                            API_Polygon&                      poly,
                            API_ElementMemo& 				 memo)
 {
+    if (coordinates.GetSize () < 1 || static_cast<GSSize> (coordinates.GetSize ()) > static_cast<GSSize> (std::numeric_limits<Int32>::max () - 1) ||
+        static_cast<GSSize> (arcs.GetSize ()) > static_cast<GSSize> (std::numeric_limits<Int32>::max ()))
+        return APIERR_BADPARS;
+
     const GS::Array<API_PolyArc> polyArcs = GetPolyArcs (arcs, 1);
     poly.nCoords	= coordinates.GetSize();
     poly.nSubPolys	= 1;
     poly.nArcs		= polyArcs.GetSize ();
 
-    memo.coords = reinterpret_cast<API_Coord**> (BMAllocateHandle ((poly.nCoords + 1) * sizeof (API_Coord), ALLOCATE_CLEAR, 0));
-    memo.pends = reinterpret_cast<Int32**> (BMAllocateHandle ((poly.nSubPolys + 1) * sizeof (Int32), ALLOCATE_CLEAR, 0));
-    memo.parcs = reinterpret_cast<API_PolyArc**> (BMAllocateHandle (poly.nArcs * sizeof (API_PolyArc), ALLOCATE_CLEAR, 0));
+    const GSSize coordCount = static_cast<GSSize> (poly.nCoords) + 1;
+    const GSSize pendCount = static_cast<GSSize> (poly.nSubPolys) + 1;
+    if (coordCount > std::numeric_limits<GSSize>::max () / sizeof (API_Coord) ||
+        pendCount > std::numeric_limits<GSSize>::max () / sizeof (Int32) ||
+        static_cast<GSSize> (poly.nArcs) > std::numeric_limits<GSSize>::max () / sizeof (API_PolyArc))
+        return APIERR_BADPARS;
+    const GSSize coordBytes = coordCount * sizeof (API_Coord);
+    const GSSize pendBytes = pendCount * sizeof (Int32);
+    const GSSize arcBytes = static_cast<GSSize> (poly.nArcs) * sizeof (API_PolyArc);
+    memo.coords = reinterpret_cast<API_Coord**> (BMAllocateHandle (coordBytes, ALLOCATE_CLEAR, 0));
+    memo.pends = reinterpret_cast<Int32**> (BMAllocateHandle (pendBytes, ALLOCATE_CLEAR, 0));
+    if (poly.nArcs > 0)
+        memo.parcs = reinterpret_cast<API_PolyArc**> (BMAllocateHandle (arcBytes, ALLOCATE_CLEAR, 0));
+    if (memo.coords == nullptr || *memo.coords == nullptr || memo.pends == nullptr || *memo.pends == nullptr ||
+        (poly.nArcs > 0 && (memo.parcs == nullptr || *memo.parcs == nullptr)))
+        return APIERR_MEMFULL;
 
     Int32 iCoord = 0;
     for (const GS::ObjectState& c : coordinates) {
@@ -652,6 +751,7 @@ static void AddPolyToMemo (const GS::Array<GS::ObjectState>& coordinates,
     for (const API_PolyArc& a : polyArcs) {
         (*memo.parcs)[iArc++] = a;
     }
+    return NoError;
 }
 
 GS::Optional<GS::ObjectState> CreatePolylinesCommand::SetTypeSpecificParameters (API_Element& element, API_ElementMemo& memo, const Stories&, const GS::ObjectState& parameters) const
@@ -684,10 +784,9 @@ GS::Optional<GS::ObjectState> CreatePolylinesCommand::SetTypeSpecificParameters 
     parameters.Get ("coordinates", coordinates);
     parameters.Get ("arcs", arcs);
 
-    AddPolyToMemo(coordinates,
-                  arcs,
-                  element.polyLine.poly,
-                  memo);
+    const GSErrCode memoErr = AddPolyToMemo (coordinates, arcs, element.polyLine.poly, memo);
+    if (memoErr != NoError)
+        return CreateErrorResponse (memoErr, "Failed to allocate polyline memo data.");
 
     return {};
 }
@@ -760,16 +859,18 @@ constexpr const char* ParameterValueFieldName = "value";
 static void SetParamValueInteger (API_AddParType&        addPar,
 					              const GS::ObjectState& parameterDetails)
 {
-	Int32 value;
-	parameterDetails.Get (ParameterValueFieldName, value);
+	Int32 value = 0;
+	if (!parameterDetails.Get (ParameterValueFieldName, value))
+		return;
 	addPar.value.real = value;
 }
 
 static void SetParamValueDouble (API_AddParType&        addPar,
 					             const GS::ObjectState&	parameterDetails)
 {
-	double value;
-	parameterDetails.Get (ParameterValueFieldName, value);
+	double value = 0.0;
+	if (!parameterDetails.Get (ParameterValueFieldName, value))
+		return;
 	addPar.value.real = value;
 }
 
@@ -777,15 +878,17 @@ static void SetParamValueOnOff (API_AddParType&         addPar,
 				                const GS::ObjectState&	parameterDetails)
 {
 	GS::String value;
-	parameterDetails.Get (ParameterValueFieldName, value);
+	if (!parameterDetails.Get (ParameterValueFieldName, value))
+		return;
 	addPar.value.real = (value == "Off" ? 0 : 1);
 }
 
 static void SetParamValueBool (API_AddParType&        addPar,
 				               const GS::ObjectState& parameterDetails)
 {
-	bool value;
-	parameterDetails.Get (ParameterValueFieldName, value);
+	bool value = false;
+	if (!parameterDetails.Get (ParameterValueFieldName, value))
+		return;
 	addPar.value.real = (value ? 0 : 1);
 }
 
@@ -793,14 +896,22 @@ static void SetParamValueString (API_AddParType&        addPar,
 					             const GS::ObjectState&	parameterDetails)
 {
 	GS::UniString value;
-	parameterDetails.Get (ParameterValueFieldName, value);
+	if (!parameterDetails.Get (ParameterValueFieldName, value))
+		return;
 
-	GS::ucscpy (addPar.value.uStr, value.ToUStr (0, GS::Min(value.GetLength (), (USize)API_UAddParStrLen)).Get ());
+	const auto ustrObject = value.ToUStr ();
+	GS::ucsncpy (addPar.value.uStr, ustrObject, API_UAddParStrLen);
+	addPar.value.uStr[API_UAddParStrLen - 1] = 0;
 }
 
-static void ChangeParams (API_AddParType**& params, const GS::HashTable<GS::String, GS::ObjectState>& changeParamsDictionary)
+static bool ChangeParams (API_AddParType**& params, const GS::HashTable<GS::String, GS::ObjectState>& changeParamsDictionary)
 {
-	const GSSize nParams = BMGetHandleSize ((GSHandle) params) / sizeof (API_AddParType);
+	if (params == nullptr || *params == nullptr)
+		return false;
+	const GSSize bytes = BMhGetSize (reinterpret_cast<GSHandle> (params));
+	if (bytes == 0 || bytes % sizeof (API_AddParType) != 0)
+		return false;
+	const GSSize nParams = bytes / sizeof (API_AddParType);
 	for (GSIndex ii = 0; ii < nParams; ++ii) {
 		API_AddParType& actParam = (*params)[ii];
 
@@ -832,6 +943,7 @@ static void ChangeParams (API_AddParType**& params, const GS::HashTable<GS::Stri
 				break;
 		}
 	}
+	return true;
 }
 
 // Shared placement logic for CreateObjects and CreateLamps.
@@ -848,10 +960,11 @@ static GS::Optional<GS::ObjectState> SetLibraryPartElementParameters (
     parameters.Get ("libraryPartName", uName);
 
     API_LibPart libPart = {};
-    GS::ucscpy (libPart.docu_UName, uName.ToUStr ());
+    LibraryPartLocationGuard libPartLocationGuard (libPart);
+    GS::ucsncpy (libPart.docu_UName, uName.ToUStr (), GS::ArraySize (libPart.docu_UName));
+    libPart.docu_UName[GS::ArraySize (libPart.docu_UName) - 1] = 0;
 
     GSErrCode err = ACAPI_LibraryPart_Search (&libPart, false, true);
-    delete libPart.location;
 
     if (err != NoError) {
         return CreateErrorResponse (err, GS::UniString::Printf ("Not found library part with name '%T'", uName.ToPrintf ()));
@@ -877,7 +990,9 @@ static GS::Optional<GS::ObjectState> SetLibraryPartElementParameters (
         element.object.xRatio = dimensions.x;
         element.object.yRatio = dimensions.y;
         GS::ObjectState os (ParameterValueFieldName, dimensions.z);
-        ChangeParams (memo.params, {{"ZZYZX", os}});
+        if (!ChangeParams (memo.params, {{"ZZYZX", os}})) {
+            return CreateErrorResponse (APIERR_BADPARS, "The library part has no valid parameter memo for the requested dimensions.");
+        }
     }
 
     return {};
@@ -1074,7 +1189,9 @@ GS::Optional<GS::ObjectState> CreateMeshesCommand::SetTypeSpecificParameters (AP
 
     GS::Array<GS::ObjectState> sublines;
     parameters.Get ("sublines", sublines);
-    BuildMeshSublinesMemoFromGeometry (element, memo, sublines);
+    const GSErrCode sublineErr = BuildMeshSublinesMemoFromGeometry (element, memo, sublines);
+    if (sublineErr != NoError)
+        return CreateErrorResponse (sublineErr, "Failed to build mesh level-line memo data.");
 
     return {};
 }
@@ -1138,32 +1255,59 @@ GS::Optional<GS::UniString> CreateLabelsCommand::GetInputParametersSchema () con
 static GSErrCode SetParagraph (API_ParagraphType** paragraph, UInt32 parNum, Int32 from, Int32 range, Int32 numOfTabs, Int32 numOfRuns,
 							   Int32 numOfeolPos)
 {
-	if (paragraph == nullptr || parNum >= (BMhGetSize (reinterpret_cast<GSHandle> (paragraph)) / sizeof (API_ParagraphType)))
+	if (paragraph == nullptr || *paragraph == nullptr || parNum >= (BMhGetSize (reinterpret_cast<GSHandle> (paragraph)) / sizeof (API_ParagraphType)))
 		return APIERR_BADPARS;
 
 	if (numOfTabs < 1 || numOfRuns < 1 || numOfeolPos < 0)
 		return APIERR_BADPARS;
+	if (static_cast<GSSize> (numOfTabs) > std::numeric_limits<GSSize>::max () / sizeof (API_TabType) ||
+		static_cast<GSSize> (numOfRuns) > std::numeric_limits<GSSize>::max () / sizeof (API_RunType) ||
+		static_cast<GSSize> (numOfeolPos) > std::numeric_limits<GSSize>::max () / sizeof (Int32))
+		return APIERR_BADPARS;
 
-	(*paragraph)[parNum].from = from;
-	(*paragraph)[parNum].range = range;
+	API_TabType* const tabs = reinterpret_cast<API_TabType*> (BMpAllClear (static_cast<GSSize> (numOfTabs) * sizeof (API_TabType)));
+	API_RunType* const runs = reinterpret_cast<API_RunType*> (BMpAllClear (static_cast<GSSize> (numOfRuns) * sizeof (API_RunType)));
+	if (tabs == nullptr || runs == nullptr) {
+		if (tabs != nullptr)
+			BMpFree (reinterpret_cast<GSPtr> (tabs));
+		if (runs != nullptr)
+			BMpFree (reinterpret_cast<GSPtr> (runs));
+		return APIERR_MEMFULL;
+    }
 
-	(*paragraph)[parNum].tab = reinterpret_cast<API_TabType*> (BMpAllClear (numOfTabs * sizeof (API_TabType)));
-	(*paragraph)[parNum].run = reinterpret_cast<API_RunType*> (BMpAllClear (numOfRuns * sizeof (API_RunType)));
-
+	Int32* eolPositions = nullptr;
 	if (numOfeolPos > 0) {
-		(*paragraph)[parNum].eolPos = reinterpret_cast<Int32*> (BMpAllClear (numOfeolPos * sizeof (Int32)));
+		eolPositions = reinterpret_cast<Int32*> (BMpAllClear (static_cast<GSSize> (numOfeolPos) * sizeof (Int32)));
+		if (eolPositions == nullptr) {
+			BMpFree (reinterpret_cast<GSPtr> (tabs));
+			BMpFree (reinterpret_cast<GSPtr> (runs));
+			return APIERR_MEMFULL;
+		}
 	}
+
+	API_ParagraphType& target = (*paragraph)[parNum];
+	if (target.tab != nullptr)
+		BMpFree (reinterpret_cast<GSPtr> (target.tab));
+	if (target.run != nullptr)
+		BMpFree (reinterpret_cast<GSPtr> (target.run));
+	if (target.eolPos != nullptr)
+		BMpFree (reinterpret_cast<GSPtr> (target.eolPos));
+	target.from = from;
+	target.range = range;
+	target.tab = tabs;
+	target.run = runs;
+	target.eolPos = eolPositions;
 
 	return NoError;
 }
 
 static GSErrCode SetRun (API_ParagraphType** paragraph, UInt32 parNum, UInt32 runNum, Int32 from, Int32 range, short pen, unsigned short faceBits,
-						 short font, Int32 effectBits, double size)
+							 short font, Int32 effectBits, double size)
 {
-	if (paragraph == nullptr || parNum >= (BMhGetSize (reinterpret_cast<GSHandle> (paragraph)) / sizeof (API_ParagraphType)))
+	if (paragraph == nullptr || *paragraph == nullptr || parNum >= (BMhGetSize (reinterpret_cast<GSHandle> (paragraph)) / sizeof (API_ParagraphType)))
 		return APIERR_BADPARS;
 
-	if (runNum >= BMGetPtrSize (reinterpret_cast<GSPtr> ((*paragraph)[parNum].run)) / sizeof (API_RunType))
+	if ((*paragraph)[parNum].run == nullptr || runNum >= BMGetPtrSize (reinterpret_cast<GSPtr> ((*paragraph)[parNum].run)) / sizeof (API_RunType))
 		return APIERR_BADPARS;
 
 	(*paragraph)[parNum].run[runNum].from	    = from;
@@ -1179,10 +1323,10 @@ static GSErrCode SetRun (API_ParagraphType** paragraph, UInt32 parNum, UInt32 ru
 
 static GSErrCode SetEOL (API_ParagraphType** paragraph, UInt32 parNum, UInt32 eolNum, Int32 offset)
 {
-	if (paragraph == nullptr || parNum >= (BMhGetSize (reinterpret_cast<GSHandle> (paragraph)) / sizeof (API_ParagraphType)))
+	if (paragraph == nullptr || *paragraph == nullptr || parNum >= (BMhGetSize (reinterpret_cast<GSHandle> (paragraph)) / sizeof (API_ParagraphType)))
 		return APIERR_BADPARS;
 
-	if (eolNum >= BMGetPtrSize (reinterpret_cast<GSPtr> ((*paragraph)[parNum].eolPos)) / sizeof (Int32))
+	if ((*paragraph)[parNum].eolPos == nullptr || eolNum >= BMGetPtrSize (reinterpret_cast<GSPtr> ((*paragraph)[parNum].eolPos)) / sizeof (Int32))
 		return APIERR_BADPARS;
 
 	if (offset < 0)
@@ -1205,34 +1349,77 @@ static API_JustID ParseJustificationString (const GS::UniString& justification)
     return APIJust_Left;
 }
 
-static void SetTextContentAndParagraphs (API_ElementMemo& memo, API_TextType& textData, const GS::UniString& text)
+static GSErrCode SetTextContentAndParagraphs (API_ElementMemo& memo, API_TextType& textData, const GS::UniString& text)
 {
+    if (text.GetLength () >= static_cast<USize> (std::numeric_limits<Int32>::max ()))
+        return APIERR_BADPARS;
 #ifdef ServerMainVers_2800
-    delete memo.textContent;
-    memo.textContent = new GS::UniString { text };
+    std::unique_ptr<GS::UniString> replacement (new (std::nothrow) GS::UniString { text });
+    if (replacement == nullptr)
+        return APIERR_MEMFULL;
+    if (memo.textContent != nullptr) {
+        std::unique_ptr<GS::UniString> oldText (memo.textContent);
+        memo.textContent = nullptr;
+    }
+    memo.textContent = replacement.release ();
 #else
-    memo.textContent = BMhAllClear ((text.GetLength () + 1) * sizeof (GS::uchar_t));
-    GS::ucscpy (reinterpret_cast<GS::uchar_t*> (*memo.textContent), text.ToUStr ());
+    const GSSize textCharCount = static_cast<GSSize> (text.GetLength ()) + 1;
+    if (textCharCount > std::numeric_limits<GSSize>::max () / sizeof (GS::uchar_t))
+        return APIERR_BADPARS;
+    GSHandle replacement = BMhAllClear (textCharCount * sizeof (GS::uchar_t));
+    if (replacement == nullptr || *replacement == nullptr) {
+        if (replacement != nullptr)
+            BMKillHandle (&replacement);
+        return APIERR_MEMFULL;
+    }
+    if (memo.textContent != nullptr)
+        BMKillHandle (reinterpret_cast<GSHandle*> (&memo.textContent));
+    memo.textContent = reinterpret_cast<char**> (replacement);
+    GS::ucsncpy (reinterpret_cast<GS::uchar_t*> (*memo.textContent), text.ToUStr (), static_cast<USize> (textCharCount));
+    reinterpret_cast<GS::uchar_t*> (*memo.textContent)[textCharCount - 1] = 0;
 #endif
 
     const GS::UniChar newlineChar = GS::UniChar (char ('\n'));
     textData.nLine = text.Count (newlineChar) + 1;
     const Int32 numOfParagraphs = 1;
-    memo.paragraphs = reinterpret_cast<API_ParagraphType**> (BMhAll (numOfParagraphs * sizeof (API_ParagraphType)));
-    SetParagraph (memo.paragraphs, 0, 0, text.GetLength (), 1, 1, textData.nLine);
-    SetRun (memo.paragraphs, 0, 0, 0, text.GetLength (), textData.pen, textData.faceBits, textData.font, textData.effectsBits, textData.size);
+    API_ElementMemo replacementMemo = {};
+    replacementMemo.paragraphs = reinterpret_cast<API_ParagraphType**> (BMhAllClear (numOfParagraphs * sizeof (API_ParagraphType)));
+    const GS::OnExit replacementGuard ([&replacementMemo] () {
+        ACAPI_DisposeElemMemoHdls (&replacementMemo);
+    });
+    if (replacementMemo.paragraphs == nullptr || *replacementMemo.paragraphs == nullptr) {
+        if (replacementMemo.paragraphs != nullptr)
+            BMKillHandle (reinterpret_cast<GSHandle*> (&replacementMemo.paragraphs));
+        replacementMemo.paragraphs = nullptr;
+        return APIERR_MEMFULL;
+    }
+
+    GSErrCode err = SetParagraph (replacementMemo.paragraphs, 0, 0, text.GetLength (), 1, 1, textData.nLine);
+    if (err != NoError)
+        return err;
+    err = SetRun (replacementMemo.paragraphs, 0, 0, 0, text.GetLength (), textData.pen, textData.faceBits, textData.font, textData.effectsBits, textData.size);
+    if (err != NoError)
+        return err;
     Int32 lastEolPos = 0;
     for (Int32 eolIndex = 0; eolIndex < textData.nLine; ++eolIndex) {
         Int32 eolPos = text.FindFirst (newlineChar, eolIndex == 0 ? 0 : lastEolPos + 1);
         Int32 offset = (eolPos != MaxUIndex ? eolPos : text.GetLength ()) - lastEolPos - 1;
         lastEolPos = eolPos;
-        SetEOL (memo.paragraphs, 0, eolIndex, offset);
+        err = SetEOL (replacementMemo.paragraphs, 0, eolIndex, offset);
+        if (err != NoError)
+            return err;
     }
+
+    if (memo.paragraphs != nullptr)
+        BMKillHandle (reinterpret_cast<GSHandle*> (&memo.paragraphs));
+    memo.paragraphs = replacementMemo.paragraphs;
+    replacementMemo.paragraphs = nullptr;
 
     textData.width = 0;
     textData.height = 0;
     textData.nonBreaking = true;
     textData.useEolPos = true;
+    return NoError;
 }
 
 GS::Optional<GS::ObjectState> CreateLabelsCommand::SetTypeSpecificParameters (API_Element& element, API_ElementMemo& memo, const Stories&, const GS::ObjectState& parameters) const
@@ -1285,7 +1472,9 @@ GS::Optional<GS::ObjectState> CreateLabelsCommand::SetTypeSpecificParameters (AP
         if (!parameters.Get ("text", text)) {
             return CreateErrorResponse (APIERR_BADPARS, "Missing 'text' parameter for text label");
         }
-        SetTextContentAndParagraphs (memo, element.label.u.text, text);
+        const GSErrCode textErr = SetTextContentAndParagraphs (memo, element.label.u.text, text);
+        if (textErr != NoError)
+            return CreateErrorResponse (textErr, "Failed to allocate text label memo data.");
     }
 
     return {};
@@ -1386,7 +1575,9 @@ GS::Optional<GS::ObjectState> CreateTextsCommand::SetTypeSpecificParameters (API
         return CreateErrorResponse (APIERR_BADPARS, "Missing 'text' parameter");
     }
 
-    SetTextContentAndParagraphs (memo, element.text, text);
+    const GSErrCode textErr = SetTextContentAndParagraphs (memo, element.text, text);
+    if (textErr != NoError)
+        return CreateErrorResponse (textErr, "Failed to allocate text memo data.");
 
     return {};
 }

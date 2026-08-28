@@ -1,5 +1,9 @@
 #include "ProjectCommands.hpp"
 #include "MigrationHelper.hpp"
+#include "File.hpp"
+#include "NativeOwnership.hpp"
+
+#include <cmath>
 
 GetProjectInfoCommand::GetProjectInfoCommand () :
     CommandBase (CommonSchema::NotUsed)
@@ -514,10 +518,25 @@ GS::Optional<GS::UniString> GetStoriesCommand::GetResponseSchema () const
 GS::ObjectState GetStoriesCommand::Execute (const GS::ObjectState& /*parameters*/, GS::ProcessControl& /*processControl*/) const
 {
     API_StoryInfo storyInfo = {};
+    const GS::OnExit storyInfoGuard ([&storyInfo] () {
+        if (storyInfo.data != nullptr)
+            BMKillHandle (reinterpret_cast<GSHandle *> (&storyInfo.data));
+        storyInfo.data = nullptr;
+    });
     GSErrCode err = ACAPI_ProjectSetting_GetStorySettings (&storyInfo);
     if (err != NoError) {
-        BMKillHandle (reinterpret_cast<GSHandle *> (&storyInfo.data));
         return CreateErrorResponse (err, "Failed to retrive stories info.");
+    }
+    if (storyInfo.data == nullptr || *storyInfo.data == nullptr || storyInfo.lastStory < storyInfo.firstStory) {
+        return CreateErrorResponse (APIERR_BADPARS, "Archicad returned invalid story data.");
+    }
+
+    const Int32 firstStory = static_cast<Int32> (storyInfo.firstStory);
+    const Int32 lastStory = static_cast<Int32> (storyInfo.lastStory);
+    const GS::USize storyCount = static_cast<GS::USize> (lastStory - firstStory + 1);
+    const GSSize storyDataCount = BMhGetSize (reinterpret_cast<GSHandle> (storyInfo.data)) / sizeof (API_StoryType);
+    if (storyCount == 0 || static_cast<GSSize> (storyCount) > storyDataCount) {
+        return CreateErrorResponse (APIERR_BADPARS, "Archicad returned an undersized story data handle.");
     }
 
     GS::ObjectState response;
@@ -528,8 +547,7 @@ GS::ObjectState GetStoriesCommand::Execute (const GS::ObjectState& /*parameters*
 
     const auto& listAdder = response.AddList<GS::ObjectState> ("stories");
 
-    short storyCount = storyInfo.lastStory - storyInfo.firstStory + 1;
-    for (short i = 0; i < storyCount; i++) {
+    for (GS::UIndex i = 0; i < storyCount; i++) {
         const API_StoryType& story = (*storyInfo.data)[i];
         GS::ObjectState storyData;
         GS::UniString uName = story.uName;
@@ -545,8 +563,6 @@ GS::ObjectState GetStoriesCommand::Execute (const GS::ObjectState& /*parameters*
 
         listAdder (storyData);
     }
-
-    BMKillHandle (reinterpret_cast<GSHandle *> (&storyInfo.data));
 
     return response;
 }
@@ -591,13 +607,29 @@ GS::ObjectState SetStoriesCommand::Execute (const GS::ObjectState& parameters, G
     parameters.Get ("stories", stories);
 
     API_StoryInfo storyInfo = {};
+    const GS::OnExit storyInfoGuard ([&storyInfo] () {
+        if (storyInfo.data != nullptr)
+            BMKillHandle (reinterpret_cast<GSHandle *> (&storyInfo.data));
+        storyInfo.data = nullptr;
+    });
     GSErrCode err = ACAPI_ProjectSetting_GetStorySettings (&storyInfo);
     if (err != NoError) {
-        BMKillHandle (reinterpret_cast<GSHandle *> (&storyInfo.data));
         return CreateFailedExecutionResult (err, "Failed to retrive stories info.");
     }
+    if (storyInfo.data == nullptr || *storyInfo.data == nullptr) {
+        return CreateFailedExecutionResult (APIERR_BADPARS, "Archicad returned no story data.");
+    }
 
-    GS::USize storyCount = storyInfo.lastStory - storyInfo.firstStory + 1;
+    const Int32 firstStory = static_cast<Int32> (storyInfo.firstStory);
+    const Int32 lastStory = static_cast<Int32> (storyInfo.lastStory);
+    if (lastStory < firstStory) {
+        return CreateFailedExecutionResult (APIERR_BADPARS, "Archicad returned an invalid story range.");
+    }
+    GS::USize storyCount = static_cast<GS::USize> (lastStory - firstStory + 1);
+    const GSSize storyDataCount = BMhGetSize (reinterpret_cast<GSHandle> (storyInfo.data)) / sizeof (API_StoryType);
+    if (static_cast<GSSize> (storyCount) > storyDataCount) {
+        return CreateFailedExecutionResult (APIERR_BADPARS, "Archicad returned an undersized story data handle.");
+    }
 
     if (storyCount != stories.GetSize ()) {
         if (storyCount < stories.GetSize ()) {
@@ -618,31 +650,39 @@ GS::ObjectState SetStoriesCommand::Execute (const GS::ObjectState& parameters, G
             
                 err = ACAPI_ProjectSetting_ChangeStorySettings (&storyCmd);
                 if (err != NoError) {
-                    BMKillHandle (reinterpret_cast<GSHandle *> (&storyInfo.data));
                     return CreateFailedExecutionResult (err, "Failed to create new story.");
                 }
             }
         } else {
-            for (GS::UIndex i = storyCount - 1; i >= stories.GetSize (); --i) {
+            for (GS::UIndex i = storyCount; i > stories.GetSize ();) {
+                --i;
                 API_StoryCmdType storyCmd = {};
                 storyCmd.action = APIStory_Delete;
                 storyCmd.index  = (*storyInfo.data)[i].index;
             
                 err = ACAPI_ProjectSetting_ChangeStorySettings (&storyCmd);
                 if (err != NoError) {
-                    BMKillHandle (reinterpret_cast<GSHandle *> (&storyInfo.data));
                     return CreateFailedExecutionResult (err, "Failed to delete story.");
                 }
             }
         }
 
+        if (storyInfo.data != nullptr)
+            BMKillHandle (reinterpret_cast<GSHandle *> (&storyInfo.data));
+        storyInfo.data = nullptr;
         err = ACAPI_ProjectSetting_GetStorySettings (&storyInfo);
         if (err != NoError) {
-            BMKillHandle (reinterpret_cast<GSHandle *> (&storyInfo.data));
             return CreateFailedExecutionResult (err, "Failed to retrive stories info.");
         }
-        
-        storyCount = storyInfo.lastStory - storyInfo.firstStory + 1;
+        if (storyInfo.data == nullptr || *storyInfo.data == nullptr || storyInfo.lastStory < storyInfo.firstStory) {
+            return CreateFailedExecutionResult (APIERR_BADPARS, "Archicad returned invalid story data after resizing.");
+        }
+        storyCount = static_cast<GS::USize> (
+            static_cast<Int32> (storyInfo.lastStory) - static_cast<Int32> (storyInfo.firstStory) + 1);
+        const GSSize refreshedStoryDataCount = BMhGetSize (reinterpret_cast<GSHandle> (storyInfo.data)) / sizeof (API_StoryType);
+        if (static_cast<GSSize> (storyCount) > refreshedStoryDataCount || storyCount != static_cast<GS::USize> (stories.GetSize ())) {
+            return CreateFailedExecutionResult (APIERR_BADPARS, "Archicad returned inconsistent story data after resizing.");
+        }
     }
 
     GS::USize recursionCount = 0;
@@ -861,6 +901,167 @@ GS::ObjectState SaveProjectCommand::Execute (const GS::ObjectState& /*parameters
         return CreateFailedExecutionResult (APIERR_COMMANDFAILED, "Failed to save the project.");
     }
     return CreateSuccessfulExecutionResult ();
+}
+
+SaveProjectAsVersionCommand::SaveProjectAsVersionCommand () :
+    CommandBase (CommonSchema::NotUsed)
+{
+}
+
+GS::String SaveProjectAsVersionCommand::GetName () const
+{
+    return "SaveProjectAsVersion";
+}
+
+GS::Optional<GS::UniString> SaveProjectAsVersionCommand::GetInputParametersSchema () const
+{
+    return R"({
+        "type": "object",
+        "properties": {
+            "targetVersion": {
+                "type": "integer",
+                "enum": [23, 24, 25, 26, 27],
+                "description": "The Archicad major version to write. The current command is intentionally bounded to versions supported by the Archicad 28 save-as-old-version file types."
+            },
+            "outputPath": {
+                "type": "string",
+                "minLength": 1,
+                "description": "A new local .pln or .pla path. Existing files are never overwritten."
+            },
+            "archive": {
+                "type": "boolean",
+                "description": "Write an archive (.pla) and embed library parts when true; write a plan (.pln) when false."
+            },
+            "includeLibraryParts": {
+                "type": "boolean",
+                "description": "For archives, include the full library payload so placed windows, doors, and objects have the best chance of surviving the older-version conversion."
+            }
+        },
+        "additionalProperties": false,
+        "required": [
+            "targetVersion",
+            "outputPath"
+        ]
+    })";
+}
+
+GS::Optional<GS::UniString> SaveProjectAsVersionCommand::GetResponseSchema () const
+{
+    return R"({
+        "type": "object",
+        "properties": {
+            "success": { "type": "boolean" },
+            "targetVersion": { "type": "integer" },
+            "outputPath": { "type": "string" },
+            "archive": { "type": "boolean" },
+            "includeLibraryParts": { "type": "boolean" },
+            "textures": { "type": "boolean" }
+        }
+    })";
+}
+
+GS::ObjectState SaveProjectAsVersionCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl& /*processControl*/) const
+{
+    Int32 targetVersion = 0;
+    GS::UniString outputPath;
+    bool archive = true;
+    bool includeLibraryParts = true;
+
+    if (!parameters.Get ("targetVersion", targetVersion)) {
+        return CreateFailedExecutionResult (APIERR_BADPARS, "targetVersion parameter is missing");
+    }
+    if (!parameters.Get ("outputPath", outputPath) || outputPath.IsEmpty ()) {
+        return CreateFailedExecutionResult (APIERR_BADPARS, "outputPath parameter is missing or empty");
+    }
+    parameters.Get ("archive", archive);
+    parameters.Get ("includeLibraryParts", includeLibraryParts);
+
+    IO::Location outputLocation (outputPath);
+    if (outputLocation.GetStatus () != NoError) {
+        return CreateFailedExecutionResult (APIERR_BADPARS, "outputPath parameter is not a valid filesystem location");
+    }
+
+    IO::Name lastLocalName;
+    if (outputLocation.GetLastLocalName (&lastLocalName) != NoError) {
+        return CreateFailedExecutionResult (APIERR_BADPARS, "outputPath parameter is not a valid local file path");
+    }
+
+    const GS::UniString extension = lastLocalName.GetExtension ();
+    const GS::UniString expectedExtension = archive ? "pla" : "pln";
+    if (extension.Compare (expectedExtension, CaseInsensitive) != GS::UniString::Equal) {
+        return CreateFailedExecutionResult (
+            APIERR_BADPARS,
+            archive
+                ? "outputPath must have a .pla extension when archive is true"
+                : "outputPath must have a .pln extension when archive is false"
+        );
+    }
+
+    // Do not let a conversion accidentally replace the source project or an
+    // earlier export.  APIDo_SaveID may otherwise follow normal Save As
+    // overwrite behavior, which is too dangerous for an agent-facing write.
+    if (IO::File (outputLocation, IO::File::OnNotFound::Fail).GetStatus () == NoError) {
+        return CreateFailedExecutionResult (APIERR_BADPARS, "Refusing to overwrite an existing output file");
+    }
+
+    API_FTypeID fileTypeID;
+    switch (targetVersion) {
+        case 23:
+            fileTypeID = archive ? APIFType_A_PlanFile2300 : APIFType_PlanFile2300;
+            break;
+        case 24:
+            fileTypeID = archive ? APIFType_A_PlanFile2400 : APIFType_PlanFile2400;
+            break;
+#ifdef ServerMainVers_2600
+        case 25:
+            fileTypeID = archive ? APIFType_A_PlanFile2500 : APIFType_PlanFile2500;
+            break;
+        case 26:
+            fileTypeID = archive ? APIFType_A_PlanFile2600 : APIFType_PlanFile2600;
+            break;
+#endif
+#ifdef ServerMainVers_2700
+        case 27:
+            fileTypeID = archive ? APIFType_A_PlanFile2700 : APIFType_PlanFile2700;
+            break;
+#endif
+        default:
+            return CreateFailedExecutionResult (APIERR_BADPARS, "targetVersion is not supported by this Archicad build");
+    }
+
+    API_FileSavePars savePars = {};
+    savePars.fileTypeID = fileTypeID;
+    savePars.file = &outputLocation;
+
+    GSErrCode err = NoError;
+    if (archive) {
+        API_SavePars_Archive archivePars = {};
+        archivePars.texturesOn = false;
+        archivePars.libraryPartsOn = includeLibraryParts;
+#ifdef ServerMainVers_2800
+        err = ACAPI_ProjectOperation_Save (&savePars, &archivePars);
+#else
+        err = ACAPI_Automate (APIDo_SaveID, &savePars, &archivePars);
+#endif
+    } else {
+#ifdef ServerMainVers_2800
+        err = ACAPI_ProjectOperation_Save (&savePars);
+#else
+        err = ACAPI_Automate (APIDo_SaveID, &savePars, nullptr);
+#endif
+    }
+
+    if (err != NoError) {
+        return CreateFailedExecutionResult (err, "Failed to save the project in the requested older Archicad version");
+    }
+
+    GS::ObjectState response = CreateSuccessfulExecutionResult ();
+    response.Add ("targetVersion", targetVersion);
+    response.Add ("outputPath", outputPath);
+    response.Add ("archive", archive);
+    response.Add ("includeLibraryParts", archive && includeLibraryParts);
+    response.Add ("textures", false);
+    return response;
 }
 
 GetGeoLocationCommand::GetGeoLocationCommand () :
@@ -1661,14 +1862,16 @@ GS::ObjectState RenderMarqueePrintCommand::Execute (const GS::ObjectState& param
     }
     parameters.Get ("storyIndex", requestedStory);
     parameters.Get ("multiStory", multiStory);
-    if (xMin >= xMax || yMin >= yMax)
+    if (!std::isfinite (xMin) || !std::isfinite (yMin) || !std::isfinite (xMax) || !std::isfinite (yMax) ||
+        xMin >= xMax || yMin >= yMax)
         return CreateFailedExecutionResult (APIERR_BADPARS, "Marquee bounds must have positive area.");
 
     API_SelectionInfo selectionBefore = {};
     const GSErrCode selectionErr = ACAPI_Selection_Get (&selectionBefore, nullptr, false);
+    const GS::OnExit selectionBeforeGuard ([&selectionBefore] () { ReleaseSelectionInfoHandles (selectionBefore); });
+    if (selectionErr != NoError && selectionErr != APIERR_NOSEL)
+        return CreateErrorResponse (selectionErr, "Failed to inspect the operator focus before rendering.");
     if (selectionErr == NoError && selectionBefore.typeID == API_SelElems) {
-        if (selectionBefore.marquee.coords != nullptr)
-            BMKillHandle (reinterpret_cast<GSHandle*> (&selectionBefore.marquee.coords));
         return CreateFailedExecutionResult (APIERR_REFUSEDCMD, "Render refuses to change marquee while an element selection is active.");
     }
     const bool hadOriginalMarquee = selectionErr == NoError &&
@@ -1677,8 +1880,6 @@ GS::ObjectState RenderMarqueePrintCommand::Execute (const GS::ObjectState& param
     API_DatabaseInfo startingDatabase = {};
     GSErrCode operationErr = ACAPI_Database_GetCurrentDatabase (&startingDatabase);
     if (operationErr != NoError) {
-        if (selectionBefore.marquee.coords != nullptr)
-            BMKillHandle (reinterpret_cast<GSHandle*> (&selectionBefore.marquee.coords));
         return CreateFailedExecutionResult (operationErr, "Failed to read the starting database.");
     }
 
@@ -1758,31 +1959,39 @@ GS::ObjectState RenderMarqueePrintCommand::Execute (const GS::ObjectState& param
     }
 
     bool focusChangedDuringRender = false;
-    if (marqueeSet && restoreDatabaseErr == NoError) {
+    if (marqueeSet) {
         API_SelectionInfo currentSelection = {};
         const GSErrCode currentErr = ACAPI_Selection_Get (&currentSelection, nullptr, false);
-        if (currentErr == NoError && (currentSelection.typeID == API_MarqueeHorBox || currentSelection.typeID == API_MarqueeRotBox)) {
+        const GS::OnExit currentSelectionGuard ([&currentSelection] () { ReleaseSelectionInfoHandles (currentSelection); });
+        if (currentErr != NoError || currentSelection.typeID != API_MarqueeHorBox) {
+            focusChangedDuringRender = true;
+        } else {
             focusChangedDuringRender = currentSelection.marquee.box.xMin != xMin ||
                 currentSelection.marquee.box.yMin != yMin || currentSelection.marquee.box.xMax != xMax ||
-                currentSelection.marquee.box.yMax != yMax;
+                currentSelection.marquee.box.yMax != yMax || currentSelection.multiStory != multiStory;
         }
-        if (currentSelection.marquee.coords != nullptr)
-            BMKillHandle (reinterpret_cast<GSHandle*> (&currentSelection.marquee.coords));
-        if (!focusChangedDuringRender) {
+        if (!focusChangedDuringRender && restoreDatabaseErr == NoError) {
             API_SelectionInfo marqueeAfter = {};
-            if (hadOriginalMarquee)
-                marqueeAfter = selectionBefore;
-            else
+            const GS::OnExit marqueeAfterGuard ([&marqueeAfter] () { ReleaseSelectionInfoHandles (marqueeAfter); });
+            bool restoreReady = true;
+            if (hadOriginalMarquee) {
+                restoreReady = CloneSelectionInfoHandles (selectionBefore, marqueeAfter);
+                if (!restoreReady) {
+                    operationErr = APIERR_MEMFULL;
+                    failureMessage = "Print completed, but the original marquee could not be copied safely for restoration.";
+                }
+            } else {
                 marqueeAfter.typeID = API_SelEmpty;
-            const GSErrCode marqueeRestoreErr = ACAPI_Selection_SetMarquee (&marqueeAfter);
-            if (operationErr == NoError && marqueeRestoreErr != NoError) {
-                operationErr = marqueeRestoreErr;
-                failureMessage = "Print succeeded, but the original marquee could not be restored.";
+            }
+            if (restoreReady) {
+                const GSErrCode marqueeRestoreErr = ACAPI_Selection_SetMarquee (&marqueeAfter);
+                if (operationErr == NoError && marqueeRestoreErr != NoError) {
+                    operationErr = marqueeRestoreErr;
+                    failureMessage = "Print succeeded, but the original marquee could not be restored.";
+                }
             }
         }
     }
-    if (selectionBefore.marquee.coords != nullptr)
-        BMKillHandle (reinterpret_cast<GSHandle*> (&selectionBefore.marquee.coords));
     if (operationErr != NoError)
         return CreateFailedExecutionResult (operationErr, failureMessage);
 
@@ -1842,7 +2051,8 @@ GS::ObjectState RenderMarqueePdfProbeCommand::Execute (const GS::ObjectState& pa
         !parameters.Get ("xMax", xMax) || !parameters.Get ("yMax", yMax) || !parameters.Get ("pdfPath", pdfPath)) {
         return CreateFailedExecutionResult (APIERR_BADPARS, "storyIndex, bounds and pdfPath are required.");
     }
-    if (xMin >= xMax || yMin >= yMax) {
+    if (!std::isfinite (xMin) || !std::isfinite (yMin) || !std::isfinite (xMax) || !std::isfinite (yMax) ||
+        xMin >= xMax || yMin >= yMax) {
         return CreateFailedExecutionResult (APIERR_BADPARS, "Marquee bounds must have positive area.");
     }
 
@@ -1852,9 +2062,10 @@ GS::ObjectState RenderMarqueePdfProbeCommand::Execute (const GS::ObjectState& pa
     // rotated user marquee can be restored exactly.
     API_SelectionInfo selectionBefore = {};
     const GSErrCode selectionErr = ACAPI_Selection_Get (&selectionBefore, nullptr, false);
+    const GS::OnExit selectionBeforeGuard ([&selectionBefore] () { ReleaseSelectionInfoHandles (selectionBefore); });
+    if (selectionErr != NoError && selectionErr != APIERR_NOSEL)
+        return CreateErrorResponse (selectionErr, "Failed to inspect the operator focus before the PDF render.");
     if (selectionErr == NoError && selectionBefore.typeID == API_SelElems) {
-        if (selectionBefore.marquee.coords != nullptr)
-            BMKillHandle (reinterpret_cast<GSHandle*> (&selectionBefore.marquee.coords));
         return CreateFailedExecutionResult (APIERR_REFUSEDCMD, "Render probe refuses to change marquee while an element selection is active.");
     }
     const bool hadOriginalMarquee = selectionErr == NoError &&
@@ -1863,8 +2074,6 @@ GS::ObjectState RenderMarqueePdfProbeCommand::Execute (const GS::ObjectState& pa
     API_DatabaseInfo startingDatabase = {};
     GSErrCode err = ACAPI_Database_GetCurrentDatabase (&startingDatabase);
     if (err != NoError) {
-        if (selectionBefore.marquee.coords != nullptr)
-            BMKillHandle (reinterpret_cast<GSHandle*> (&selectionBefore.marquee.coords));
         return CreateFailedExecutionResult (err, "Failed to read the starting database.");
     }
 
@@ -1873,8 +2082,6 @@ GS::ObjectState RenderMarqueePdfProbeCommand::Execute (const GS::ObjectState& pa
     targetDatabase.index = storyIndex;
     err = ACAPI_Window_GetDatabaseInfo (&targetDatabase);
     if (err != NoError) {
-        if (selectionBefore.marquee.coords != nullptr)
-            BMKillHandle (reinterpret_cast<GSHandle*> (&selectionBefore.marquee.coords));
         return CreateFailedExecutionResult (err, "Failed to resolve the requested floor-plan story.");
     }
 
@@ -1885,8 +2092,6 @@ GS::ObjectState RenderMarqueePdfProbeCommand::Execute (const GS::ObjectState& pa
 
     err = ACAPI_Database_ChangeCurrentDatabase (&targetDatabase);
     if (err != NoError) {
-        if (selectionBefore.marquee.coords != nullptr)
-            BMKillHandle (reinterpret_cast<GSHandle*> (&selectionBefore.marquee.coords));
         return CreateFailedExecutionResult (err, "Failed to change the current database in the background.");
     }
     databaseChanged = true;
@@ -1921,7 +2126,7 @@ GS::ObjectState RenderMarqueePdfProbeCommand::Execute (const GS::ObjectState& pa
             API_SavePars_Pdf pdfPars = {};
             pdfPars.sizeX = pageWidthMm;
             pdfPars.sizeY = pageHeightMm;
-            operationErr = ACAPI_ProjectOperation_Save (&savePars, &pdfPars);
+            operationErr = TAPIR_ProjectOperation_SavePdf (&savePars, &pdfPars);
             if (operationErr != NoError)
                 failureMessage = "Failed to export the temporary marquee PDF.";
         }
@@ -1934,20 +2139,44 @@ GS::ObjectState RenderMarqueePdfProbeCommand::Execute (const GS::ObjectState& pa
         operationErr = restoreErr;
         failureMessage = "PDF was exported, but the starting background database could not be restored.";
     }
-    if (restoreErr == NoError && marqueeSet) {
-        API_SelectionInfo marqueeAfter = {};
-        if (hadOriginalMarquee)
-            marqueeAfter = selectionBefore;
-        else
-            marqueeAfter.typeID = API_SelEmpty;
-        const GSErrCode marqueeRestoreErr = ACAPI_Selection_SetMarquee (&marqueeAfter);
-        if (operationErr == NoError && marqueeRestoreErr != NoError) {
-            operationErr = marqueeRestoreErr;
-            failureMessage = "PDF was exported, but the original marquee could not be restored.";
+    bool temporaryMarqueeCleared = false;
+    if (marqueeSet) {
+        API_SelectionInfo currentSelection = {};
+        const GSErrCode currentErr = ACAPI_Selection_Get (&currentSelection, nullptr, false);
+        const GS::OnExit currentSelectionGuard ([&currentSelection] () { ReleaseSelectionInfoHandles (currentSelection); });
+        const bool focusChanged = currentErr != NoError || currentSelection.typeID != API_MarqueeHorBox ||
+            currentSelection.marquee.box.xMin != xMin || currentSelection.marquee.box.yMin != yMin ||
+            currentSelection.marquee.box.xMax != xMax || currentSelection.marquee.box.yMax != yMax ||
+            currentSelection.multiStory != false;
+        if (focusChanged) {
+            if (operationErr == NoError) {
+                operationErr = currentErr != NoError ? currentErr : APIERR_REFUSEDCMD;
+                failureMessage = "PDF was exported, but the temporary marquee changed or could not be verified; it was not overwritten.";
+            }
+        } else {
+            API_SelectionInfo marqueeAfter = {};
+            const GS::OnExit marqueeAfterGuard ([&marqueeAfter] () { ReleaseSelectionInfoHandles (marqueeAfter); });
+            bool restoreReady = true;
+            if (hadOriginalMarquee) {
+                restoreReady = CloneSelectionInfoHandles (selectionBefore, marqueeAfter);
+                if (!restoreReady) {
+                    operationErr = APIERR_MEMFULL;
+                    failureMessage = "PDF completed, but the original marquee could not be copied safely for restoration.";
+                }
+            } else {
+                marqueeAfter.typeID = API_SelEmpty;
+            }
+            if (restoreReady) {
+                const GSErrCode marqueeRestoreErr = ACAPI_Selection_SetMarquee (&marqueeAfter);
+                if (marqueeRestoreErr == NoError) {
+                    temporaryMarqueeCleared = true;
+                } else if (operationErr == NoError) {
+                    operationErr = marqueeRestoreErr;
+                    failureMessage = "PDF was exported, but the original marquee could not be restored.";
+                }
+            }
         }
     }
-    if (selectionBefore.marquee.coords != nullptr)
-        BMKillHandle (reinterpret_cast<GSHandle*> (&selectionBefore.marquee.coords));
     if (operationErr != NoError)
         return CreateFailedExecutionResult (operationErr, failureMessage);
 
@@ -1955,7 +2184,7 @@ GS::ObjectState RenderMarqueePdfProbeCommand::Execute (const GS::ObjectState& pa
         "pdfPath", pdfPath,
         "storyIndex", storyIndex,
         "backgroundDatabaseRestored", true,
-        "temporaryMarqueeCleared", true
+        "temporaryMarqueeCleared", temporaryMarqueeCleared
     );
 }
 

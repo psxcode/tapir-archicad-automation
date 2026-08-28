@@ -8,6 +8,9 @@
 #include "Config.hpp"
 #include "UvManager.hpp"
 
+#include <cstdint>
+#include <memory>
+#include <mutex>
 #include <utility>
 
 class TapirPalette final : public DG::Palette,
@@ -40,6 +43,12 @@ public:
     static GSErrCode RegisterPaletteControlCallBack ();
 
 private:
+    struct ProcessState {
+        std::mutex mutex;
+        GS::Process process;
+        UInt64 generation = 0;
+    };
+
     struct PopUpItemData : public GS::Object
     {
         IO::Location fileLocation;
@@ -62,7 +71,7 @@ private:
     DG::IconButton delScriptButton;
     DG::IconButton manageShortcutsButton;
 
-    GS::Process process;
+    std::shared_ptr<ProcessState> processState;
     GS::ThreadedExecutor executor;
     bool hasCustomScript = false;
     bool hasAddedScript = false;
@@ -85,12 +94,11 @@ private:
     bool IsSelectedScriptFromGitHub () const;
     void SetDeleteScriptButtonStatus ();
     void SetRunButtonIcon ();
+    bool IsProcessRunning () const;
+    void KillProcess ();
     void RefreshScriptListShortcutLabels ();   // appends "  [Shortcut N]" to scripts assigned to a slot
     void ApplyShortcutMenuItemText (short slotIndex);   // pushes scriptShortcutLabels[slotIndex] to the real Archicad menu item
     void ApplyAllShortcutMenuItemTexts ();
-    bool IsProcessRunning () {
-        return process.IsValid ();
-    }
 
 
     template<typename... Args>

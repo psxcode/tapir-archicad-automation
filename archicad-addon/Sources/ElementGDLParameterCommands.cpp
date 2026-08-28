@@ -1,7 +1,112 @@
 #include "ElementGDLParameterCommands.hpp"
 #include "MigrationHelper.hpp"
 
+#include <cstddef>
+#include <limits>
+
 constexpr const char* ParameterValueFieldName = "value";
+constexpr GSSize MaxGdlArrayItems = 100'000;
+constexpr GSSize MaxGdlParameterCount = 10'000;
+constexpr GSSize MaxGdlPossibleValueCount = 100'000;
+constexpr GSSize MaxGdlPackedStringBytes = 16 * 1024 * 1024;
+
+static bool GetArrayItemCount (const API_AddParType& parameter, GSSize& itemCount)
+{
+    if (parameter.typeMod == API_ParSimple) {
+        itemCount = 1;
+        return true;
+    }
+    if (parameter.typeMod != API_ParArray || parameter.dim1 <= 0 || parameter.dim2 <= 0)
+        return false;
+
+    const GSSize dim1 = static_cast<GSSize> (parameter.dim1);
+    const GSSize dim2 = static_cast<GSSize> (parameter.dim2);
+    if (dim1 > std::numeric_limits<GSSize>::max () / dim2)
+        return false;
+    itemCount = dim1 * dim2;
+    return itemCount <= MaxGdlArrayItems;
+}
+
+static bool HasNumericArrayStorage (const API_AddParType& parameter, const GSSize itemCount)
+{
+    if (parameter.value.array == nullptr || *parameter.value.array == nullptr)
+        return false;
+    if (itemCount > std::numeric_limits<GSSize>::max () / static_cast<GSSize> (sizeof (double)))
+        return false;
+    const GSSize bytes = BMhGetSize (parameter.value.array);
+    const GSSize requiredBytes = itemCount * static_cast<GSSize> (sizeof (double));
+    return bytes >= requiredBytes && bytes <= MaxGdlArrayItems * static_cast<GSSize> (sizeof (double));
+}
+
+static bool ReadBoundedUString (const GS::uchar_t* value, const GSSize availableUnits, GSSize& length)
+{
+    if (value == nullptr)
+        return false;
+    for (GSSize index = 0; index < availableUnits; ++index) {
+        if (value[index] == 0) {
+            length = index;
+            return true;
+        }
+    }
+    return false;
+}
+
+template <std::size_t Capacity>
+static bool ReadFixedUString (const GS::uchar_t (&value)[Capacity], GS::UniString& result)
+{
+    GSSize length = 0;
+    if (!ReadBoundedUString (value, static_cast<GSSize> (Capacity), length))
+        return false;
+    result = GS::UniString (value, static_cast<USize> (length));
+    return true;
+}
+
+static bool GetPackedStringUnits (const API_AddParType& parameter, const GSSize itemCount, GSSize& units)
+{
+    if (parameter.value.array == nullptr || *parameter.value.array == nullptr)
+        return false;
+    const GSSize bytes = BMhGetSize (parameter.value.array);
+    if (bytes <= 0 || bytes % static_cast<GSSize> (sizeof (GS::uchar_t)) != 0 || bytes > MaxGdlPackedStringBytes)
+        return false;
+    units = bytes / static_cast<GSSize> (sizeof (GS::uchar_t));
+    const auto* values = reinterpret_cast<const GS::uchar_t*> (*parameter.value.array);
+    GSSize offset = 0;
+    for (GSSize index = 0; index < itemCount; ++index) {
+        if (offset >= units)
+            return false;
+        GSSize length = 0;
+        if (!ReadBoundedUString (values + offset, units - offset, length))
+            return false;
+        if (length == std::numeric_limits<GSSize>::max () - offset)
+            return false;
+        offset += length + 1;
+    }
+    return true;
+}
+
+static bool GetPossiblePackedStringUnits (const API_GetParamValuesType& values, GSSize& units)
+{
+    if (values.uStrValues == nullptr || *values.uStrValues == nullptr || values.nVals <= 0 ||
+        static_cast<GSSize> (values.nVals) > MaxGdlPossibleValueCount)
+        return false;
+    const GSSize bytes = BMhGetSize (reinterpret_cast<GSHandle> (values.uStrValues));
+    if (bytes <= 0 || bytes % static_cast<GSSize> (sizeof (GS::uchar_t)) != 0 || bytes > MaxGdlPackedStringBytes)
+        return false;
+    units = bytes / static_cast<GSSize> (sizeof (GS::uchar_t));
+    const auto* data = *values.uStrValues;
+    GSSize offset = 0;
+    for (GSSize index = 0; index < static_cast<GSSize> (values.nVals); ++index) {
+        if (offset >= units)
+            return false;
+        GSSize length = 0;
+        if (!ReadBoundedUString (data + offset, units - offset, length))
+            return false;
+        if (length == std::numeric_limits<GSSize>::max () - offset)
+            return false;
+        offset += length + 1;
+    }
+    return true;
+}
 
 static GS::UniString ConvertAddParIDToString (API_AddParID addParID)
 {
@@ -29,40 +134,37 @@ static GS::UniString ConvertAddParIDToString (API_AddParID addParID)
 }
 
 static void AddValueInteger (GS::ObjectState& gdlParameterDetails,
-                             const API_AddParType& actParam)
+                             const API_AddParType& actParam,
+                             const GSSize itemCount)
 {
     if (actParam.typeMod == API_ParSimple) {
         gdlParameterDetails.Add (ParameterValueFieldName, static_cast<Int32> (actParam.value.real));
     } else {
         const auto& arrayValueItemAdder = gdlParameterDetails.AddList<Int32> (ParameterValueFieldName);
-        Int32 arrayIndex = 0;
-        for (Int32 i1 = 1; i1 <= actParam.dim1; i1++) {
-            for (Int32 i2 = 1; i2 <= actParam.dim2; i2++) {
-                arrayValueItemAdder (static_cast<Int32> (((double*) *actParam.value.array)[arrayIndex++]));
-            }
-        }
+        const auto* values = reinterpret_cast<const double*> (*actParam.value.array);
+        for (GSSize index = 0; index < itemCount; ++index)
+            arrayValueItemAdder (static_cast<Int32> (values[index]));
     }
 }
 
 static void AddValueDouble (GS::ObjectState& gdlParameterDetails,
-                            const API_AddParType& actParam)
+                            const API_AddParType& actParam,
+                            const GSSize itemCount)
 {
     if (actParam.typeMod == API_ParSimple) {
         gdlParameterDetails.Add (ParameterValueFieldName, actParam.value.real);
     } else {
         const auto& arrayValueItemAdder = gdlParameterDetails.AddList<double> (ParameterValueFieldName);
-        Int32 arrayIndex = 0;
-        for (Int32 i1 = 1; i1 <= actParam.dim1; i1++) {
-            for (Int32 i2 = 1; i2 <= actParam.dim2; i2++) {
-                arrayValueItemAdder (((double*) *actParam.value.array)[arrayIndex++]);
-            }
-        }
+        const auto* values = reinterpret_cast<const double*> (*actParam.value.array);
+        for (GSSize index = 0; index < itemCount; ++index)
+            arrayValueItemAdder (values[index]);
     }
 }
 
 template<typename T>
 static void AddValueTrueFalseOptions (GS::ObjectState& gdlParameterDetails,
                                       const API_AddParType& actParam,
+                                      const GSSize itemCount,
                                       T optionTrue,
                                       T optionFalse)
 {
@@ -70,41 +172,50 @@ static void AddValueTrueFalseOptions (GS::ObjectState& gdlParameterDetails,
         gdlParameterDetails.Add (ParameterValueFieldName, static_cast<Int32> (actParam.value.real) == 0 ? optionFalse : optionTrue);
     } else {
         const auto& arrayValueItemAdder = gdlParameterDetails.AddList<T> (ParameterValueFieldName);
-        Int32 arrayIndex = 0;
-        for (Int32 i1 = 1; i1 <= actParam.dim1; i1++) {
-            for (Int32 i2 = 1; i2 <= actParam.dim2; i2++) {
-                arrayValueItemAdder (static_cast<Int32> (((double*) *actParam.value.array)[arrayIndex++]) == 0 ? optionFalse : optionTrue);
-            }
-        }
+        const auto* values = reinterpret_cast<const double*> (*actParam.value.array);
+        for (GSSize index = 0; index < itemCount; ++index)
+            arrayValueItemAdder (static_cast<Int32> (values[index]) == 0 ? optionFalse : optionTrue);
     }
 }
 
 static void AddValueOnOff (GS::ObjectState& gdlParameterDetails,
-                           const API_AddParType& actParam)
+                           const API_AddParType& actParam,
+                           const GSSize itemCount)
 {
-    AddValueTrueFalseOptions (gdlParameterDetails, actParam, GS::String ("On"), GS::String ("Off"));
+    AddValueTrueFalseOptions (gdlParameterDetails, actParam, itemCount, GS::String ("On"), GS::String ("Off"));
 }
 
 static void AddValueBool (GS::ObjectState& gdlParameterDetails,
-                          const API_AddParType& actParam)
+                          const API_AddParType& actParam,
+                          const GSSize itemCount)
 {
-    AddValueTrueFalseOptions (gdlParameterDetails, actParam, true, false);
+    AddValueTrueFalseOptions (gdlParameterDetails, actParam, itemCount, true, false);
 }
 
 static void AddValueString (GS::ObjectState& gdlParameterDetails,
-                            const API_AddParType& actParam)
+                            const API_AddParType& actParam,
+                            const GSSize itemCount,
+                            const GSSize packedStringUnits)
 {
     if (actParam.typeMod == API_ParSimple) {
-        gdlParameterDetails.Add (ParameterValueFieldName, GS::UniString (actParam.value.uStr));
+        GS::UniString value;
+        if (ReadFixedUString (actParam.value.uStr, value))
+            gdlParameterDetails.Add (ParameterValueFieldName, value);
     } else {
         const auto& arrayValueItemAdder = gdlParameterDetails.AddList<GS::UniString> (ParameterValueFieldName);
-        Int32 arrayIndex = 0;
-        for (Int32 i1 = 1; i1 <= actParam.dim1; i1++) {
-            for (Int32 i2 = 1; i2 <= actParam.dim2; i2++) {
-                GS::uchar_t* uValueStr = (reinterpret_cast<GS::uchar_t*>(*actParam.value.array)) + arrayIndex;
-                arrayIndex += GS::ucslen32 (uValueStr) + 1;
-                arrayValueItemAdder (GS::UniString (uValueStr));
-            }
+        const GSSize units = packedStringUnits;
+        const auto* values = reinterpret_cast<const GS::uchar_t*> (*actParam.value.array);
+        GSSize offset = 0;
+        for (GSSize index = 0; index < itemCount; ++index) {
+            if (offset >= units)
+                return;
+            GSSize length = 0;
+            if (!ReadBoundedUString (values + offset, units - offset, length))
+                return;
+            arrayValueItemAdder (GS::UniString (values + offset, static_cast<USize> (length)));
+            if (length >= units - offset)
+                return;
+            offset += length + 1;
         }
     }
 }
@@ -153,6 +264,7 @@ static bool SetParamValueBool (API_ChangeParamType& changeParam,
     return false;
 }
 
+constexpr USize MaxStrValueLength = 512;
 static const API_AddParType* FindParameterByName (const API_GetParamsType& getParams, const char* name)
 {
     const GSSize nParams = BMGetHandleSize ((GSHandle) getParams.params) / sizeof (API_AddParType);
@@ -318,16 +430,16 @@ static bool GetArrayValueField (const GS::ObjectState& parameter, GS::Array<T>& 
 }
 
 static bool SetParamValueString (API_ChangeParamType& changeParam,
-                                 const GS::ObjectState& parameterDetails)
+                                 const GS::ObjectState& parameterDetails,
+                                 GS::uchar_t (&strValueStorage)[MaxStrValueLength])
 {
     GS::UniString value;
     if (parameterDetails.Get (ParameterValueFieldName, value)) {
-        constexpr USize MaxStrValueLength = 512;
+        const auto ustrObject = value.ToUStr ();
+        GS::ucsncpy (strValueStorage, ustrObject, MaxStrValueLength);
+        strValueStorage[MaxStrValueLength - 1] = 0;
 
-        static GS::uchar_t strValuePtr[MaxStrValueLength];
-        GS::ucscpy (strValuePtr, value.ToUStr (0, GS::Min (value.GetLength (), MaxStrValueLength)).Get ());
-
-        changeParam.uStrValue = strValuePtr;
+        changeParam.uStrValue = strValueStorage;
         return true;
     }
     return false;
@@ -414,8 +526,23 @@ GS::ObjectState	GetGDLParametersOfElementsCommand::Execute (const GS::ObjectStat
 #endif
 
         API_GetParamsType getParams = {};
+        API_AddParType** addPars = nullptr;
+        bool parametersOpened = false;
+        const GS::OnExit parameterResourcesGuard ([&] () {
+            if (parametersOpened) {
+                ACAPI_LibraryPart_CloseParameters ();
+            }
+            if (getParams.params != nullptr) {
+                ACAPI_DisposeAddParHdl (&getParams.params);
+            }
+            if (addPars != nullptr) {
+                ACAPI_DisposeAddParHdl (&addPars);
+            }
+        });
+
         err = ACAPI_LibraryPart_OpenParameters (&paramOwner);
         if (err == NoError) {
+            parametersOpened = true;
             err = ACAPI_LibraryPart_GetActParameters (&getParams);
         }
 
@@ -455,10 +582,33 @@ GS::ObjectState	GetGDLParametersOfElementsCommand::Execute (const GS::ObjectStat
         double a;
         double b;
         Int32 addParNum;
-        API_AddParType** addPars;
-        ACAPI_LibraryPart_GetParams (libInd, &a, &b, &addParNum, &addPars);
+        const GSErrCode defaultParamsErr = ACAPI_LibraryPart_GetParams (libInd, &a, &b, &addParNum, &addPars);
+        if (defaultParamsErr != NoError || addPars == nullptr || *addPars == nullptr) {
+            elemGdlParameterListAdder (CreateErrorResponse (
+                defaultParamsErr != NoError ? defaultParamsErr : APIERR_BADPARS,
+                "Failed to get the default Library Part parameters."));
+            continue;
+        }
+        if (getParams.params == nullptr || *getParams.params == nullptr) {
+            elemGdlParameterListAdder (CreateErrorResponse (APIERR_BADPARS, "Archicad returned no active Library Part parameters."));
+            continue;
+        }
 
-        const GSSize nParams = BMGetHandleSize ((GSHandle) getParams.params) / sizeof (API_AddParType);
+        const GSSize paramsBytes = BMhGetSize (reinterpret_cast<GSHandle> (getParams.params));
+        const GSSize libraryParamsBytes = BMhGetSize (reinterpret_cast<GSHandle> (addPars));
+        if (paramsBytes == 0 || paramsBytes % sizeof (API_AddParType) != 0 ||
+            libraryParamsBytes == 0 || libraryParamsBytes % sizeof (API_AddParType) != 0 ||
+            paramsBytes > MaxGdlParameterCount * static_cast<GSSize> (sizeof (API_AddParType)) ||
+            libraryParamsBytes > MaxGdlParameterCount * static_cast<GSSize> (sizeof (API_AddParType))) {
+            elemGdlParameterListAdder (CreateErrorResponse (APIERR_BADPARS, "Library Part parameter memo sizes are invalid."));
+            continue;
+        }
+        const GSSize nParams = paramsBytes / sizeof (API_AddParType);
+        const GSSize libraryParamCapacity = libraryParamsBytes / sizeof (API_AddParType);
+        if (addParNum < 0 || static_cast<GSSize> (addParNum) < nParams || libraryParamCapacity < nParams) {
+            elemGdlParameterListAdder (CreateErrorResponse (APIERR_BADPARS, "Library Part parameter memo sizes are inconsistent."));
+            continue;
+        }
         GS::ObjectState gdlParameters;
         const auto& parameterListAdder = gdlParameters.AddList<GS::ObjectState> ("parameters");
         for (GSIndex ii = 0; ii < nParams; ++ii) {
@@ -470,12 +620,23 @@ GS::ObjectState	GetGDLParametersOfElementsCommand::Execute (const GS::ObjectStat
             }
 
             API_GetParamValuesType getValues = {};
+            const GS::OnExit getValuesGuard ([&] () {
+                if (getValues.uStrValues != nullptr) {
+                    BMhFree ((GSHandle) getValues.uStrValues);
+                }
+                if (getValues.realValues != nullptr) {
+                    BMhFree ((GSHandle) getValues.realValues);
+                }
+            });
             getValues.index = actParam.index;
-            ACAPI_LibraryPart_GetParamValues (&getValues);
+            const GSErrCode valuesErr = ACAPI_LibraryPart_GetParamValues (&getValues);
 
             GS::ObjectState gdlParameterDetails;
             gdlParameterDetails.Add ("name", actParam.name);
-            gdlParameterDetails.Add ("displayName", GS::UniString (actLibPartParam.uDescname));
+            GS::UniString displayName;
+            if (!ReadFixedUString (actLibPartParam.uDescname, displayName))
+                displayName = GS::EmptyUniString;
+            gdlParameterDetails.Add ("displayName", displayName);
             gdlParameterDetails.Add ("index", actParam.index);
             gdlParameterDetails.Add ("type", ConvertAddParIDToString (actParam.typeID));
             if (actParam.typeMod == API_ParArray) {
@@ -483,45 +644,98 @@ GS::ObjectState	GetGDLParametersOfElementsCommand::Execute (const GS::ObjectStat
                 gdlParameterDetails.Add ("dimension2", actParam.dim2);
             }
 
-            switch (actParam.typeID) {
-                case APIParT_Integer:
-                case APIParT_PenCol:
-                case APIParT_LineTyp:
-                case APIParT_Mater:
-                case APIParT_FillPat:
-                case APIParT_BuildingMaterial:
-                case APIParT_Profile:
-                    AddValueInteger (gdlParameterDetails, actParam);
-                    break;
-                case APIParT_ColRGB:
-                case APIParT_Intens:
-                case APIParT_Length:
-                case APIParT_RealNum:
-                case APIParT_Angle:
-                    AddValueDouble (gdlParameterDetails, actParam);
-                    break;
-                case APIParT_LightSw:
-                    AddValueOnOff (gdlParameterDetails, actParam);
-                    break;
-                case APIParT_Boolean:
-                    AddValueBool (gdlParameterDetails, actParam);
-                    break;
-                case APIParT_CString:
-                case APIParT_Title:
-                    AddValueString (gdlParameterDetails, actParam);
-                    break;
-                default:
-                case APIParT_Dictionary:
-                    // Not supported by the Archicad API yet
-                    break;
+            GSSize arrayItemCount = 1;
+            bool valueAvailable = GetArrayItemCount (actParam, arrayItemCount);
+            if (valueAvailable && actParam.typeMod == API_ParArray) {
+                if (actParam.typeID == APIParT_CString || actParam.typeID == APIParT_Title) {
+                    GSSize packedStringUnits = 0;
+                    valueAvailable = GetPackedStringUnits (actParam, arrayItemCount, packedStringUnits);
+                } else {
+                    valueAvailable = HasNumericArrayStorage (actParam, arrayItemCount);
+                }
+            }
+            if (!valueAvailable) {
+                gdlParameterDetails.Add ("valueStatus", "unavailable");
+            } else {
+                switch (actParam.typeID) {
+                    case APIParT_Integer:
+                    case APIParT_PenCol:
+                    case APIParT_LineTyp:
+                    case APIParT_Mater:
+                    case APIParT_FillPat:
+                    case APIParT_BuildingMaterial:
+                    case APIParT_Profile:
+                        AddValueInteger (gdlParameterDetails, actParam, arrayItemCount);
+                        break;
+                    case APIParT_ColRGB:
+                    case APIParT_Intens:
+                    case APIParT_Length:
+                    case APIParT_RealNum:
+                    case APIParT_Angle:
+                        AddValueDouble (gdlParameterDetails, actParam, arrayItemCount);
+                        break;
+                    case APIParT_LightSw:
+                        AddValueOnOff (gdlParameterDetails, actParam, arrayItemCount);
+                        break;
+                    case APIParT_Boolean:
+                        AddValueBool (gdlParameterDetails, actParam, arrayItemCount);
+                        break;
+                    case APIParT_CString:
+                    case APIParT_Title:
+                        if (actParam.typeMod == API_ParSimple) {
+                            GS::UniString stringValue;
+                            if (!ReadFixedUString (actParam.value.uStr, stringValue))
+                                gdlParameterDetails.Add ("valueStatus", "unavailable");
+                            else
+                                AddValueString (gdlParameterDetails, actParam, arrayItemCount, 0);
+                        } else {
+                            GSSize packedStringUnits = 0;
+                            if (!GetPackedStringUnits (actParam, arrayItemCount, packedStringUnits)) {
+                                gdlParameterDetails.Add ("valueStatus", "unavailable");
+                            } else {
+                                AddValueString (gdlParameterDetails, actParam, arrayItemCount, packedStringUnits);
+                            }
+                        }
+                        break;
+                    default:
+                    case APIParT_Dictionary:
+                        // Not supported by the Archicad API yet
+                        break;
+                }
             }
 
-            GS::UniString valueDescription (actParam.valueDescription);
+            GS::UniString valueDescription;
+            if (!ReadFixedUString (actParam.valueDescription, valueDescription))
+                valueDescription = GS::EmptyUniString;
             if (!valueDescription.IsEmpty ()) {
                 gdlParameterDetails.Add ("valueDescription", valueDescription);
             }
 
             gdlParameterDetails.Add ("isLocked", getValues.locked);
+            if (valuesErr != NoError) {
+                gdlParameterDetails.Add ("possibleValuesStatus", "unavailable");
+                getValues.nVals = 0;
+            } else if (getValues.nVals > 0) {
+                const bool countInvalid = getValues.nVals < 0 ||
+                    static_cast<GSSize> (getValues.nVals) > MaxGdlPossibleValueCount;
+                const bool stringValuesPresent = getValues.uStrValues != nullptr;
+                const bool realValuesPresent = getValues.realValues != nullptr;
+                GSSize packedStringUnits = 0;
+                const bool stringValuesValid = !stringValuesPresent ||
+                    GetPossiblePackedStringUnits (getValues, packedStringUnits);
+                const GSSize realValueBytes = realValuesPresent
+                    ? BMhGetSize (reinterpret_cast<GSHandle> (getValues.realValues))
+                    : 0;
+                const bool realValuesValid = !realValuesPresent ||
+                    (*getValues.realValues != nullptr && realValueBytes > 0 &&
+                     realValueBytes % static_cast<GSSize> (sizeof (API_VLNumType)) == 0 &&
+                     realValueBytes / static_cast<GSSize> (sizeof (API_VLNumType)) >= static_cast<GSSize> (getValues.nVals) &&
+                     realValueBytes <= MaxGdlPossibleValueCount * static_cast<GSSize> (sizeof (API_VLNumType)));
+                if (countInvalid || (!stringValuesPresent && !realValuesPresent) || !stringValuesValid || !realValuesValid) {
+                    gdlParameterDetails.Add ("possibleValuesStatus", "invalid");
+                    getValues.nVals = 0;
+                }
+            }
 
             const auto& flags = gdlParameterDetails.AddList<GS::UniString> ("flags");
             if (actParam.flags & API_ParFlg_Hidden) {
@@ -545,18 +759,23 @@ GS::ObjectState	GetGDLParametersOfElementsCommand::Execute (const GS::ObjectStat
 
             if (getValues.nVals > 0) {
                 if (actParam.typeID == APIParT_PenCol && getValues.nVals == 255) {
-                    BMhFree ((GSHandle)getValues.realValues);
+                    // The guard releases the values handle after this parameter.
                 } else {
-                    if (getValues.uStrValues != nullptr) {
+                    if (getValues.uStrValues != nullptr && *getValues.uStrValues != nullptr) {
                         const auto& possibleValues = gdlParameterDetails.AddList<GS::UniString> ("possibleValues");
                         GS::uchar_t *strPos = *getValues.uStrValues;
+                        GSSize stringUnits = BMhGetSize (reinterpret_cast<GSHandle> (getValues.uStrValues)) /
+                            static_cast<GSSize> (sizeof (GS::uchar_t));
+                        GSSize stringOffset = 0;
                         for (GSIndex valIdx = 0; valIdx < getValues.nVals; ++valIdx) {
-                            GS::UniString tmpUStr (strPos);
-                            possibleValues (tmpUStr);
-                            strPos += GS::ucslen (strPos) + 1;
+                            GSSize stringLength = 0;
+                            if (stringOffset >= stringUnits ||
+                                !ReadBoundedUString (strPos + stringOffset, stringUnits - stringOffset, stringLength))
+                                break;
+                            possibleValues (GS::UniString (strPos + stringOffset, static_cast<USize> (stringLength)));
+                            stringOffset += stringLength + 1;
                         }
-                        BMhFree ((GSHandle)getValues.uStrValues);
-                    } else if (getValues.realValues != nullptr) {
+                    } else if (getValues.realValues != nullptr && *getValues.realValues != nullptr) {
                         const auto& possibleValues = gdlParameterDetails.AddList<GS::ObjectState> ("possibleValues");
                         for (GSIndex valIdx = 0; valIdx < getValues.nVals; ++valIdx) {
                             const auto& possibleValue = (*getValues.realValues)[valIdx];
@@ -577,13 +796,14 @@ GS::ObjectState	GetGDLParametersOfElementsCommand::Execute (const GS::ObjectStat
                             } else {
                                 os = GS::ObjectState ("value", possibleValue.value);
                             }
-                            GS::UniString valueDescription (possibleValue.valueDescription);
+                            GS::UniString valueDescription;
+                            if (!ReadFixedUString (possibleValue.valueDescription, valueDescription))
+                                valueDescription = GS::EmptyUniString;
                             if (!valueDescription.IsEmpty ()) {
                                 os.Add ("description", valueDescription);
                             }
                             possibleValues (os);
                         }
-                        BMhFree ((GSHandle)getValues.realValues);
                     }
                     gdlParameterDetails.Add ("canHaveCustomValue", getValues.custom);
                 }
@@ -592,7 +812,6 @@ GS::ObjectState	GetGDLParametersOfElementsCommand::Execute (const GS::ObjectStat
             parameterListAdder (gdlParameterDetails);
         }
         elemGdlParameterListAdder (gdlParameters);
-        ACAPI_DisposeAddParHdl (&getParams.params);
     }
 
     return response;
@@ -688,15 +907,34 @@ GS::ObjectState	SetGDLParametersOfElementsCommand::Execute (const GS::ObjectStat
             GS::Array<GS::ObjectState> elemGdlParameters;
             elementWithGDLParameters.Get ("gdlParameters", elemGdlParameters);
 
+            API_GetParamsType getParams = {};
+            bool parametersOpened = false;
+            const GS::OnExit parametersGuard ([&] () {
+                if (parametersOpened)
+                    ACAPI_LibraryPart_CloseParameters ();
+                if (getParams.params != nullptr)
+                    ACAPI_DisposeAddParHdl (&getParams.params);
+            });
+
             err = ACAPI_LibraryPart_OpenParameters (&paramOwner);
             if (err == NoError) {
-                API_GetParamsType getParams = {};
+                parametersOpened = true;
                 err = ACAPI_LibraryPart_GetActParameters (&getParams);
+                if (err == NoError && (getParams.params == nullptr || *getParams.params == nullptr)) {
+                    err = APIERR_BADPARS;
+                    errMessage = "Archicad returned no active Library Part parameters.";
+                }
                 if (err == NoError) {
-                    const GSSize nParams = BMGetHandleSize ((GSHandle) getParams.params) / sizeof (API_AddParType);
+                    const GSSize paramsBytes = BMhGetSize (reinterpret_cast<GSHandle> (getParams.params));
+                    if (paramsBytes <= 0 || paramsBytes % sizeof (API_AddParType) != 0 ||
+                        paramsBytes > MaxGdlParameterCount * static_cast<GSSize> (sizeof (API_AddParType))) {
+                        err = APIERR_BADPARS;
+                        errMessage = "Archicad returned an invalid Library Part parameter memo.";
+                    }
+                    const GSSize nParams = paramsBytes / sizeof (API_AddParType);
                     GS::HashTable<GS::String, API_AddParID> gdlParametersTypeDictionary;
                     GS::HashTable<short, GS::String> gdlParametersIndexNameDictionary;
-                    for (GSIndex ii = 0; ii < nParams; ++ii) {
+                    for (GSIndex ii = 0; err == NoError && ii < nParams; ++ii) {
                         const API_AddParType& actParam = (*getParams.params)[ii];
                         if (actParam.typeID != APIParT_Separator) {
                             auto name = GS::String (actParam.name);
@@ -706,7 +944,21 @@ GS::ObjectState	SetGDLParametersOfElementsCommand::Execute (const GS::ObjectStat
                     }
 
                     GS::Array<ArrayParameterChange> pendingArrayChanges;
+                    const auto refreshParameters = [&]() -> GSErrCode {
+                        ACAPI_DisposeAddParHdl (&getParams.params);
+                        const GSErrCode refreshErr = ACAPI_LibraryPart_GetActParameters (&getParams);
+                        if (refreshErr != NoError || getParams.params == nullptr || *getParams.params == nullptr)
+                            return refreshErr != NoError ? refreshErr : APIERR_BADPARS;
+                        const GSSize refreshedBytes = BMhGetSize (reinterpret_cast<GSHandle> (getParams.params));
+                        return refreshedBytes <= 0 || refreshedBytes % sizeof (API_AddParType) != 0 ||
+                            refreshedBytes > MaxGdlParameterCount * static_cast<GSSize> (sizeof (API_AddParType))
+                            ? APIERR_BADPARS
+                            : NoError;
+                    };
+
                     for (const GS::ObjectState& elemGdlParametersItem : elemGdlParameters) {
+                        if (err != NoError)
+                            break;
                         GS::Array<GS::ObjectState> parameters;
                         if (elemGdlParametersItem.Get ("parameters", parameters)) {
                             // Legacy mode: old schema had nested list for parameters
@@ -716,8 +968,7 @@ GS::ObjectState	SetGDLParametersOfElementsCommand::Execute (const GS::ObjectStat
                                     break;
                                 }
 
-                                ACAPI_DisposeAddParHdl (&getParams.params);
-                                ACAPI_LibraryPart_GetActParameters (&getParams);
+                                err = refreshParameters ();
                             }
                             if (err != NoError) {
                                 break;
@@ -728,8 +979,7 @@ GS::ObjectState	SetGDLParametersOfElementsCommand::Execute (const GS::ObjectStat
                                 break;
                             }
 
-                            ACAPI_DisposeAddParHdl (&getParams.params);
-                            ACAPI_LibraryPart_GetActParameters (&getParams);
+                            err = refreshParameters ();
                         }
                     }
 
@@ -772,13 +1022,16 @@ GS::ObjectState	SetGDLParametersOfElementsCommand::Execute (const GS::ObjectStat
                                     break;
                             }
 
-                            memo.params = getParams.params;
-                            err = ACAPI_Element_Change (&element, &mask, &memo, APIMemoMask_AddPars, true);
+                            if (getParams.params == nullptr || *getParams.params == nullptr) {
+                                err = APIERR_BADPARS;
+                                errMessage = "Archicad returned no refreshed Library Part parameters.";
+                            } else {
+                                memo.params = getParams.params;
+                                err = ACAPI_Element_Change (&element, &mask, &memo, APIMemoMask_AddPars, true);
+                            }
                         }
                     }
                 }
-                ACAPI_LibraryPart_CloseParameters ();
-                ACAPI_DisposeAddParHdl (&getParams.params);
             }
 
             if (err != NoError) {
@@ -886,6 +1139,7 @@ SetGDLParametersOfElementsCommand::SetOneGDLParameter (
         return APIERR_BADPARS;
     }
 
+    GS::uchar_t stringValueStorage[MaxStrValueLength] = {};
     switch (gdlParametersTypeDictionary[changeParam.name]) {
         case APIParT_Integer:
         case APIParT_PenCol:
@@ -923,7 +1177,7 @@ SetGDLParametersOfElementsCommand::SetOneGDLParameter (
             break;
         case APIParT_CString:
         case APIParT_Title:
-            if (!SetParamValueString (changeParam, parameter)) {
+            if (!SetParamValueString (changeParam, parameter, stringValueStorage)) {
                 errMessage = GS::UniString::Printf ("Invalid input: the given value is not a string for parameter %s of element %T", changeParam.name, APIGuidToString (elemGuid).ToPrintf ());
                 return APIERR_BADPARS;
             }

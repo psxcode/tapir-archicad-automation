@@ -2,6 +2,7 @@
 
 #include "MigrationHelper.hpp"
 #include "NotificationCommands.hpp"
+#include "NativeOwnership.hpp"
 
 #ifdef ServerMainVers_2900
 #include	"ACAPI/Element/Opening/OpeningDefault.hpp"
@@ -244,6 +245,7 @@ GSErrCode PrepareWindowOrDoorDefaults (API_ElemTypeID elemTypeId, API_Element& e
     }
 
     API_LibPart libPart = {};
+    LibraryPartLocationGuard libPartLocationGuard (libPart);
 #ifdef ServerMainVers_2700
     err = ACAPI_LibraryPart_GetMarkerParent (element.header.type, libPart);
 #elif ServerMainVers_2600
@@ -256,7 +258,6 @@ GSErrCode PrepareWindowOrDoorDefaults (API_ElemTypeID elemTypeId, API_Element& e
     }
 
     err = ACAPI_LibraryPart_Search (&libPart, false, true);
-    delete libPart.location;
     if (err != NoError) {
         return err;
     }
@@ -473,8 +474,14 @@ GS::Optional<GS::UniString> PopulateAssociativeDimensionMemo (
     API_Element& element,
     API_ElementMemo& memo)
 {
+    if (static_cast<GSSize> (points.GetSize ()) > static_cast<GSSize> (std::numeric_limits<Int32>::max ()))
+        return "Too many associative dimension points.";
     element.dimension.nDimElem = static_cast<Int32> (points.GetSize ());
-    memo.dimElems = reinterpret_cast<API_DimElem**> (BMhAllClear (element.dimension.nDimElem * sizeof (API_DimElem)));
+    const GSSize dimElemCount = static_cast<GSSize> (element.dimension.nDimElem);
+    if (dimElemCount > std::numeric_limits<GSSize>::max () / sizeof (API_DimElem))
+        return "Associative dimension data exceeds the supported range.";
+    const GSSize dimElemBytes = dimElemCount * sizeof (API_DimElem);
+    memo.dimElems = reinterpret_cast<API_DimElem**> (BMhAllClear (dimElemBytes));
     if (memo.dimElems == nullptr || *memo.dimElems == nullptr) {
         return "Failed to allocate associative dimension witness data.";
     }
@@ -830,19 +837,34 @@ GS::Optional<GS::UniString> BuildSlabMemoFromGeometry (
     if (IsSame2DCoordinate (polygonOutline.GetFirst (), polygonOutline.GetLast ())) {
         polygonOutline.Pop ();
     }
+    const GSSize polygonCoordinateCount = static_cast<GSSize> (polygonOutline.GetSize ());
+    const GSSize polygonArcCount = static_cast<GSSize> (polygonArcs.GetSize ());
+    if (polygonCoordinateCount < 3 || polygonCoordinateCount > static_cast<GSSize> (std::numeric_limits<Int32>::max () - 1) ||
+        polygonArcCount > static_cast<GSSize> (std::numeric_limits<Int32>::max ()))
+        return "Invalid slab polygon dimensions.";
 
     const API_Polygon oldPoly = element.slab.poly;
-    element.slab.poly.nCoords = polygonOutline.GetSize () + 1;
+    element.slab.poly.nCoords = static_cast<Int32> (polygonCoordinateCount) + 1;
     element.slab.poly.nSubPolys = 1;
-    element.slab.poly.nArcs = polygonArcs.GetSize ();
+    element.slab.poly.nArcs = static_cast<Int32> (polygonArcCount);
 
     for (const GS::ObjectState& hole : holes) {
         GS::Array<GS::ObjectState> holePolygonOutline;
         GS::Array<GS::ObjectState> holePolygonArcs;
-        if (GetHoleGeometry (hole, holePolygonOutline, holePolygonArcs)) {
-            element.slab.poly.nCoords += holePolygonOutline.GetSize () + 1;
+        if (GetHoleGeometry (hole, holePolygonOutline, holePolygonArcs) && holePolygonOutline.GetSize () >= 3) {
+            const GSSize holeCoordinateCount = static_cast<GSSize> (holePolygonOutline.GetSize ());
+            const GSSize holeArcCount = static_cast<GSSize> (holePolygonArcs.GetSize ());
+            const GSSize maxInt32 = static_cast<GSSize> (std::numeric_limits<Int32>::max ());
+            const GSSize currentCoordinateCount = static_cast<GSSize> (element.slab.poly.nCoords);
+            const GSSize currentArcCount = static_cast<GSSize> (element.slab.poly.nArcs);
+            if (currentCoordinateCount > maxInt32 - 1 || currentArcCount > maxInt32 ||
+                static_cast<GSSize> (element.slab.poly.nSubPolys) >= maxInt32 ||
+                holeCoordinateCount > maxInt32 - currentCoordinateCount - 1 ||
+                holeArcCount > maxInt32 - currentArcCount)
+                return "Slab polygon dimensions exceed the supported range.";
+            element.slab.poly.nCoords += static_cast<Int32> (holeCoordinateCount) + 1;
             ++element.slab.poly.nSubPolys;
-            element.slab.poly.nArcs += holePolygonArcs.GetSize ();
+            element.slab.poly.nArcs += static_cast<Int32> (holeArcCount);
         }
     }
 
@@ -856,31 +878,83 @@ GS::Optional<GS::UniString> BuildSlabMemoFromGeometry (
     const Int32 nCoords    = element.slab.poly.nCoords;
     const Int32 nSubPolys  = element.slab.poly.nSubPolys;
     const Int32 nArcs      = element.slab.poly.nArcs;
+    if (nCoords < 4 || nSubPolys < 1 || nArcs < 0)
+        return "Invalid slab polygon memo dimensions.";
+    const GSSize coordCount = static_cast<GSSize> (nCoords) + 1;
+    const GSSize subPolyCount = static_cast<GSSize> (nSubPolys) + 1;
+    if (coordCount > std::numeric_limits<GSSize>::max () / sizeof (API_Coord) ||
+        coordCount > std::numeric_limits<GSSize>::max () / sizeof (UInt32) ||
+        coordCount > std::numeric_limits<GSSize>::max () / sizeof (API_EdgeTrim) ||
+        coordCount > std::numeric_limits<GSSize>::max () / sizeof (API_OverriddenAttribute) ||
+        subPolyCount > std::numeric_limits<GSSize>::max () / sizeof (Int32) ||
+        (nArcs > 0 && static_cast<GSSize> (nArcs) > std::numeric_limits<GSSize>::max () / sizeof (API_PolyArc)))
+        return "Slab polygon memo dimensions exceed the supported range.";
     const bool  coordsWereNull = (memo.coords == nullptr);
 
     if (coordsWereNull) {
-        memo.coords        = reinterpret_cast<API_Coord**>             (BMAllocateHandle ((nCoords + 1) * sizeof (API_Coord),               ALLOCATE_CLEAR, 0));
-        memo.vertexIDs     = reinterpret_cast<UInt32**>                (BMAllocateHandle ((nCoords + 1) * sizeof (API_Coord),               ALLOCATE_CLEAR, 0));
-        memo.edgeTrims     = reinterpret_cast<API_EdgeTrim**>          (BMAllocateHandle ((nCoords + 1) * sizeof (API_EdgeTrim),            ALLOCATE_CLEAR, 0));
-        memo.sideMaterials = reinterpret_cast<API_OverriddenAttribute*>(BMAllocatePtr    ((nCoords + 1) * sizeof (API_OverriddenAttribute), ALLOCATE_CLEAR, 0));
+        if (memo.vertexIDs != nullptr)
+            BMKillHandle (reinterpret_cast<GSHandle*> (&memo.vertexIDs));
+        if (memo.edgeTrims != nullptr)
+            BMKillHandle (reinterpret_cast<GSHandle*> (&memo.edgeTrims));
+        if (memo.sideMaterials != nullptr)
+            BMpFree (reinterpret_cast<GSPtr> (memo.sideMaterials));
+        memo.coords        = reinterpret_cast<API_Coord**>             (BMAllocateHandle (coordCount * sizeof (API_Coord),               ALLOCATE_CLEAR, 0));
+        memo.vertexIDs     = reinterpret_cast<UInt32**>                (BMAllocateHandle (coordCount * sizeof (UInt32),                ALLOCATE_CLEAR, 0));
+        memo.edgeTrims     = reinterpret_cast<API_EdgeTrim**>          (BMAllocateHandle (coordCount * sizeof (API_EdgeTrim),            ALLOCATE_CLEAR, 0));
+        memo.sideMaterials = reinterpret_cast<API_OverriddenAttribute*>(BMAllocatePtr    (coordCount * sizeof (API_OverriddenAttribute), ALLOCATE_CLEAR, 0));
+    } else if (*memo.coords == nullptr) {
+        return "Slab coordinate memo handle is invalid.";
     } else if (oldPoly.nCoords != nCoords) {
-        memo.coords        = reinterpret_cast<API_Coord**>             (BMReallocHandle (reinterpret_cast<GSHandle> (memo.coords),        (nCoords + 1) * sizeof (API_Coord),               REALLOC_CLEAR, 0));
-        memo.vertexIDs     = reinterpret_cast<UInt32**>                (BMReallocHandle (reinterpret_cast<GSHandle> (memo.vertexIDs),     (nCoords + 1) * sizeof (API_Coord),               REALLOC_CLEAR, 0));
-        memo.edgeTrims     = reinterpret_cast<API_EdgeTrim**>          (BMReallocHandle (reinterpret_cast<GSHandle> (memo.edgeTrims),     (nCoords + 1) * sizeof (API_EdgeTrim),            REALLOC_CLEAR, 0));
-        memo.sideMaterials = reinterpret_cast<API_OverriddenAttribute*>(BMReallocPtr    (reinterpret_cast<GSPtr> (memo.sideMaterials), (nCoords + 1) * sizeof (API_OverriddenAttribute), REALLOC_CLEAR, 0));
+        GSHandle resizedCoords = BMReallocHandle (reinterpret_cast<GSHandle> (memo.coords), coordCount * sizeof (API_Coord), REALLOC_CLEAR, 0);
+        if (resizedCoords == nullptr) return "Failed to resize slab coordinate memo.";
+        memo.coords = reinterpret_cast<API_Coord**> (resizedCoords);
+        if (memo.vertexIDs == nullptr) {
+            memo.vertexIDs = reinterpret_cast<UInt32**> (BMAllocateHandle (coordCount * sizeof (UInt32), ALLOCATE_CLEAR, 0));
+        } else {
+            if (*memo.vertexIDs == nullptr) return "Slab vertex memo handle is invalid.";
+            GSHandle resizedVertexIDs = BMReallocHandle (reinterpret_cast<GSHandle> (memo.vertexIDs), coordCount * sizeof (UInt32), REALLOC_CLEAR, 0);
+            if (resizedVertexIDs == nullptr) return "Failed to resize slab vertex memo.";
+            memo.vertexIDs = reinterpret_cast<UInt32**> (resizedVertexIDs);
+        }
+        if (memo.edgeTrims == nullptr) {
+            memo.edgeTrims = reinterpret_cast<API_EdgeTrim**> (BMAllocateHandle (coordCount * sizeof (API_EdgeTrim), ALLOCATE_CLEAR, 0));
+        } else {
+            if (*memo.edgeTrims == nullptr) return "Slab edge-trim memo handle is invalid.";
+            GSHandle resizedEdgeTrims = BMReallocHandle (reinterpret_cast<GSHandle> (memo.edgeTrims), coordCount * sizeof (API_EdgeTrim), REALLOC_CLEAR, 0);
+            if (resizedEdgeTrims == nullptr) return "Failed to resize slab edge-trim memo.";
+            memo.edgeTrims = reinterpret_cast<API_EdgeTrim**> (resizedEdgeTrims);
+        }
+        if (memo.sideMaterials == nullptr) {
+            memo.sideMaterials = reinterpret_cast<API_OverriddenAttribute*> (BMAllocatePtr (coordCount * sizeof (API_OverriddenAttribute), ALLOCATE_CLEAR, 0));
+        } else {
+            GSPtr resizedSideMaterials = BMReallocPtr (reinterpret_cast<GSPtr> (memo.sideMaterials), coordCount * sizeof (API_OverriddenAttribute), REALLOC_CLEAR, 0);
+            if (resizedSideMaterials == nullptr) return "Failed to resize slab side-material memo.";
+            memo.sideMaterials = reinterpret_cast<API_OverriddenAttribute*> (resizedSideMaterials);
+        }
     }
     if (memo.pends == nullptr) {
-        memo.pends = reinterpret_cast<Int32**> (BMAllocateHandle ((nSubPolys + 1) * sizeof (Int32), ALLOCATE_CLEAR, 0));
+        memo.pends = reinterpret_cast<Int32**> (BMAllocateHandle (subPolyCount * sizeof (Int32), ALLOCATE_CLEAR, 0));
     } else if (oldPoly.nSubPolys != nSubPolys) {
-        memo.pends = reinterpret_cast<Int32**> (BMReallocHandle (reinterpret_cast<GSHandle> (memo.pends), (nSubPolys + 1) * sizeof (Int32), REALLOC_CLEAR, 0));
+        if (*memo.pends == nullptr) return "Slab polygon-end memo handle is invalid.";
+        GSHandle resizedPends = BMReallocHandle (reinterpret_cast<GSHandle> (memo.pends), subPolyCount * sizeof (Int32), REALLOC_CLEAR, 0);
+        if (resizedPends == nullptr) return "Failed to resize slab polygon-end memo.";
+        memo.pends = reinterpret_cast<Int32**> (resizedPends);
     }
     if (nArcs > 0) {
         if (memo.parcs == nullptr) {
-            memo.parcs = reinterpret_cast<API_PolyArc**> (BMAllocateHandle (nArcs * sizeof (API_PolyArc), ALLOCATE_CLEAR, 0));
+            memo.parcs = reinterpret_cast<API_PolyArc**> (BMAllocateHandle (static_cast<GSSize> (nArcs) * sizeof (API_PolyArc), ALLOCATE_CLEAR, 0));
         } else if (oldPoly.nArcs != nArcs) {
-            memo.parcs = reinterpret_cast<API_PolyArc**> (BMReallocHandle (reinterpret_cast<GSHandle> (memo.parcs), nArcs * sizeof (API_PolyArc), REALLOC_CLEAR, 0));
+            if (*memo.parcs == nullptr) return "Slab arc memo handle is invalid.";
+            GSHandle resizedArcs = BMReallocHandle (reinterpret_cast<GSHandle> (memo.parcs), static_cast<GSSize> (nArcs) * sizeof (API_PolyArc), REALLOC_CLEAR, 0);
+            if (resizedArcs == nullptr) return "Failed to resize slab arc memo.";
+            memo.parcs = reinterpret_cast<API_PolyArc**> (resizedArcs);
         }
     }
+    if (memo.coords == nullptr || *memo.coords == nullptr || memo.vertexIDs == nullptr || *memo.vertexIDs == nullptr ||
+        memo.edgeTrims == nullptr || *memo.edgeTrims == nullptr || memo.sideMaterials == nullptr ||
+        memo.pends == nullptr || *memo.pends == nullptr ||
+        (nArcs > 0 && (memo.parcs == nullptr || *memo.parcs == nullptr)))
+        return "Failed to allocate slab polygon memo data.";
     const bool needToProcessVertexIDs =
         coordsWereNull ||
         oldPoly.nCoords != element.slab.poly.nCoords ||
@@ -890,13 +964,17 @@ GS::Optional<GS::UniString> BuildSlabMemoFromGeometry (
     Int32 iCoord = 1;
     Int32 iArc = 0;
     Int32 iPends = 1;
-    AddPolyToMemo (polygonOutline, polygonArcs, iCoord, iArc, iPends, memo, &edgeTrimSideType, &element.slab.sideMat, needToProcessVertexIDs);
+    GSErrCode memoErr = AddPolyToMemo (polygonOutline, polygonArcs, iCoord, iArc, iPends, memo, &edgeTrimSideType, &element.slab.sideMat, needToProcessVertexIDs);
+    if (memoErr != NoError)
+        return "Failed to populate slab polygon memo data.";
 
     for (const GS::ObjectState& hole : holes) {
         GS::Array<GS::ObjectState> holePolygonOutline;
         GS::Array<GS::ObjectState> holePolygonArcs;
         if (GetHoleGeometry (hole, holePolygonOutline, holePolygonArcs)) {
-            AddPolyToMemo (holePolygonOutline, holePolygonArcs, iCoord, iArc, iPends, memo, &edgeTrimSideType, &element.slab.sideMat, needToProcessVertexIDs);
+            memoErr = AddPolyToMemo (holePolygonOutline, holePolygonArcs, iCoord, iArc, iPends, memo, &edgeTrimSideType, &element.slab.sideMat, needToProcessVertexIDs);
+            if (memoErr != NoError)
+                return "Failed to populate slab hole memo data.";
         }
     }
 
@@ -905,7 +983,7 @@ GS::Optional<GS::UniString> BuildSlabMemoFromGeometry (
 
 namespace {
 
-void AddAdditionalPolyToMemo (
+GSErrCode AddAdditionalPolyToMemo (
     const GS::Array<GS::ObjectState>& coords,
     const GS::Array<GS::ObjectState>& arcs,
     Int32& iCoord,
@@ -913,6 +991,27 @@ void AddAdditionalPolyToMemo (
     Int32& iPends,
     API_ElementMemo& memo)
 {
+    if (coords.GetSize () < 3 || memo.additionalPolyCoords == nullptr || *memo.additionalPolyCoords == nullptr ||
+        memo.additionalPolyPends == nullptr || *memo.additionalPolyPends == nullptr || iCoord < 1 || iArc < 0 || iPends < 1)
+        return APIERR_BADPARS;
+
+    const GSSize coordCapacity = BMhGetSize (reinterpret_cast<GSHandle> (memo.additionalPolyCoords)) / sizeof (API_Coord);
+    const GSSize pendsCapacity = BMhGetSize (reinterpret_cast<GSHandle> (memo.additionalPolyPends)) / sizeof (Int32);
+    const GSSize coordinateCount = static_cast<GSSize> (coords.GetSize ());
+    if (coordinateCount > std::numeric_limits<Int32>::max () ||
+        static_cast<GSSize> (iCoord) + coordinateCount + 1 > coordCapacity ||
+        static_cast<GSSize> (iPends) >= pendsCapacity)
+        return APIERR_BADPARS;
+
+    const GS::Array<API_PolyArc> polyArcs = GetPolyArcs (arcs, iCoord);
+    if (!polyArcs.IsEmpty ()) {
+        if (memo.additionalPolyParcs == nullptr || *memo.additionalPolyParcs == nullptr)
+            return APIERR_BADPARS;
+        const GSSize arcCapacity = BMhGetSize (reinterpret_cast<GSHandle> (memo.additionalPolyParcs)) / sizeof (API_PolyArc);
+        if (static_cast<GSSize> (iArc) + static_cast<GSSize> (polyArcs.GetSize ()) > arcCapacity)
+            return APIERR_BADPARS;
+    }
+
     const Int32 startIndex = iCoord;
     for (const GS::ObjectState& coord : coords) {
         (*memo.additionalPolyCoords)[iCoord++] = Get2DCoordinateFromObjectState (coord);
@@ -922,10 +1021,10 @@ void AddAdditionalPolyToMemo (
     (*memo.additionalPolyPends)[iPends++] = iCoord;
     ++iCoord;
 
-    const GS::Array<API_PolyArc> polyArcs = GetPolyArcs (arcs, startIndex);
     for (const API_PolyArc& polyArc : polyArcs) {
         (*memo.additionalPolyParcs)[iArc++] = polyArc;
     }
+    return NoError;
 }
 
 GS::Optional<GS::UniString> BuildRoofMemoFromGeometry (
@@ -942,18 +1041,34 @@ GS::Optional<GS::UniString> BuildRoofMemoFromGeometry (
     if (IsSame2DCoordinate (polygonOutline.GetFirst (), polygonOutline.GetLast ())) {
         polygonOutline.Pop ();
     }
+    const GSSize polygonCoordinateCount = static_cast<GSSize> (polygonOutline.GetSize ());
+    if (polygonCoordinateCount < 3 || polygonCoordinateCount > static_cast<GSSize> (std::numeric_limits<Int32>::max () - 1))
+        return "'polygonOutline' must contain between 3 and INT32_MAX-1 distinct coordinates.";
+    const GSSize polygonArcCount = static_cast<GSSize> (polygonArcs.GetSize ());
+    if (polygonArcCount > static_cast<GSSize> (std::numeric_limits<Int32>::max ()))
+        return "'polygonArcs' exceeds the supported range.";
 
-    element.roof.u.polyRoof.pivotPolygon.nCoords = polygonOutline.GetSize () + 1;
+    element.roof.u.polyRoof.pivotPolygon.nCoords = static_cast<Int32> (polygonCoordinateCount) + 1;
     element.roof.u.polyRoof.pivotPolygon.nSubPolys = 1;
-    element.roof.u.polyRoof.pivotPolygon.nArcs = polygonArcs.GetSize ();
+    element.roof.u.polyRoof.pivotPolygon.nArcs = static_cast<Int32> (polygonArcCount);
 
     for (const GS::ObjectState& hole : holes) {
         GS::Array<GS::ObjectState> holePolygonOutline;
         GS::Array<GS::ObjectState> holePolygonArcs;
-        if (GetHoleGeometry (hole, holePolygonOutline, holePolygonArcs)) {
-            element.roof.u.polyRoof.pivotPolygon.nCoords += holePolygonOutline.GetSize () + 1;
+        if (GetHoleGeometry (hole, holePolygonOutline, holePolygonArcs) && holePolygonOutline.GetSize () >= 3) {
+            const GSSize holeCoordinateCount = static_cast<GSSize> (holePolygonOutline.GetSize ());
+            const GSSize holeArcCount = static_cast<GSSize> (holePolygonArcs.GetSize ());
+            const GSSize maxInt32 = static_cast<GSSize> (std::numeric_limits<Int32>::max ());
+            const GSSize currentCoordinateCount = static_cast<GSSize> (element.roof.u.polyRoof.pivotPolygon.nCoords);
+            const GSSize currentArcCount = static_cast<GSSize> (element.roof.u.polyRoof.pivotPolygon.nArcs);
+            if (currentCoordinateCount > maxInt32 - 1 || currentArcCount > maxInt32 ||
+                static_cast<GSSize> (element.roof.u.polyRoof.pivotPolygon.nSubPolys) >= maxInt32 ||
+                holeCoordinateCount > maxInt32 - currentCoordinateCount - 1 ||
+                holeArcCount > maxInt32 - currentArcCount)
+                return "Roof polygon dimensions exceed the supported range.";
+            element.roof.u.polyRoof.pivotPolygon.nCoords += static_cast<Int32> (holeCoordinateCount) + 1;
             ++element.roof.u.polyRoof.pivotPolygon.nSubPolys;
-            element.roof.u.polyRoof.pivotPolygon.nArcs += holePolygonArcs.GetSize ();
+            element.roof.u.polyRoof.pivotPolygon.nArcs += static_cast<Int32> (holeArcCount);
         }
     }
 
@@ -964,28 +1079,72 @@ GS::Optional<GS::UniString> BuildRoofMemoFromGeometry (
     const Int32 roofNCoords   = element.roof.u.polyRoof.pivotPolygon.nCoords;
     const Int32 roofNSubPolys = element.roof.u.polyRoof.pivotPolygon.nSubPolys;
     const Int32 roofNArcs     = element.roof.u.polyRoof.pivotPolygon.nArcs;
-    memo.additionalPolyCoords = reinterpret_cast<API_Coord**> (memo.additionalPolyCoords == nullptr
-        ? BMAllocateHandle ((roofNCoords + 1) * sizeof (API_Coord), ALLOCATE_CLEAR, 0)
-        : BMReallocHandle (reinterpret_cast<GSHandle> (memo.additionalPolyCoords), (roofNCoords + 1) * sizeof (API_Coord), REALLOC_CLEAR, 0));
-    memo.additionalPolyPends = reinterpret_cast<Int32**> (memo.additionalPolyPends == nullptr
-        ? BMAllocateHandle ((roofNSubPolys + 1) * sizeof (Int32), ALLOCATE_CLEAR, 0)
-        : BMReallocHandle (reinterpret_cast<GSHandle> (memo.additionalPolyPends), (roofNSubPolys + 1) * sizeof (Int32), REALLOC_CLEAR, 0));
-    if (roofNArcs > 0) {
-        memo.additionalPolyParcs = reinterpret_cast<API_PolyArc**> (memo.additionalPolyParcs == nullptr
-            ? BMAllocateHandle (roofNArcs * sizeof (API_PolyArc), ALLOCATE_CLEAR, 0)
-            : BMReallocHandle (reinterpret_cast<GSHandle> (memo.additionalPolyParcs), roofNArcs * sizeof (API_PolyArc), REALLOC_CLEAR, 0));
+    if (roofNCoords < 4 || roofNSubPolys < 1 || roofNArcs < 0)
+        return "Invalid roof pivot polygon memo dimensions.";
+
+    const GSSize roofCoordCount = static_cast<GSSize> (roofNCoords) + 1;
+    const GSSize roofSubPolyCount = static_cast<GSSize> (roofNSubPolys) + 1;
+    if (roofCoordCount > std::numeric_limits<GSSize>::max () / sizeof (API_Coord) ||
+        roofSubPolyCount > std::numeric_limits<GSSize>::max () / sizeof (Int32) ||
+        (roofNArcs > 0 && static_cast<GSSize> (roofNArcs) > std::numeric_limits<GSSize>::max () / sizeof (API_PolyArc)))
+        return "Roof pivot polygon memo dimensions exceed the supported range.";
+    const GSSize coordBytes = roofCoordCount * sizeof (API_Coord);
+    const GSSize pendsBytes = roofSubPolyCount * sizeof (Int32);
+    if (memo.additionalPolyCoords == nullptr) {
+        memo.additionalPolyCoords = reinterpret_cast<API_Coord**> (BMAllocateHandle (coordBytes, ALLOCATE_CLEAR, 0));
+    } else {
+        if (*memo.additionalPolyCoords == nullptr)
+            return "Roof pivot coordinate memo handle is invalid.";
+        GSHandle resizedCoords = BMReallocHandle (reinterpret_cast<GSHandle> (memo.additionalPolyCoords), coordBytes, REALLOC_CLEAR, 0);
+        if (resizedCoords == nullptr)
+            return "Failed to resize roof pivot coordinate memo.";
+        memo.additionalPolyCoords = reinterpret_cast<API_Coord**> (resizedCoords);
     }
+    if (memo.additionalPolyPends == nullptr) {
+        memo.additionalPolyPends = reinterpret_cast<Int32**> (BMAllocateHandle (pendsBytes, ALLOCATE_CLEAR, 0));
+    } else {
+        if (*memo.additionalPolyPends == nullptr)
+            return "Roof pivot endpoint memo handle is invalid.";
+        GSHandle resizedPends = BMReallocHandle (reinterpret_cast<GSHandle> (memo.additionalPolyPends), pendsBytes, REALLOC_CLEAR, 0);
+        if (resizedPends == nullptr)
+            return "Failed to resize roof pivot endpoint memo.";
+        memo.additionalPolyPends = reinterpret_cast<Int32**> (resizedPends);
+    }
+    if (roofNArcs > 0) {
+        const GSSize arcBytes = static_cast<GSSize> (roofNArcs) * sizeof (API_PolyArc);
+        if (memo.additionalPolyParcs == nullptr) {
+            memo.additionalPolyParcs = reinterpret_cast<API_PolyArc**> (BMAllocateHandle (arcBytes, ALLOCATE_CLEAR, 0));
+        } else {
+            if (*memo.additionalPolyParcs == nullptr)
+                return "Roof pivot arc memo handle is invalid.";
+            GSHandle resizedArcs = BMReallocHandle (reinterpret_cast<GSHandle> (memo.additionalPolyParcs), arcBytes, REALLOC_CLEAR, 0);
+            if (resizedArcs == nullptr)
+                return "Failed to resize roof pivot arc memo.";
+            memo.additionalPolyParcs = reinterpret_cast<API_PolyArc**> (resizedArcs);
+        }
+    } else if (memo.additionalPolyParcs != nullptr) {
+        BMKillHandle (reinterpret_cast<GSHandle*> (&memo.additionalPolyParcs));
+        memo.additionalPolyParcs = nullptr;
+    }
+    if (memo.additionalPolyCoords == nullptr || *memo.additionalPolyCoords == nullptr ||
+        memo.additionalPolyPends == nullptr || *memo.additionalPolyPends == nullptr ||
+        (roofNArcs > 0 && (memo.additionalPolyParcs == nullptr || *memo.additionalPolyParcs == nullptr)))
+        return "Failed to allocate roof pivot polygon memo data.";
 
     Int32 iCoord = 1;
     Int32 iArc = 0;
     Int32 iPends = 1;
-    AddAdditionalPolyToMemo (polygonOutline, polygonArcs, iCoord, iArc, iPends, memo);
+    GSErrCode memoErr = AddAdditionalPolyToMemo (polygonOutline, polygonArcs, iCoord, iArc, iPends, memo);
+    if (memoErr != NoError)
+        return "Failed to populate roof pivot polygon memo data.";
 
     for (const GS::ObjectState& hole : holes) {
         GS::Array<GS::ObjectState> holePolygonOutline;
         GS::Array<GS::ObjectState> holePolygonArcs;
-        if (GetHoleGeometry (hole, holePolygonOutline, holePolygonArcs)) {
-            AddAdditionalPolyToMemo (holePolygonOutline, holePolygonArcs, iCoord, iArc, iPends, memo);
+        if (GetHoleGeometry (hole, holePolygonOutline, holePolygonArcs) && holePolygonOutline.GetSize () >= 3) {
+            memoErr = AddAdditionalPolyToMemo (holePolygonOutline, holePolygonArcs, iCoord, iArc, iPends, memo);
+            if (memoErr != NoError)
+                return "Failed to populate roof pivot hole memo data.";
         }
     }
 
@@ -995,14 +1154,29 @@ GS::Optional<GS::UniString> BuildRoofMemoFromGeometry (
     // GSException. Use the same outline for the contour as for the pivot polygon by
     // duplicating the handles.
     element.roof.u.polyRoof.contourPolygon = element.roof.u.polyRoof.pivotPolygon;
-    if (memo.additionalPolyCoords != nullptr) {
+    if (*memo.additionalPolyCoords != nullptr) {
+        if (memo.coords != nullptr)
+            BMKillHandle (reinterpret_cast<GSHandle*> (&memo.coords));
+        memo.coords = nullptr;
         BMHandleToHandle (reinterpret_cast<GSConstHandle> (memo.additionalPolyCoords), reinterpret_cast<GSHandle*> (&memo.coords));
+        if (memo.coords == nullptr || *memo.coords == nullptr)
+            return "Failed to duplicate the roof contour coordinate memo.";
     }
-    if (memo.additionalPolyPends != nullptr) {
+    if (*memo.additionalPolyPends != nullptr) {
+        if (memo.pends != nullptr)
+            BMKillHandle (reinterpret_cast<GSHandle*> (&memo.pends));
+        memo.pends = nullptr;
         BMHandleToHandle (reinterpret_cast<GSConstHandle> (memo.additionalPolyPends), reinterpret_cast<GSHandle*> (&memo.pends));
+        if (memo.pends == nullptr || *memo.pends == nullptr)
+            return "Failed to duplicate the roof contour endpoint memo.";
     }
-    if (memo.additionalPolyParcs != nullptr) {
+    if (memo.additionalPolyParcs != nullptr && *memo.additionalPolyParcs != nullptr) {
+        if (memo.parcs != nullptr)
+            BMKillHandle (reinterpret_cast<GSHandle*> (&memo.parcs));
+        memo.parcs = nullptr;
         BMHandleToHandle (reinterpret_cast<GSConstHandle> (memo.additionalPolyParcs), reinterpret_cast<GSHandle*> (&memo.parcs));
+        if (memo.parcs == nullptr || *memo.parcs == nullptr)
+            return "Failed to duplicate the roof contour arc memo.";
     }
 
     return {};
@@ -1536,8 +1710,8 @@ GS::Optional<GS::UniString> CreateWallsCommand::GetInputParametersSchema () cons
                         "endCoordinate": { "$ref": "#/Coordinate2D" },
                         "floorIndex": { "type": "integer", "description": "Story index (as returned by GetStories). When provided, zCoordinate is interpreted as bottomOffset relative to the floor. Takes priority over zCoordinate for floor assignment." },
                         "zCoordinate": { "type": "number", "description": "Absolute Z when floorIndex is absent; bottomOffset relative to the floor when floorIndex is provided." },
-                        "height": { "type": "number", "exclusiveMinimum": 0.0 },
-                        "thickness": { "type": "number", "exclusiveMinimum": 0.0 },
+                        "height": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
+                        "thickness": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
                         "offset": { "type": "number" },
                         "arcAngle": { "type": "number", "description": "Arc angle in radians; non-zero creates a curved wall (begCoordinate/endCoordinate are the chord endpoints)." },
                         "referenceLineLocation": {
@@ -1665,12 +1839,12 @@ GS::Optional<GS::UniString> CreateBeamsCommand::GetInputParametersSchema () cons
                         "width": {
                             "type": "number",
                             "description": "Cross section width of the beam. Applied to all segments.",
-                            "exclusiveMinimum": 0.0
+                            "minimum": 0.0, "exclusiveMinimum": true
                         },
                         "height": {
                             "type": "number",
                             "description": "Cross section height of the beam. Applied to all segments.",
-                            "exclusiveMinimum": 0.0
+                            "minimum": 0.0, "exclusiveMinimum": true
                         },
                         "anchorPoint": {
                             "type": "string",
@@ -1780,12 +1954,12 @@ GS::Optional<GS::UniString> CreateStairsCommand::GetInputParametersSchema () con
                         "totalHeight": {
                             "type": "number",
                             "description": "Total height of the stair.",
-                            "exclusiveMinimum": 0.0
+                            "minimum": 0.0, "exclusiveMinimum": true
                         },
                         "flightWidth": {
                             "type": "number",
                             "description": "Width of the stair flight.",
-                            "exclusiveMinimum": 0.0
+                            "minimum": 0.0, "exclusiveMinimum": true
                         },
                         "stepNum": {
                             "type": "integer",
@@ -1795,12 +1969,12 @@ GS::Optional<GS::UniString> CreateStairsCommand::GetInputParametersSchema () con
                         "riserHeight": {
                             "type": "number",
                             "description": "Height of each riser.",
-                            "exclusiveMinimum": 0.0
+                            "minimum": 0.0, "exclusiveMinimum": true
                         },
                         "treadDepth": {
                             "type": "number",
                             "description": "Depth (going) of each tread.",
-                            "exclusiveMinimum": 0.0
+                            "minimum": 0.0, "exclusiveMinimum": true
                         }
                     },
                     "additionalProperties": false,
@@ -1849,25 +2023,38 @@ GS::Optional<GS::ObjectState> CreateStairsCommand::SetTypeSpecificParameters (AP
         element.stair.treadDepth = treadDepth.Get ();
     }
 
-    // Build the baseline polyline in the memo
-    const Int32 nCoords = static_cast<Int32> (baseLinePoints.GetSize ());
+    // Build the baseline polyline in the memo.
+    const GSSize baselinePointCount = static_cast<GSSize> (baseLinePoints.GetSize ());
+    if (baselinePointCount > static_cast<GSSize> (std::numeric_limits<Int32>::max ()))
+        return CreateErrorResponse (APIERR_BADPARS, "baseLinePoints exceeds the supported range.");
+    const Int32 nCoords = static_cast<Int32> (baselinePointCount);
+    const GSSize baselineCoordCount = baselinePointCount + 1;
+    if (baselineCoordCount > std::numeric_limits<GSSize>::max () / sizeof (API_Coord))
+        return CreateErrorResponse (APIERR_BADPARS, "Stair baseline dimensions exceed the supported range.");
 
-    // Free existing baseline handles from defaults
-    if (memo.stairBaseLine.coords != nullptr) {
+    // Allocate replacements before releasing the defaults. A failed allocation must not
+    // leave a partially initialized memo that the code below could dereference.
+    API_Coord** newCoords = reinterpret_cast<API_Coord**> (BMAllocateHandle (baselineCoordCount * sizeof (API_Coord), ALLOCATE_CLEAR, 0));
+    Int32** newPends = reinterpret_cast<Int32**> (BMAllocateHandle (static_cast<GSSize> (2) * sizeof (Int32), ALLOCATE_CLEAR, 0));
+    if (newCoords == nullptr || *newCoords == nullptr || newPends == nullptr || *newPends == nullptr) {
+        if (newCoords != nullptr)
+            BMKillHandle (reinterpret_cast<GSHandle*> (&newCoords));
+        if (newPends != nullptr)
+            BMKillHandle (reinterpret_cast<GSHandle*> (&newPends));
+        return CreateErrorResponse (APIERR_MEMFULL, "Failed to allocate stair baseline memo data.");
+    }
+
+    // Free existing baseline handles from defaults only after all replacements exist.
+    if (memo.stairBaseLine.coords != nullptr)
         BMKillHandle (reinterpret_cast<GSHandle*>(&memo.stairBaseLine.coords));
-    }
-    if (memo.stairBaseLine.pends != nullptr) {
+    if (memo.stairBaseLine.pends != nullptr)
         BMKillHandle (reinterpret_cast<GSHandle*>(&memo.stairBaseLine.pends));
-    }
-    if (memo.stairBaseLine.parcs != nullptr) {
+    if (memo.stairBaseLine.parcs != nullptr)
         BMKillHandle (reinterpret_cast<GSHandle*>(&memo.stairBaseLine.parcs));
-    }
-    if (memo.stairBaseLine.edgeData != nullptr) {
+    if (memo.stairBaseLine.edgeData != nullptr)
         BMKillPtr (reinterpret_cast<GSPtr*>(&memo.stairBaseLine.edgeData));
-    }
-    if (memo.stairBaseLine.vertexData != nullptr) {
+    if (memo.stairBaseLine.vertexData != nullptr)
         BMKillPtr (reinterpret_cast<GSPtr*>(&memo.stairBaseLine.vertexData));
-    }
 
     // Allocate new baseline: polyline (not polygon), so no closing vertex needed
     // Coords: index 1..nCoords (1-based), index 0 unused
@@ -1875,9 +2062,9 @@ GS::Optional<GS::ObjectState> CreateStairsCommand::SetTypeSpecificParameters (AP
     // from the baseline geometry (see the Element_Test example in the DevKit). Pre-filling
     // them marks every edge as a steps segment, which makes multi-segment (L/U-shaped)
     // baselines fail with -2130313215 (#444).
-    memo.stairBaseLine.coords = reinterpret_cast<API_Coord**> (BMAllocateHandle ((nCoords + 1) * sizeof (API_Coord), ALLOCATE_CLEAR, 0));
-    memo.stairBaseLine.pends = reinterpret_cast<Int32**> (BMAllocateHandle (2 * sizeof (Int32), ALLOCATE_CLEAR, 0));
-    memo.stairBaseLine.parcs = reinterpret_cast<API_PolyArc**> (BMAllocateHandle (0, ALLOCATE_CLEAR, 0));
+    memo.stairBaseLine.coords = newCoords;
+    memo.stairBaseLine.pends = newPends;
+    memo.stairBaseLine.parcs = nullptr;
 
     for (Int32 i = 0; i < nCoords; ++i) {
         (*memo.stairBaseLine.coords)[i + 1] = Get2DCoordinateFromObjectState (baseLinePoints[i]);
@@ -1915,8 +2102,8 @@ GS::Optional<GS::UniString> CreateWindowsCommand::GetInputParametersSchema () co
                         "ownerWallId": { "$ref": "#/ElementId" },
                         "centerOffset": { "type": "number", "minimum": 0.0 },
                         "sillHeight": { "type": "number" },
-                        "width": { "type": "number", "exclusiveMinimum": 0.0 },
-                        "height": { "type": "number", "exclusiveMinimum": 0.0 },
+                        "width": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
+                        "height": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
                         "reflected": { "type": "boolean" },
                         "refSide": { "type": "boolean" },
                         "oSide": { "type": "boolean" },
@@ -2057,8 +2244,8 @@ GS::Optional<GS::UniString> CreateDoorsCommand::GetInputParametersSchema () cons
                         "ownerWallId": { "$ref": "#/ElementId" },
                         "centerOffset": { "type": "number", "minimum": 0.0 },
                         "sillHeight": { "type": "number" },
-                        "width": { "type": "number", "exclusiveMinimum": 0.0 },
-                        "height": { "type": "number", "exclusiveMinimum": 0.0 },
+                        "width": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
+                        "height": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
                         "reflected": { "type": "boolean" },
                         "refSide": { "type": "boolean" },
                         "oSide": { "type": "boolean" },
@@ -2198,8 +2385,8 @@ GS::Optional<GS::UniString> CreateOpeningsCommand::GetInputParametersSchema () c
                     "properties": {
                         "ownerElementId": { "$ref": "#/ElementId" },
                         "basePoint": { "$ref": "#/Coordinate3D" },
-                        "width": { "type": "number", "exclusiveMinimum": 0.0 },
-                        "height": { "type": "number", "exclusiveMinimum": 0.0 }
+                        "width": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
+                        "height": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true }
                     },
                     "additionalProperties": false,
                     "required": ["ownerElementId", "basePoint"]
@@ -2448,7 +2635,7 @@ GS::Optional<GS::UniString> CreateRoofsCommand::GetInputParametersSchema () cons
                     "properties": {
                         "level": { "type": "number" },
                         "floorIndex": { "type": "integer", "description": "Optional floor index. If omitted, derived from level." },
-                        "thickness": { "type": "number", "exclusiveMinimum": 0.0 },
+                        "thickness": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
                         "polygonCoordinates": {
                             "type": "array",
                             "items": { "$ref": "#/Coordinate2D" },
@@ -2468,7 +2655,7 @@ GS::Optional<GS::UniString> CreateRoofsCommand::GetInputParametersSchema () cons
                                 "type": "object",
                                 "properties": {
                                     "levelHeight": { "type": "number" },
-                                    "levelAngle": { "type": "number", "exclusiveMinimum": 0.0 }
+                                    "levelAngle": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true }
                                 },
                                 "additionalProperties": false,
                                 "required": ["levelHeight", "levelAngle"]
@@ -3027,8 +3214,8 @@ GS::Optional<GS::UniString> ModifyWallsCommand::GetInputParametersSchema () cons
                         "begCoordinate": { "$ref": "#/Coordinate2D" },
                         "endCoordinate": { "$ref": "#/Coordinate2D" },
                         "arcAngle": { "type": "number", "description": "Arc angle in radians; non-zero makes the wall curved (begCoordinate/endCoordinate are the chord endpoints)." },
-                        "height": { "type": "number", "exclusiveMinimum": 0.0 },
-                        "thickness": { "type": "number", "exclusiveMinimum": 0.0 },
+                        "height": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
+                        "thickness": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
                         "bottomOffset": { "type": "number" },
                         "offset": { "type": "number" },
                         "structureType": {
@@ -3197,7 +3384,7 @@ GS::Optional<GS::UniString> ModifySlabsCommand::GetInputParametersSchema () cons
                     "properties": {
                         "elementId": { "$ref": "#/ElementId" },
                         "zCoordinate": { "type": "number" },
-                        "thickness": { "type": "number", "exclusiveMinimum": 0.0 },
+                        "thickness": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
                         "structureType": {
                             "type": "string",
                             "enum": ["Basic", "Composite"]
@@ -3324,7 +3511,7 @@ GS::Optional<GS::UniString> ModifyRoofsCommand::GetInputParametersSchema () cons
                     "properties": {
                         "elementId": { "$ref": "#/ElementId" },
                         "level": { "type": "number" },
-                        "thickness": { "type": "number", "exclusiveMinimum": 0.0 },
+                        "thickness": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
                         "eavesOverhang": { "type": "number" },
                         "levels": {
                             "type": "array",
@@ -3334,7 +3521,7 @@ GS::Optional<GS::UniString> ModifyRoofsCommand::GetInputParametersSchema () cons
                                 "type": "object",
                                 "properties": {
                                     "levelHeight": { "type": "number" },
-                                    "levelAngle": { "type": "number", "exclusiveMinimum": 0.0 }
+                                    "levelAngle": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true }
                                 },
                                 "additionalProperties": false,
                                 "required": ["levelHeight", "levelAngle"]
@@ -3615,7 +3802,7 @@ GS::Optional<GS::UniString> ModifyColumnsCommand::GetInputParametersSchema () co
                         "elementId": { "$ref": "#/ElementId" },
                         "origin": { "$ref": "#/Coordinate2D" },
                         "zCoordinate": { "type": "number" },
-                        "height": { "type": "number", "exclusiveMinimum": 0.0 },
+                        "height": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
                         "bottomOffset": { "type": "number" },
                         "axisRotationAngle": { "type": "number" }
                     },
@@ -3693,8 +3880,8 @@ GS::Optional<GS::UniString> ModifyWindowsCommand::GetInputParametersSchema () co
                     "type": "object",
                     "properties": {
                         "elementId": { "$ref": "#/ElementId" },
-                        "width": { "type": "number", "exclusiveMinimum": 0.0 },
-                        "height": { "type": "number", "exclusiveMinimum": 0.0 },
+                        "width": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
+                        "height": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
                         "sillHeight": { "type": "number" },
                         "centerOffset": { "type": "number", "minimum": 0.0 },
                         "reflected": { "type": "boolean" },
@@ -3773,8 +3960,8 @@ GS::Optional<GS::UniString> ModifyDoorsCommand::GetInputParametersSchema () cons
                     "type": "object",
                     "properties": {
                         "elementId": { "$ref": "#/ElementId" },
-                        "width": { "type": "number", "exclusiveMinimum": 0.0 },
-                        "height": { "type": "number", "exclusiveMinimum": 0.0 },
+                        "width": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
+                        "height": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
                         "sillHeight": { "type": "number" },
                         "centerOffset": { "type": "number", "minimum": 0.0 },
                         "reflected": { "type": "boolean" },
@@ -4042,7 +4229,8 @@ GS::ObjectState CreateSectionsCommand::Execute (const GS::ObjectState& parameter
 
             GS::UniString name;
             if (data.Get ("name", name)) {
-                GS::ucscpy (element.cutPlane.segment.cutPlName, name.ToUStr ().Get ());
+                GS::ucsncpy (element.cutPlane.segment.cutPlName, name.ToUStr ().Get (), GS::ArraySize (element.cutPlane.segment.cutPlName));
+                element.cutPlane.segment.cutPlName[GS::ArraySize (element.cutPlane.segment.cutPlName) - 1] = 0;
             }
 
             const double dx = endCoord.x - startCoord.x;
@@ -4064,21 +4252,33 @@ GS::ObjectState CreateSectionsCommand::Execute (const GS::ObjectState& parameter
             element.cutPlane.linkData.sourceMarker = true;
             marker.subType = APISubElement_MainMarker;
 
+            API_Coord* const newMainCoords = reinterpret_cast<API_Coord*> (BMpAllClear (2 * sizeof (API_Coord)));
+            if (newMainCoords == nullptr) {
+                elements.Push (CreateErrorResponse (APIERR_MEMFULL, "Failed to allocate section main coordinates."));
+                continue;
+            }
+            API_Coord* const newDepthCoords = reinterpret_cast<API_Coord*> (BMpAllClear (2 * sizeof (API_Coord)));
+            if (newDepthCoords == nullptr) {
+                BMpFree (reinterpret_cast<GSPtr> (newMainCoords));
+                elements.Push (CreateErrorResponse (APIERR_MEMFULL, "Failed to allocate section depth coordinates."));
+                continue;
+            }
+
+            newMainCoords[0] = startCoord;
+            newMainCoords[1] = endCoord;
+            newDepthCoords[0].x = startCoord.x + nx * depth;
+            newDepthCoords[0].y = startCoord.y + ny * depth;
+            newDepthCoords[1].x = endCoord.x + nx * depth;
+            newDepthCoords[1].y = endCoord.y + ny * depth;
+
             if (memo.sectionSegmentMainCoords != nullptr) {
                 BMpFree (reinterpret_cast<GSPtr> (memo.sectionSegmentMainCoords));
             }
-            memo.sectionSegmentMainCoords = reinterpret_cast<API_Coord*> (BMpAll (2 * sizeof (API_Coord)));
-            memo.sectionSegmentMainCoords[0] = startCoord;
-            memo.sectionSegmentMainCoords[1] = endCoord;
-
+            memo.sectionSegmentMainCoords = newMainCoords;
             if (memo.sectionSegmentDepthCoords != nullptr) {
                 BMpFree (reinterpret_cast<GSPtr> (memo.sectionSegmentDepthCoords));
             }
-            memo.sectionSegmentDepthCoords = reinterpret_cast<API_Coord*> (BMpAll (2 * sizeof (API_Coord)));
-            memo.sectionSegmentDepthCoords[0].x = startCoord.x + nx * depth;
-            memo.sectionSegmentDepthCoords[0].y = startCoord.y + ny * depth;
-            memo.sectionSegmentDepthCoords[1].x = endCoord.x + nx * depth;
-            memo.sectionSegmentDepthCoords[1].y = endCoord.y + ny * depth;
+            memo.sectionSegmentDepthCoords = newDepthCoords;
 
             err = ACAPI_Element_CreateExt (&element, &memo, 1UL, &marker);
             if (err != NoError) {
@@ -4104,71 +4304,133 @@ GS::Optional<GS::UniString> BuildMeshPolyMemoFromGeometry (
         polygonCoordinates.Pop ();
     }
 
-    elem.mesh.poly.nCoords   = polygonCoordinates.GetSize () + 1;
-    elem.mesh.poly.nSubPolys = 1;
-    elem.mesh.poly.nArcs     = polygonArcs.GetSize ();
+    const GSSize polygonCoordinateCount = static_cast<GSSize> (polygonCoordinates.GetSize ());
+    const GSSize polygonArcCount = static_cast<GSSize> (polygonArcs.GetSize ());
+    if (polygonCoordinateCount < 3 || polygonCoordinateCount > static_cast<GSSize> (std::numeric_limits<Int32>::max () - 1) ||
+        polygonArcCount > static_cast<GSSize> (std::numeric_limits<Int32>::max ()))
+        return "Invalid mesh polygon dimensions.";
+
+    GSSize totalCoords = polygonCoordinateCount + 1;
+    GSSize totalArcs = polygonArcCount;
+    GSSize totalSubPolys = 1;
 
     for (const GS::ObjectState& hole : holes) {
         GS::Array<GS::ObjectState> holeCoords;
         GS::Array<GS::ObjectState> holeArcs;
-        if (GetHoleGeometry (hole, holeCoords, holeArcs)) {
-            elem.mesh.poly.nCoords += holeCoords.GetSize () + 1;
-            ++elem.mesh.poly.nSubPolys;
-            elem.mesh.poly.nArcs += holeArcs.GetSize ();
+        if (GetHoleGeometry (hole, holeCoords, holeArcs) && holeCoords.GetSize () >= 3) {
+            const GSSize holeCoordinateCount = static_cast<GSSize> (holeCoords.GetSize ());
+            const GSSize holeArcCount = static_cast<GSSize> (holeArcs.GetSize ());
+            const GSSize maxInt32 = static_cast<GSSize> (std::numeric_limits<Int32>::max ());
+            if (totalCoords > maxInt32 - 1 || totalArcs > maxInt32 ||
+                totalSubPolys >= maxInt32 ||
+                holeCoordinateCount > maxInt32 - totalCoords - 1 ||
+                holeArcCount > maxInt32 - totalArcs)
+                return "Mesh polygon dimensions exceed the supported range.";
+            totalCoords += holeCoordinateCount + 1;
+            totalSubPolys += 1;
+            totalArcs += holeArcCount;
         }
     }
+
+    elem.mesh.poly.nCoords   = static_cast<Int32> (totalCoords);
+    elem.mesh.poly.nSubPolys = static_cast<Int32> (totalSubPolys);
+    elem.mesh.poly.nArcs     = static_cast<Int32> (totalArcs);
 
     const Int32 nCoords   = elem.mesh.poly.nCoords;
     const Int32 nSubPolys = elem.mesh.poly.nSubPolys;
     const Int32 nArcs     = elem.mesh.poly.nArcs;
+    if (nCoords < 4 || nSubPolys < 1 || nArcs < 0)
+        return "Invalid mesh polygon memo dimensions.";
+    const GSSize coordCount = static_cast<GSSize> (nCoords) + 1;
+    const GSSize subPolyCount = static_cast<GSSize> (nSubPolys) + 1;
+    if (coordCount > std::numeric_limits<GSSize>::max () / sizeof (API_Coord) ||
+        coordCount > std::numeric_limits<GSSize>::max () / sizeof (double) ||
+        coordCount > std::numeric_limits<GSSize>::max () / sizeof (UInt32) ||
+        subPolyCount > std::numeric_limits<GSSize>::max () / sizeof (Int32) ||
+        (nArcs > 0 && static_cast<GSSize> (nArcs) > std::numeric_limits<GSSize>::max () / sizeof (API_PolyArc)))
+        return "Mesh polygon memo dimensions exceed the supported range.";
 
-    memo.coords = reinterpret_cast<API_Coord**> (
-        memo.coords == nullptr
-            ? BMAllocateHandle ((nCoords + 1) * sizeof (API_Coord), ALLOCATE_CLEAR, 0)
-            : BMReallocHandle (reinterpret_cast<GSHandle> (memo.coords), (nCoords + 1) * sizeof (API_Coord), REALLOC_CLEAR, 0));
-
-    memo.meshPolyZ = reinterpret_cast<double**> (
-        memo.meshPolyZ == nullptr
-            ? BMAllocateHandle ((nCoords + 1) * sizeof (double), ALLOCATE_CLEAR, 0)
-            : BMReallocHandle (reinterpret_cast<GSHandle> (memo.meshPolyZ), (nCoords + 1) * sizeof (double), REALLOC_CLEAR, 0));
-
-    memo.pends = reinterpret_cast<Int32**> (
-        memo.pends == nullptr
-            ? BMAllocateHandle ((nSubPolys + 1) * sizeof (Int32), ALLOCATE_CLEAR, 0)
-            : BMReallocHandle (reinterpret_cast<GSHandle> (memo.pends), (nSubPolys + 1) * sizeof (Int32), REALLOC_CLEAR, 0));
+    if (memo.coords == nullptr) {
+        memo.coords = reinterpret_cast<API_Coord**> (BMAllocateHandle (coordCount * sizeof (API_Coord), ALLOCATE_CLEAR, 0));
+    } else {
+        if (*memo.coords == nullptr)
+            return "Mesh coordinate memo handle is invalid.";
+        GSHandle resizedCoords = BMReallocHandle (reinterpret_cast<GSHandle> (memo.coords), coordCount * sizeof (API_Coord), REALLOC_CLEAR, 0);
+        if (resizedCoords == nullptr) return "Failed to resize mesh coordinate memo.";
+        memo.coords = reinterpret_cast<API_Coord**> (resizedCoords);
+    }
+    if (memo.meshPolyZ == nullptr) {
+        memo.meshPolyZ = reinterpret_cast<double**> (BMAllocateHandle (coordCount * sizeof (double), ALLOCATE_CLEAR, 0));
+    } else {
+        if (*memo.meshPolyZ == nullptr)
+            return "Mesh elevation memo handle is invalid.";
+        GSHandle resizedZ = BMReallocHandle (reinterpret_cast<GSHandle> (memo.meshPolyZ), coordCount * sizeof (double), REALLOC_CLEAR, 0);
+        if (resizedZ == nullptr) return "Failed to resize mesh elevation memo.";
+        memo.meshPolyZ = reinterpret_cast<double**> (resizedZ);
+    }
+    if (memo.pends == nullptr) {
+        memo.pends = reinterpret_cast<Int32**> (BMAllocateHandle (subPolyCount * sizeof (Int32), ALLOCATE_CLEAR, 0));
+    } else {
+        if (*memo.pends == nullptr)
+            return "Mesh polygon-end memo handle is invalid.";
+        GSHandle resizedPends = BMReallocHandle (reinterpret_cast<GSHandle> (memo.pends), subPolyCount * sizeof (Int32), REALLOC_CLEAR, 0);
+        if (resizedPends == nullptr) return "Failed to resize mesh polygon-end memo.";
+        memo.pends = reinterpret_cast<Int32**> (resizedPends);
+    }
 
     if (nArcs > 0) {
-        memo.parcs = reinterpret_cast<API_PolyArc**> (
-            memo.parcs == nullptr
-                ? BMAllocateHandle (nArcs * sizeof (API_PolyArc), ALLOCATE_CLEAR, 0)
-                : BMReallocHandle (reinterpret_cast<GSHandle> (memo.parcs), nArcs * sizeof (API_PolyArc), REALLOC_CLEAR, 0));
+        if (memo.parcs == nullptr) {
+            memo.parcs = reinterpret_cast<API_PolyArc**> (BMAllocateHandle (static_cast<GSSize> (nArcs) * sizeof (API_PolyArc), ALLOCATE_CLEAR, 0));
+        } else {
+            if (*memo.parcs == nullptr)
+                return "Mesh arc memo handle is invalid.";
+            GSHandle resizedArcs = BMReallocHandle (reinterpret_cast<GSHandle> (memo.parcs), static_cast<GSSize> (nArcs) * sizeof (API_PolyArc), REALLOC_CLEAR, 0);
+            if (resizedArcs == nullptr)
+                return "Failed to resize mesh arc memo.";
+            memo.parcs = reinterpret_cast<API_PolyArc**> (resizedArcs);
+        }
+        if (memo.parcs == nullptr || *memo.parcs == nullptr)
+            return "Failed to allocate mesh arc memo.";
     } else if (memo.parcs != nullptr) {
         BMKillHandle (reinterpret_cast<GSHandle*> (&memo.parcs));
         memo.parcs = nullptr;
     }
 
     if (memo.vertexIDs != nullptr) {
-        memo.vertexIDs = reinterpret_cast<UInt32**> (
-            BMReallocHandle (reinterpret_cast<GSHandle> (memo.vertexIDs), (nCoords + 1) * sizeof (UInt32), REALLOC_CLEAR, 0));
+        if (*memo.vertexIDs == nullptr)
+            return "Mesh vertex memo handle is invalid.";
+        if (coordCount > std::numeric_limits<GSSize>::max () / sizeof (UInt32))
+            return "Mesh vertex memo dimensions exceed the supported range.";
+        GSHandle resizedVertexIDs = BMReallocHandle (reinterpret_cast<GSHandle> (memo.vertexIDs), coordCount * sizeof (UInt32), REALLOC_CLEAR, 0);
+        if (resizedVertexIDs == nullptr)
+            return "Failed to resize mesh vertex memo.";
+        memo.vertexIDs = reinterpret_cast<UInt32**> (resizedVertexIDs);
     }
+    if (memo.coords == nullptr || *memo.coords == nullptr || memo.meshPolyZ == nullptr || *memo.meshPolyZ == nullptr ||
+        memo.pends == nullptr || *memo.pends == nullptr)
+        return "Failed to allocate mesh polygon memo data.";
 
     Int32 iCoord = 1;
     Int32 iArc   = 0;
     Int32 iPends = 1;
-    AddPolyToMemo (polygonCoordinates, polygonArcs, iCoord, iArc, iPends, memo);
+    GSErrCode memoErr = AddPolyToMemo (polygonCoordinates, polygonArcs, iCoord, iArc, iPends, memo);
+    if (memoErr != NoError)
+        return "Failed to populate mesh polygon memo data.";
 
     for (const GS::ObjectState& hole : holes) {
         GS::Array<GS::ObjectState> holeCoords;
         GS::Array<GS::ObjectState> holeArcs;
         if (GetHoleGeometry (hole, holeCoords, holeArcs)) {
-            AddPolyToMemo (holeCoords, holeArcs, iCoord, iArc, iPends, memo);
+            memoErr = AddPolyToMemo (holeCoords, holeArcs, iCoord, iArc, iPends, memo);
+            if (memoErr != NoError)
+                return "Failed to populate mesh hole memo data.";
         }
     }
 
     return {};
 }
 
-void BuildMeshSublinesMemoFromGeometry (
+GSErrCode BuildMeshSublinesMemoFromGeometry (
     API_Element&                      elem,
     API_ElementMemo&                  memo,
     const GS::Array<GS::ObjectState>& sublines)
@@ -4178,22 +4440,52 @@ void BuildMeshSublinesMemoFromGeometry (
     for (const GS::ObjectState& subline : sublines) {
         GS::Array<GS::ObjectState> coords;
         if (subline.Get ("coordinates", coords) && !coords.IsEmpty ()) {
-            nTotalCoords += (Int32) coords.GetSize ();
+            const GSSize coordinateCount = static_cast<GSSize> (coords.GetSize ());
+            if (coordinateCount > static_cast<GSSize> (std::numeric_limits<Int32>::max ()) - static_cast<GSSize> (nTotalCoords))
+                return APIERR_BADPARS;
+            if (nSubLines == std::numeric_limits<Int32>::max ())
+                return APIERR_BADPARS;
             ++nSubLines;
+            nTotalCoords += static_cast<Int32> (coordinateCount);
         }
     }
 
     elem.mesh.levelLines.nCoords   = nTotalCoords;
     elem.mesh.levelLines.nSubLines = nSubLines;
 
-    memo.meshLevelCoords = reinterpret_cast<API_MeshLevelCoord**> (
-        memo.meshLevelCoords == nullptr
-            ? BMAllocateHandle (nTotalCoords * sizeof (API_MeshLevelCoord), ALLOCATE_CLEAR, 0)
-            : BMReallocHandle (reinterpret_cast<GSHandle> (memo.meshLevelCoords), nTotalCoords * sizeof (API_MeshLevelCoord), REALLOC_CLEAR, 0));
-    memo.meshLevelEnds = reinterpret_cast<Int32**> (
-        memo.meshLevelEnds == nullptr
-            ? BMAllocateHandle (nSubLines * sizeof (Int32), ALLOCATE_CLEAR, 0)
-            : BMReallocHandle (reinterpret_cast<GSHandle> (memo.meshLevelEnds), nSubLines * sizeof (Int32), REALLOC_CLEAR, 0));
+    if (nTotalCoords <= 0 || nSubLines <= 0) {
+        if (memo.meshLevelCoords != nullptr)
+            BMKillHandle (reinterpret_cast<GSHandle*> (&memo.meshLevelCoords));
+        if (memo.meshLevelEnds != nullptr)
+            BMKillHandle (reinterpret_cast<GSHandle*> (&memo.meshLevelEnds));
+        memo.meshLevelCoords = nullptr;
+        memo.meshLevelEnds = nullptr;
+        return NoError;
+    }
+
+    const GSSize coordsBytes = static_cast<GSSize> (nTotalCoords) * sizeof (API_MeshLevelCoord);
+    const GSSize endsBytes = static_cast<GSSize> (nSubLines) * sizeof (Int32);
+    if (memo.meshLevelCoords == nullptr) {
+        memo.meshLevelCoords = reinterpret_cast<API_MeshLevelCoord**> (BMAllocateHandle (coordsBytes, ALLOCATE_CLEAR, 0));
+    } else {
+        if (*memo.meshLevelCoords == nullptr)
+            return APIERR_BADPARS;
+        GSHandle resizedCoords = BMReallocHandle (reinterpret_cast<GSHandle> (memo.meshLevelCoords), coordsBytes, REALLOC_CLEAR, 0);
+        if (resizedCoords == nullptr) return APIERR_MEMFULL;
+        memo.meshLevelCoords = reinterpret_cast<API_MeshLevelCoord**> (resizedCoords);
+    }
+    if (memo.meshLevelEnds == nullptr) {
+        memo.meshLevelEnds = reinterpret_cast<Int32**> (BMAllocateHandle (endsBytes, ALLOCATE_CLEAR, 0));
+    } else {
+        if (*memo.meshLevelEnds == nullptr)
+            return APIERR_BADPARS;
+        GSHandle resizedEnds = BMReallocHandle (reinterpret_cast<GSHandle> (memo.meshLevelEnds), endsBytes, REALLOC_CLEAR, 0);
+        if (resizedEnds == nullptr) return APIERR_MEMFULL;
+        memo.meshLevelEnds = reinterpret_cast<Int32**> (resizedEnds);
+    }
+    if (memo.meshLevelCoords == nullptr || *memo.meshLevelCoords == nullptr ||
+        memo.meshLevelEnds == nullptr || *memo.meshLevelEnds == nullptr)
+        return APIERR_MEMFULL;
 
     Int32 iCoord = 0;
     Int32 iLine  = 0;
@@ -4207,6 +4499,7 @@ void BuildMeshSublinesMemoFromGeometry (
         }
         (*memo.meshLevelEnds)[iLine++] = iCoord;
     }
+    return iCoord == nTotalCoords && iLine == nSubLines ? NoError : APIERR_BADPARS;
 }
 
 ModifyMeshesCommand::ModifyMeshesCommand () :
@@ -4479,6 +4772,10 @@ GS::ObjectState ModifyMeshesCommand::Execute (const GS::ObjectState& parameters,
                     // resulting in nSubLines == 0 stored in the element.
                     // memo.coords is guaranteed valid here (loaded above for this case).
                     const Int32 nPolyCoords = elem.mesh.poly.nCoords;
+                    if (memo.coords == nullptr || *memo.coords == nullptr || nPolyCoords < 2) {
+                        executionResults (CreateFailedExecutionResult (APIERR_BADPARS, "Mesh polygon memo is unavailable for clearing sublines."));
+                        continue;
+                    }
                     double xMin = (*memo.coords)[1].x;
                     double yMin = (*memo.coords)[1].y;
                     for (Int32 j = 2; j < nPolyCoords; ++j) {
@@ -4491,14 +4788,39 @@ GS::ObjectState ModifyMeshesCommand::Execute (const GS::ObjectState& parameters,
                     const double ox = xMin - kOffset;
                     const double oy = yMin - kOffset;
 
-                    memo.meshLevelCoords = reinterpret_cast<API_MeshLevelCoord**> (
-                        memo.meshLevelCoords == nullptr
-                            ? BMAllocateHandle (4 * sizeof (API_MeshLevelCoord), ALLOCATE_CLEAR, 0)
-                            : BMReallocHandle (reinterpret_cast<GSHandle> (memo.meshLevelCoords), 4 * sizeof (API_MeshLevelCoord), REALLOC_CLEAR, 0));
-                    memo.meshLevelEnds = reinterpret_cast<Int32**> (
-                        memo.meshLevelEnds == nullptr
-                            ? BMAllocateHandle (2 * sizeof (Int32), ALLOCATE_CLEAR, 0)
-                            : BMReallocHandle (reinterpret_cast<GSHandle> (memo.meshLevelEnds), 2 * sizeof (Int32), REALLOC_CLEAR, 0));
+                    if (memo.meshLevelCoords == nullptr) {
+                        memo.meshLevelCoords = reinterpret_cast<API_MeshLevelCoord**> (BMAllocateHandle (4 * sizeof (API_MeshLevelCoord), ALLOCATE_CLEAR, 0));
+                    } else {
+                        if (*memo.meshLevelCoords == nullptr) {
+                            executionResults (CreateFailedExecutionResult (APIERR_BADPARS, "Mesh subline coordinate memo handle is invalid."));
+                            continue;
+                        }
+                        GSHandle resizedCoords = BMReallocHandle (reinterpret_cast<GSHandle> (memo.meshLevelCoords), 4 * sizeof (API_MeshLevelCoord), REALLOC_CLEAR, 0);
+                        if (resizedCoords == nullptr) {
+                            executionResults (CreateFailedExecutionResult (APIERR_MEMFULL, "Failed to resize mesh subline coordinates."));
+                            continue;
+                        }
+                        memo.meshLevelCoords = reinterpret_cast<API_MeshLevelCoord**> (resizedCoords);
+                    }
+                    if (memo.meshLevelEnds == nullptr) {
+                        memo.meshLevelEnds = reinterpret_cast<Int32**> (BMAllocateHandle (2 * sizeof (Int32), ALLOCATE_CLEAR, 0));
+                    } else {
+                        if (*memo.meshLevelEnds == nullptr) {
+                            executionResults (CreateFailedExecutionResult (APIERR_BADPARS, "Mesh subline endpoint memo handle is invalid."));
+                            continue;
+                        }
+                        GSHandle resizedEnds = BMReallocHandle (reinterpret_cast<GSHandle> (memo.meshLevelEnds), 2 * sizeof (Int32), REALLOC_CLEAR, 0);
+                        if (resizedEnds == nullptr) {
+                            executionResults (CreateFailedExecutionResult (APIERR_MEMFULL, "Failed to resize mesh subline endpoints."));
+                            continue;
+                        }
+                        memo.meshLevelEnds = reinterpret_cast<Int32**> (resizedEnds);
+                    }
+                    if (memo.meshLevelCoords == nullptr || *memo.meshLevelCoords == nullptr ||
+                        memo.meshLevelEnds == nullptr || *memo.meshLevelEnds == nullptr) {
+                        executionResults (CreateFailedExecutionResult (APIERR_MEMFULL, "Failed to allocate mesh subline memo data."));
+                        continue;
+                    }
 
                     (*memo.meshLevelCoords)[0].c.x = ox;          (*memo.meshLevelCoords)[0].c.y = oy;          (*memo.meshLevelCoords)[0].c.z = 0.0;
                     (*memo.meshLevelCoords)[1].c.x = ox + kStep;  (*memo.meshLevelCoords)[1].c.y = oy;          (*memo.meshLevelCoords)[1].c.z = 0.0;
@@ -4512,7 +4834,11 @@ GS::ObjectState ModifyMeshesCommand::Execute (const GS::ObjectState& parameters,
                     ACAPI_ELEMENT_MASK_SET (mask, API_MeshType, levelLines);
                     memoChangeMask |= APIMemoMask_MeshLevel;
                 } else {
-                    BuildMeshSublinesMemoFromGeometry (elem, memo, sublines);
+                    const GSErrCode sublineErr = BuildMeshSublinesMemoFromGeometry (elem, memo, sublines);
+                    if (sublineErr != NoError) {
+                        executionResults (CreateFailedExecutionResult (sublineErr, "Failed to allocate mesh subline memo data."));
+                        continue;
+                    }
                     ACAPI_ELEMENT_MASK_SET (mask, API_MeshType, levelLines);
                     memoChangeMask |= APIMemoMask_MeshLevel;
                 }

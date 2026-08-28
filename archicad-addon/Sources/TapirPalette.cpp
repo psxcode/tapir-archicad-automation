@@ -18,7 +18,9 @@
 #include "MigrationHelper.hpp"
 
 #include <map>
+#include <new>
 #include <regex>
+#include <vector>
 
 const GS::Guid        TapirPalette::paletteGuid("{2D42DF37-222F-40CD-BA86-B3279CCA1FEE}");
 GS::Ref<TapirPalette> TapirPalette::instance;
@@ -111,20 +113,28 @@ static std::map<GS::UniString, GS::UniString> GetFilesFromGitHubInRelativeLocati
         JSON::ValueRef parsed = parser.Parse (clientConnection.BeginReceive (response));
 
         if (response.GetStatusCode () == HTTP::MessageHeader::StatusCode::OK) {
-            JSON::ArrayValueRef arrayValue = GS::DynamicCast<JSON::ArrayValue> (parsed);
-            arrayValue->Enumerate ([&] (const JSON::ValueRef& assetValue) {
-                JSON::ObjectValueRef objectValue = GS::DynamicCast<JSON::ObjectValue> (assetValue);
-                JSON::StringValueRef typeValue = GS::DynamicCast<JSON::StringValue> (objectValue->Get ("type"));
-                JSON::StringValueRef pathValue = GS::DynamicCast<JSON::StringValue> (objectValue->Get ("path"));
+            const JSON::ArrayValueRef arrayValue = GS::DynamicCast<JSON::ArrayValue> (parsed);
+            if (arrayValue != nullptr) {
+                arrayValue->Enumerate ([&] (const JSON::ValueRef& assetValue) {
+                    const JSON::ObjectValueRef objectValue = GS::DynamicCast<JSON::ObjectValue> (assetValue);
+                    if (objectValue == nullptr)
+                        return;
 
-                if (typeValue->Get () == "dir") {
-                    auto subFiles = GetFilesFromGitHubInRelativeLocation (repository, pathValue->Get ());
-                    files.insert (subFiles.begin (), subFiles.end ());
-                } else {
-                    JSON::StringValueRef downloadUrlValue = GS::DynamicCast<JSON::StringValue> (objectValue->Get ("download_url"));
-                    files[pathValue->Get ()] = downloadUrlValue->Get ();
-                }
-            });
+                    const JSON::StringValueRef typeValue = GS::DynamicCast<JSON::StringValue> (objectValue->Get ("type"));
+                    const JSON::StringValueRef pathValue = GS::DynamicCast<JSON::StringValue> (objectValue->Get ("path"));
+                    if (typeValue == nullptr || pathValue == nullptr)
+                        return;
+
+                    if (typeValue->Get () == "dir") {
+                        auto subFiles = GetFilesFromGitHubInRelativeLocation (repository, pathValue->Get ());
+                        files.insert (subFiles.begin (), subFiles.end ());
+                    } else if (typeValue->Get () == "file") {
+                        const JSON::StringValueRef downloadUrlValue = GS::DynamicCast<JSON::StringValue> (objectValue->Get ("download_url"));
+                        if (downloadUrlValue != nullptr)
+                            files[pathValue->Get ()] = downloadUrlValue->Get ();
+                    }
+                });
+            }
         }
 
         clientConnection.Close (false);
@@ -142,6 +152,7 @@ TapirPalette::TapirPalette ()
     , openScriptButton (GetReference (), 4)
     , addScriptButton (GetReference (), 5)
     , delScriptButton (GetReference (), 6)
+    , processState (std::make_shared<ProcessState> ())
     , manageShortcutsButton (GetReference (), 7)
 {
     Attach (*this);
@@ -156,8 +167,30 @@ TapirPalette::TapirPalette ()
 
 TapirPalette::~TapirPalette ()
 {
+    try {
+        KillProcess ();
+    } catch (...) {
+    }
+    try {
+        executor.Cancel ();
+        executor.Wait ();
+    } catch (...) {
+    }
     DetachFromAllItems (*this);
     EndEventProcessing ();
+}
+
+bool TapirPalette::IsProcessRunning () const
+{
+    const std::lock_guard<std::mutex> lock (processState->mutex);
+    return processState->process.IsValid ();
+}
+
+void TapirPalette::KillProcess ()
+{
+    const std::lock_guard<std::mutex> lock (processState->mutex);
+    if (processState->process.IsValid ())
+        processState->process.Kill ();
 }
 
 bool TapirPalette::HasInstance ()
@@ -168,7 +201,12 @@ bool TapirPalette::HasInstance ()
 TapirPalette& TapirPalette::Instance ()
 {
     if (!HasInstance ()) {
-        instance = new TapirPalette ();
+        // The constructor is intentionally private to preserve the singleton
+        // invariant, so GS::NewRef cannot instantiate it through its template
+        // boundary.  Adopt the allocation immediately into GS::Ref; the
+        // reference-counted owner remains responsible for destruction.
+        GS::Ref<TapirPalette> created (new TapirPalette ());
+        instance = created;
     }
     return *instance;
 }
@@ -255,7 +293,11 @@ void TapirPalette::ButtonClicked (const DG::ButtonClickEvent& ev)
 {
     if (ev.GetSource () == &runScriptButton) {
         if (IsProcessRunning ()) {
-            process.Kill ();
+            try {
+                KillProcess ();
+            } catch (...) {
+                WriteReport (DG_ERROR, "Failed to stop the running script.");
+            }
         } else {
             if (Config::Instance().AskUpdatingAddOnBeforeEachExecution () && UpdateAddOn ()) {
                 return;
@@ -613,36 +655,45 @@ void TapirPalette::OpenShortcutsDialog ()
 
 GSErrCode TapirPalette::PaletteControlCallBack (Int32, API_PaletteMessageID messageID, GS::IntPtr param)
 {
-    switch (messageID) {
-        case APIPalMsg_OpenPalette:
-            Instance ().Show ();
-            break;
+    if (messageID == APIPalMsg_IsPaletteVisible && param == 0)
+        return APIERR_BADPARS;
 
-        case APIPalMsg_ClosePalette:
-            if (!HasInstance ())
-                break;
-            Instance ().Hide ();
-            break;
-
-        case APIPalMsg_HidePalette_Begin:
-            if (HasInstance () && Instance ().IsVisible ())
-                Instance ().Hide ();
-            break;
-
-        case APIPalMsg_HidePalette_End:
-            if (HasInstance () && !Instance ().IsVisible ())
+    try {
+        switch (messageID) {
+            case APIPalMsg_OpenPalette:
                 Instance ().Show ();
-            break;
+                break;
 
-        case APIPalMsg_IsPaletteVisible:
-            *(reinterpret_cast<bool*> (param)) = HasInstance () && Instance ().IsVisible ();
-            break;
+            case APIPalMsg_ClosePalette:
+                if (!HasInstance ())
+                    break;
+                Instance ().Hide ();
+                break;
 
-        default:
-            break;
+            case APIPalMsg_HidePalette_Begin:
+                if (HasInstance () && Instance ().IsVisible ())
+                    Instance ().Hide ();
+                break;
+
+            case APIPalMsg_HidePalette_End:
+                if (HasInstance () && !Instance ().IsVisible ())
+                    Instance ().Show ();
+                break;
+
+            case APIPalMsg_IsPaletteVisible:
+                *(reinterpret_cast<bool*> (param)) = HasInstance () && Instance ().IsVisible ();
+                break;
+
+            default:
+                break;
+        }
+
+        return NoError;
+    } catch (const std::bad_alloc&) {
+        return APIERR_MEMFULL;
+    } catch (...) {
+        return APIERR_GENERAL;
     }
-
-    return NoError;
 }
 
 GSErrCode TapirPalette::RegisterPaletteControlCallBack ()
@@ -663,14 +714,19 @@ void TapirPalette::ExecuteScript (const PopUpItemData& popUpItemData)
 
     class UIUpdaterThread : public GS::Runnable
     {
-        GS::Process& process;
+        std::shared_ptr<TapirPalette::ProcessState> processState;
+        GS::Process process;
+        UInt64 generation;
 
         class IconUpdateTask : public GS::Runnable {
         public:
             IconUpdateTask () = default;
             virtual void Run ()
             {
-                TapirPalette::Instance ().SetRunButtonIcon ();
+                try {
+                    TapirPalette::Instance ().SetRunButtonIcon ();
+                } catch (...) {
+                }
             }
         };
         class OutputUpdateTask : public GS::Runnable {
@@ -681,7 +737,10 @@ void TapirPalette::ExecuteScript (const PopUpItemData& popUpItemData)
             {}
             virtual void Run ()
             {
-                TapirPalette::Instance ().WriteReport (type, text);
+                try {
+                    TapirPalette::Instance ().WriteReport (type, text);
+                } catch (...) {
+                }
             }
         };
 
@@ -705,21 +764,30 @@ void TapirPalette::ExecuteScript (const PopUpItemData& popUpItemData)
         }
 
     public:
-        explicit UIUpdaterThread (GS::Process& p) : process(p)
+        explicit UIUpdaterThread (
+            const std::shared_ptr<TapirPalette::ProcessState>& state,
+            const GS::Process& p,
+            UInt64 processGeneration)
+            : processState (state)
+            , process (p)
+            , generation (processGeneration)
         {
         }
         GS::UniString ReadFromChannel (GS::IBinaryChannel& channel)
         {
-            if (channel.GetAvailable () <= 0) {
+            constexpr GS::USize MaxChannelRead = 1024 * 1024;
+            const auto available = channel.GetAvailable ();
+            if (available <= 0) {
                 return GS::EmptyUniString;
             }
 
-            const GS::USize uSize = static_cast<GS::USize> (channel.GetAvailable ());
-            std::unique_ptr<char> buffer;
-            buffer.reset (new char[uSize + 1]);
+            const GS::USize uSize = static_cast<GS::USize> (available) > MaxChannelRead
+                ? MaxChannelRead
+                : static_cast<GS::USize> (available);
+            std::vector<char> buffer (uSize + 1, '\0');
 
-            GS::IBinaryChannelUtilities::ReadFully (channel, buffer.get (), uSize);
-            return GS::UniString (buffer.get (), uSize, CC_UTF8);
+            GS::IBinaryChannelUtilities::ReadFully (channel, buffer.data (), uSize);
+            return GS::UniString (buffer.data (), uSize, CC_UTF8);
         }
         void ReadFromChannels ()
         {
@@ -733,19 +801,35 @@ void TapirPalette::ExecuteScript (const PopUpItemData& popUpItemData)
         }
         virtual void Run () override final
         {
-            GS::MessageLoopExecutor ().Execute (new IconUpdateTask ());
+            try {
+                GS::MessageLoopExecutor ().Execute (new IconUpdateTask ());
 
-            const GS::Timeout Timeout = {0, 0, 0, 10 /*ms*/};
-            while (!process.WaitFor (Timeout)) {
+                const GS::Timeout Timeout = {0, 0, 0, 10 /*ms*/};
+                while (!process.WaitFor (Timeout)) {
+                    ReadFromChannels ();
+                }
+
+                const int exitCode = process.GetExitCode ();
                 ReadFromChannels ();
+                {
+                    const std::lock_guard<std::mutex> lock (processState->mutex);
+                    if (processState->generation == generation)
+                        processState->process = {};
+                }
+
+                GS::MessageLoopExecutor ().Execute (new IconUpdateTask ());
+                GS::MessageLoopExecutor ().Execute (new OutputUpdateTask (DG_INFORMATION, "ExitCode: " + GS::ValueToUniString (exitCode)));
+            } catch (...) {
+                {
+                    const std::lock_guard<std::mutex> lock (processState->mutex);
+                    if (processState->generation == generation)
+                        processState->process = {};
+                }
+                try {
+                    GS::MessageLoopExecutor ().Execute (new OutputUpdateTask (DG_ERROR, "The script output worker stopped unexpectedly."));
+                } catch (...) {
+                }
             }
-
-            const int exitCode = process.GetExitCode ();
-            ReadFromChannels ();
-            process = {}; // Reset the process to an invalid state
-
-            GS::MessageLoopExecutor ().Execute (new IconUpdateTask ());
-            GS::MessageLoopExecutor ().Execute (new OutputUpdateTask (DG_INFORMATION, "ExitCode: " + GS::ValueToUniString (exitCode)));
         }
     };
 
@@ -773,12 +857,21 @@ void TapirPalette::ExecuteScript (const PopUpItemData& popUpItemData)
         constexpr bool redirectStandardOutput = true;
         constexpr bool redirectStandardInput = false;
         constexpr bool redirectStandardError = true;
-        process = GS::Process::Create (command, argv, GS::Process::CreateNoWindow, redirectStandardOutput, redirectStandardInput, redirectStandardError);
-        if (!process.IsValid ()) {
+        const GS::Process createdProcess = GS::Process::Create (
+            command, argv, GS::Process::CreateNoWindow,
+            redirectStandardOutput, redirectStandardInput, redirectStandardError);
+        if (!createdProcess.IsValid ()) {
             WriteReport (DG_ERROR, "Failed to start uv process. Ensure it is installed and executable.");
+            return;
         }
 
-        executor.Execute (new UIUpdaterThread (process));
+        UInt64 processGeneration;
+        {
+            const std::lock_guard<std::mutex> lock (processState->mutex);
+            processState->process = createdProcess;
+            processGeneration = ++processState->generation;
+        }
+        executor.Execute (new UIUpdaterThread (processState, createdProcess, processGeneration));
     } catch (const GS::ProcessException&) {
         WriteReport (DG_ERROR, "Failed to execute %T", filePath.ToPrintf ());
     } catch (...) {
@@ -825,9 +918,23 @@ void TapirPalette::AddScriptsFromRepositories ()
 
     const auto& repositories = Config::Instance ().Repositories ();
     for (auto& repo : repositories) {
-        const std::unique_ptr<std::regex> excludeFromDownloadRegex = repo.excludeFromDownloadPattern.IsEmpty () ? nullptr : std::make_unique<std::regex> (repo.excludeFromDownloadPattern.ToCStr ().Get ());
-        const std::unique_ptr<std::regex> excludeRegex = repo.excludePattern.IsEmpty () ? nullptr : std::make_unique<std::regex> (repo.excludePattern.ToCStr ().Get ());
-        const std::unique_ptr<std::regex> includeRegex = repo.includePattern.IsEmpty () ? nullptr : std::make_unique<std::regex> (repo.includePattern.ToCStr ().Get ());
+        std::unique_ptr<std::regex> excludeFromDownloadRegex;
+        std::unique_ptr<std::regex> excludeRegex;
+        std::unique_ptr<std::regex> includeRegex;
+        try {
+            if (!repo.excludeFromDownloadPattern.IsEmpty ())
+                excludeFromDownloadRegex = std::make_unique<std::regex> (repo.excludeFromDownloadPattern.ToCStr ().Get ());
+            if (!repo.excludePattern.IsEmpty ())
+                excludeRegex = std::make_unique<std::regex> (repo.excludePattern.ToCStr ().Get ());
+            if (!repo.includePattern.IsEmpty ())
+                includeRegex = std::make_unique<std::regex> (repo.includePattern.ToCStr ().Get ());
+        } catch (const std::regex_error&) {
+            ACAPI_WriteReport ("Skipping repository with an invalid script filter pattern.", true);
+            continue;
+        } catch (const std::bad_alloc&) {
+            ACAPI_WriteReport ("Skipping repository because its script filter could not be allocated.", true);
+            continue;
+        }
 
         IO::RelativeLocation repoRelativeLoc (repo.repoOwner);
         repoRelativeLoc.Append (IO::Name (repo.repoName));
@@ -989,7 +1096,14 @@ bool TapirPalette::UpdateAddOn ()
     constexpr bool redirectStandardOutput = false;
     constexpr bool redirectStandardInput = false;
     constexpr bool redirectStandardError = false;
-    process = GS::Process::Create (uvCommand, argv, GS::Process::CreateNoWindow, redirectStandardOutput, redirectStandardInput, redirectStandardError);
+    const GS::Process updatedProcess = GS::Process::Create (
+        uvCommand, argv, GS::Process::CreateNoWindow,
+        redirectStandardOutput, redirectStandardInput, redirectStandardError);
+    {
+        const std::lock_guard<std::mutex> lock (processState->mutex);
+        processState->process = updatedProcess;
+        ++processState->generation;
+    }
 
     SetRunButtonIcon ();
 
@@ -1060,14 +1174,16 @@ short TapirPalette::AddScriptsFromPreferences ()
     GSSize nBytes;
 
     ACAPI_GetPreferences (&version, &nBytes, nullptr);
-    if (nBytes <= 0 || (version != PREFERENCES_VERSION && version != PREFERENCES_VERSION_BEFORE_SHORTCUT_LABELS && version != PREFERENCES_VERSION_BEFORE_SHORTCUT_SLOTS)) {
+    constexpr GSSize MaxPreferencesBytes = 16 * 1024 * 1024;
+    if (nBytes <= 0 || nBytes > MaxPreferencesBytes ||
+        (version != PREFERENCES_VERSION && version != PREFERENCES_VERSION_BEFORE_SHORTCUT_LABELS && version != PREFERENCES_VERSION_BEFORE_SHORTCUT_SLOTS)) {
         return DG::PopUp::TopItem;
     }
 
-    std::unique_ptr<char> data(new char[nBytes]);
-    ACAPI_GetPreferences (&version, &nBytes, data.get ());
+    std::vector<char> data (static_cast<std::size_t> (nBytes) + 1, '\0');
+    ACAPI_GetPreferences (&version, &nBytes, data.data ());
     GS::Array<GS::UniString> scriptPathArray;
-    GS::UniString (data.get ()).Split ("\n", GS::UniString::SkipEmptyParts, &scriptPathArray);
+    GS::UniString (data.data ()).Split ("\n", GS::UniString::SkipEmptyParts, &scriptPathArray);
 
     if (version == PREFERENCES_VERSION && scriptPathArray.GetSize () >= 2 * ScriptShortcutSlotCount) {
         // Labels were appended last, so they must be popped first.

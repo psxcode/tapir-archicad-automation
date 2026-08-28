@@ -41,128 +41,188 @@
 
 #include "InstanceInfoFile.hpp"
 
+#include <exception>
+#include <new>
+
 // Project lifecycle events used to refresh the per-instance info file written
 // by InstanceInfoFile::WriteInstanceInfo so the MCP server always sees the
 // current project identity without polling Tapir.
 static GSErrCode InstanceInfoProjectEventHandler (API_NotifyEventID notifID, Int32 /*param*/)
 {
-    switch (notifID) {
-        case APINotify_New:
-        case APINotify_NewAndReset:
-        case APINotify_Open:
-        case APINotify_Save:
-            InstanceInfoFile::WriteInstanceInfo ();
-            break;
-        default:
-            break;
+    try {
+        switch (notifID) {
+            case APINotify_New:
+            case APINotify_NewAndReset:
+            case APINotify_Open:
+            case APINotify_Save:
+                InstanceInfoFile::WriteInstanceInfo ();
+                break;
+            default:
+                break;
+        }
+        return NoError;
+    } catch (const std::bad_alloc&) {
+        return APIERR_MEMFULL;
+    } catch (...) {
+        return APIERR_GENERAL;
     }
-    return NoError;
 }
+
+// Keep registration fail-closed.  The Archicad host owns the command object
+// after InstallAddOnCommandHandler returns, so the public callback boundary
+// must receive the concrete SDK command object and its exact DevKit vtable.
+// A prior attempt to put every command behind a forwarding wrapper changed
+// that boundary and coincided with crashes in APICommandJSONSchema.dll.
+static GSErrCode gCommandRegistrationError = NoError;
 
 template <typename CommandType>
 GSErrCode RegisterCommand (CommandGroup& group, const GS::UniString& version, const GS::UniString& description)
 {
-    GS::Owner<CommandType> command = GS::NewOwned<CommandType> ();
-    group.commands.push_back (CommandInfo (
-        command->GetName (),
-        description,
-        version,
-        command->GetInputParametersSchema (),
-        command->GetResponseSchema ())
-    );
+    if (gCommandRegistrationError != NoError)
+        return gCommandRegistrationError;
 
-    GSErrCode err = ACAPI_AddOnAddOnCommunication_InstallAddOnCommandHandler (command.Pass ());
-    if (err != NoError) {
-        return err;
+    try {
+        GS::Owner<CommandType> command = GS::NewOwned<CommandType> ();
+        const GS::String name = command->GetName ();
+        // Force the resource-backed common schema to load while this command
+        // is still locally owned.  The getter is exception-safe, and doing it
+        // here avoids the first lazy resource access occurring after the host
+        // has taken ownership across the ABI boundary.
+        const GS::Optional<GS::UniString> schemaDefinitions = command->GetSchemaDefinitions ();
+        const GS::Optional<GS::UniString> inputSchema = command->GetInputParametersSchema ();
+        const GS::Optional<GS::UniString> responseSchema = command->GetResponseSchema ();
+        (void) schemaDefinitions;
+
+        // Build all metadata before transferring ownership to Archicad.  No
+        // allocation should be required after the host owns the command.
+        group.commands.emplace_back (name, description, version, inputSchema, responseSchema);
+
+        const GSErrCode err = ACAPI_AddOnAddOnCommunication_InstallAddOnCommandHandler (command.Pass ());
+        if (err != NoError) {
+            group.commands.pop_back ();
+            gCommandRegistrationError = err;
+            return err;
+        }
+
+        return NoError;
+    } catch (const std::bad_alloc&) {
+        gCommandRegistrationError = APIERR_MEMFULL;
+        return APIERR_MEMFULL;
+    } catch (...) {
+        gCommandRegistrationError = APIERR_GENERAL;
+        return APIERR_GENERAL;
     }
-    return NoError;
 }
 
 static GSErrCode MenuCommandHandler (const API_MenuParams* menuParams)
 {
-    switch (menuParams->menuItemRef.menuResID) {
-        case ID_ADDON_MENU:
-            switch (menuParams->menuItemRef.itemIndex) {
-                case ID_ADDON_MENU_ABOUT:
-                    {
-                        AboutDialog aboutDialog;
-                        aboutDialog.Invoke ();
-                    }
-                    break;
-            }
-            break;
-        case ID_ADDON_MENU_FOR_PALETTE:
-            switch (menuParams->menuItemRef.itemIndex) {
-                case ID_ADDON_MENU_PALETTE:
-                    {
-                        if (TapirPalette::HasInstance () && TapirPalette::Instance ().IsVisible ()) {
-                            TapirPalette::Instance ().Hide ();
-                        } else {
-                            TapirPalette::Instance ().Show ();
-                        }
-                    }
-                    break;
-            }
-            break;
-        case ID_ADDON_MENU_FOR_UPDATE:
-            switch (menuParams->menuItemRef.itemIndex) {
-                case ID_ADDON_MENU_UPDATE:
-                    {
-                        if (!VersionChecker::IsUsingLatestVersion ()) {
-                            TapirPalette::Instance ().UpdateAddOn ();
-                        } else {
-                            DGAlert (DG_INFORMATION,
-                                RSGetIndString (ID_AUTOUPDATE_STRINGS, ID_AUTOUPDATE_LATESTVERSION_ALERT_TITLE, ACAPI_GetOwnResModule ()),
-                                GS::UniString::Printf (RSGetIndString (ID_AUTOUPDATE_STRINGS, ID_AUTOUPDATE_LATESTVERSION_ALERT_TEXT, ACAPI_GetOwnResModule ()), ADDON_VERSION),
-                                GS::EmptyUniString,
-                                RSGetIndString (ID_AUTOUPDATE_STRINGS, ID_AUTOUPDATE_LATESTVERSION_ALERT_BUTTON, ACAPI_GetOwnResModule ()));
-                        }
-                    }
-                    break;
-            }
-            break;
-        // Each shortcut slot is its own top-level menu group (see ResourceIds.hpp) —
-        // RunShortcutSlot takes a 0-based slot index.
-        case ID_ADDON_MENU_RUNSCRIPT_1: TapirPalette::Instance ().RunShortcutSlot (0); break;
-        case ID_ADDON_MENU_RUNSCRIPT_2: TapirPalette::Instance ().RunShortcutSlot (1); break;
-        case ID_ADDON_MENU_RUNSCRIPT_3: TapirPalette::Instance ().RunShortcutSlot (2); break;
-        case ID_ADDON_MENU_RUNSCRIPT_4: TapirPalette::Instance ().RunShortcutSlot (3); break;
-        case ID_ADDON_MENU_RUNSCRIPT_5: TapirPalette::Instance ().RunShortcutSlot (4); break;
-        case ID_ADDON_MENU_RUNSCRIPT_6: TapirPalette::Instance ().RunShortcutSlot (5); break;
-    }
+    if (menuParams == nullptr)
+        return APIERR_BADPARS;
 
-    return NoError;
+    try {
+        switch (menuParams->menuItemRef.menuResID) {
+            case ID_ADDON_MENU:
+                switch (menuParams->menuItemRef.itemIndex) {
+                    case ID_ADDON_MENU_ABOUT:
+                        {
+                            AboutDialog aboutDialog;
+                            aboutDialog.Invoke ();
+                        }
+                        break;
+                }
+                break;
+            case ID_ADDON_MENU_FOR_PALETTE:
+                switch (menuParams->menuItemRef.itemIndex) {
+                    case ID_ADDON_MENU_PALETTE:
+                        {
+                            if (TapirPalette::HasInstance () && TapirPalette::Instance ().IsVisible ()) {
+                                TapirPalette::Instance ().Hide ();
+                            } else {
+                                TapirPalette::Instance ().Show ();
+                            }
+                        }
+                        break;
+                }
+                break;
+            case ID_ADDON_MENU_FOR_UPDATE:
+                switch (menuParams->menuItemRef.itemIndex) {
+                    case ID_ADDON_MENU_UPDATE:
+                        {
+                            if (!VersionChecker::IsUsingLatestVersion ()) {
+                                TapirPalette::Instance ().UpdateAddOn ();
+                            } else {
+                                DGAlert (DG_INFORMATION,
+                                    RSGetIndString (ID_AUTOUPDATE_STRINGS, ID_AUTOUPDATE_LATESTVERSION_ALERT_TITLE, ACAPI_GetOwnResModule ()),
+                                    GS::UniString::Printf (RSGetIndString (ID_AUTOUPDATE_STRINGS, ID_AUTOUPDATE_LATESTVERSION_ALERT_TEXT, ACAPI_GetOwnResModule ()), ADDON_VERSION),
+                                    GS::EmptyUniString,
+                                    RSGetIndString (ID_AUTOUPDATE_STRINGS, ID_AUTOUPDATE_LATESTVERSION_ALERT_BUTTON, ACAPI_GetOwnResModule ()));
+                            }
+                        }
+                        break;
+                }
+                break;
+            // Each shortcut slot is its own top-level menu group (see ResourceIds.hpp) —
+            // RunShortcutSlot takes a 0-based slot index.
+            case ID_ADDON_MENU_RUNSCRIPT_1: TapirPalette::Instance ().RunShortcutSlot (0); break;
+            case ID_ADDON_MENU_RUNSCRIPT_2: TapirPalette::Instance ().RunShortcutSlot (1); break;
+            case ID_ADDON_MENU_RUNSCRIPT_3: TapirPalette::Instance ().RunShortcutSlot (2); break;
+            case ID_ADDON_MENU_RUNSCRIPT_4: TapirPalette::Instance ().RunShortcutSlot (3); break;
+            case ID_ADDON_MENU_RUNSCRIPT_5: TapirPalette::Instance ().RunShortcutSlot (4); break;
+            case ID_ADDON_MENU_RUNSCRIPT_6: TapirPalette::Instance ().RunShortcutSlot (5); break;
+        }
+
+        return NoError;
+    } catch (const std::bad_alloc&) {
+        return APIERR_MEMFULL;
+    } catch (...) {
+        return APIERR_GENERAL;
+    }
 }
 
 API_AddonType CheckEnvironment (API_EnvirParams* envir)
 {
-    RSGetIndString (&envir->addOnInfo.name, ID_ADDON_INFO, ID_ADDON_INFO_NAME, ACAPI_GetOwnResModule ());
-    RSGetIndString (&envir->addOnInfo.description, ID_ADDON_INFO, ID_ADDON_INFO_DESC, ACAPI_GetOwnResModule ());
-    envir->addOnInfo.description += GS::UniString (" ") + ADDON_VERSION;
-    VersionChecker::CreateInstance (envir->serverInfo.mainVersion);
-    return APIAddon_Preload;
+    if (envir == nullptr)
+        return APIAddon_DontRegister;
+    try {
+        RSGetIndString (&envir->addOnInfo.name, ID_ADDON_INFO, ID_ADDON_INFO_NAME, ACAPI_GetOwnResModule ());
+        RSGetIndString (&envir->addOnInfo.description, ID_ADDON_INFO, ID_ADDON_INFO_DESC, ACAPI_GetOwnResModule ());
+        envir->addOnInfo.description += GS::UniString (" ") + ADDON_VERSION;
+        VersionChecker::CreateInstance (envir->serverInfo.mainVersion);
+        return APIAddon_Preload;
+    } catch (...) {
+        return APIAddon_DontRegister;
+    }
 }
 
 GSErrCode RegisterInterface (void)
 {
-    GSErrCode err = NoError;
+    try {
+        GSErrCode err = NoError;
 
-    err |= ACAPI_MenuItem_RegisterMenu (ID_ADDON_MENU_FOR_PALETTE, 0, MenuCode_UserDef, MenuFlag_Default);
-    err |= ACAPI_MenuItem_RegisterMenu (ID_ADDON_MENU_FOR_UPDATE, 0, MenuCode_UserDef, MenuFlag_Default);
-    err |= ACAPI_MenuItem_RegisterMenu (ID_ADDON_MENU, 0, MenuCode_UserDef, MenuFlag_Default);
-    err |= ACAPI_MenuItem_RegisterMenu (ID_ADDON_MENU_RUNSCRIPT_1, 0, MenuCode_UserDef, MenuFlag_Default);
-    err |= ACAPI_MenuItem_RegisterMenu (ID_ADDON_MENU_RUNSCRIPT_2, 0, MenuCode_UserDef, MenuFlag_Default);
-    err |= ACAPI_MenuItem_RegisterMenu (ID_ADDON_MENU_RUNSCRIPT_3, 0, MenuCode_UserDef, MenuFlag_Default);
-    err |= ACAPI_MenuItem_RegisterMenu (ID_ADDON_MENU_RUNSCRIPT_4, 0, MenuCode_UserDef, MenuFlag_Default);
-    err |= ACAPI_MenuItem_RegisterMenu (ID_ADDON_MENU_RUNSCRIPT_5, 0, MenuCode_UserDef, MenuFlag_Default);
-    err |= ACAPI_MenuItem_RegisterMenu (ID_ADDON_MENU_RUNSCRIPT_6, 0, MenuCode_UserDef, MenuFlag_Default);
+        err |= ACAPI_MenuItem_RegisterMenu (ID_ADDON_MENU_FOR_PALETTE, 0, MenuCode_UserDef, MenuFlag_Default);
+        err |= ACAPI_MenuItem_RegisterMenu (ID_ADDON_MENU_FOR_UPDATE, 0, MenuCode_UserDef, MenuFlag_Default);
+        err |= ACAPI_MenuItem_RegisterMenu (ID_ADDON_MENU, 0, MenuCode_UserDef, MenuFlag_Default);
+        err |= ACAPI_MenuItem_RegisterMenu (ID_ADDON_MENU_RUNSCRIPT_1, 0, MenuCode_UserDef, MenuFlag_Default);
+        err |= ACAPI_MenuItem_RegisterMenu (ID_ADDON_MENU_RUNSCRIPT_2, 0, MenuCode_UserDef, MenuFlag_Default);
+        err |= ACAPI_MenuItem_RegisterMenu (ID_ADDON_MENU_RUNSCRIPT_3, 0, MenuCode_UserDef, MenuFlag_Default);
+        err |= ACAPI_MenuItem_RegisterMenu (ID_ADDON_MENU_RUNSCRIPT_4, 0, MenuCode_UserDef, MenuFlag_Default);
+        err |= ACAPI_MenuItem_RegisterMenu (ID_ADDON_MENU_RUNSCRIPT_5, 0, MenuCode_UserDef, MenuFlag_Default);
+        err |= ACAPI_MenuItem_RegisterMenu (ID_ADDON_MENU_RUNSCRIPT_6, 0, MenuCode_UserDef, MenuFlag_Default);
 
-    return err;
+        return err;
+    } catch (const std::bad_alloc&) {
+        return APIERR_MEMFULL;
+    } catch (...) {
+        return APIERR_GENERAL;
+    }
 }
 
 GSErrCode Initialize (void)
 {
     GSErrCode err = NoError;
+    gCommandRegistrationError = NoError;
+
+    try {
 
     err |= ACAPI_MenuItem_InstallMenuHandler (ID_ADDON_MENU_FOR_PALETTE, MenuCommandHandler);
     err |= ACAPI_MenuItem_InstallMenuHandler (ID_ADDON_MENU_FOR_UPDATE, MenuCommandHandler);
@@ -174,7 +234,6 @@ GSErrCode Initialize (void)
     err |= ACAPI_MenuItem_InstallMenuHandler (ID_ADDON_MENU_RUNSCRIPT_5, MenuCommandHandler);
     err |= ACAPI_MenuItem_InstallMenuHandler (ID_ADDON_MENU_RUNSCRIPT_6, MenuCommandHandler);
     err |= TapirPalette::RegisterPaletteControlCallBack ();
-    err |= RegisterMarqueeFocusTracker ();
 
     // Forces the palette singleton (and its saved shortcut-slot preferences) to load immediately,
     // so custom shortcut menu labels are applied at startup rather than only after the user first
@@ -252,6 +311,10 @@ GSErrCode Initialize (void)
             projectCommands, "1.3.1",
             "Saves the currently opened project."
         );
+        err |= RegisterCommand<SaveProjectAsVersionCommand> (
+            projectCommands, "1.0.0",
+            "Exports the currently opened project to a new older-version PLN or PLA without overwriting an existing file."
+        );
         err |= RegisterCommand<GetCalculationUnitsCommand> (
             projectCommands, "1.4.0",
             "Gets the project calculation units."
@@ -276,6 +339,10 @@ GSErrCode Initialize (void)
             projectCommands, "1.5.12",
             "Prints a temporary rectangular marquee through Archicad's native print engine and restores the operator focus."
         );
+        err |= RegisterCommand<SetMarqueeCommand> (
+            projectCommands, "1.5.16",
+            "Sets a persistent rectangular marquee for explicit benchmark focus without changing the story or individual element selection."
+        );
         err |= RegisterCommand<RebuildViewCommand> (
             projectCommands, "1.5.0",
             "Rebuilds the current view."
@@ -287,11 +354,19 @@ GSErrCode Initialize (void)
         CommandGroup elementCommands ("Element Commands");
         err |= RegisterCommand<GetSelectedElementsCommand> (
             elementCommands, "1.5.6",
-            "Gets individual selection and independently tracked marquee focus, including geometry and returned-element relationship."
+            "Gets the active Archicad focus: either individual selection or marquee membership, including geometry and returned-element relationship."
         );
         err |= RegisterCommand<GetElementsInRectCommand> (
             elementCommands, "1.5.13",
-            "Returns elements intersecting a bounded model-coordinate rectangle without enumerating the whole database. The command temporarily uses Archicad's native marquee selection and restores the prior focus."
+            "Returns elements intersecting a bounded model-coordinate rectangle without enumerating the whole database. It requires no active individual selection, temporarily uses the native marquee mode, and restores the prior marquee or empty focus."
+        );
+        err |= RegisterCommand<GetOrthogonalDraftingProjectionCommand> (
+            elementCommands, "1.5.15",
+            "Returns a disposable read-only projection of orthogonal Line and PolyLine drafting segments for sheet discovery. Curved, diagonal, and degenerate geometry is discarded without changing operator focus."
+        );
+        err |= RegisterCommand<GetElementsInRectsCommand> (
+            elementCommands, "1.5.15",
+            "Returns Text elements grouped by bounded rectangle, including raw content and per-text font provenance, without changing operator focus."
         );
         err |= RegisterCommand<GetElementsByTypeCommand> (
             elementCommands, "1.0.7",
@@ -328,6 +403,14 @@ GSErrCode Initialize (void)
         err |= RegisterCommand<GetConnectedElementsCommand> (
             elementCommands, "1.1.4",
             "Gets connected elements of the given elements."
+        );
+        err |= RegisterCommand<GetWallRelationsCommand> (
+            elementCommands, "1.5.14",
+            "Gets native Wall-to-Wall connection relations and the connected outline for bounded Wall GUIDs. Read-only."
+        );
+        err |= RegisterCommand<GetRoomRelationsCommand> (
+            elementCommands, "1.0.0",
+            "Gets current native Zone room relations and Door-to-Zone relations for bounded GUIDs. Read-only."
         );
         err |= RegisterCommand<GetZoneBoundariesCommand> (
             elementCommands, "1.2.3",
@@ -878,6 +961,10 @@ GSErrCode Initialize (void)
             navigatorCommands, "1.1.7",
             "Get zoom and rotation of 2D views"
         );
+        err |= RegisterCommand<SetView2DZoomCommand> (
+            navigatorCommands, "1.1.8",
+            "Set the axis-aligned model-coordinate zoom of the active FloorPlan window."
+        );
         err |= RegisterCommand<SetViewRotationCommand> (
             navigatorCommands, "1.1.7",
             "Set the rotation angle of 2D views via their floor plan database."
@@ -1070,21 +1157,41 @@ GSErrCode Initialize (void)
         AddCommandGroup (developerCommands);
     }
 
+    // Do not publish instance/lifecycle state when command registration or
+    // menu setup was only partially successful.  Returning now leaves the
+    // host with the SDK-owned objects it accepted and prevents additional
+    // callbacks from being installed on a failed initialization.
+    if (gCommandRegistrationError != NoError)
+        return gCommandRegistrationError;
+    if (err != NoError)
+        return err;
+
     // Publish this instance's JSON server port and current project identity to
     // a per-pid file so the MCP server can discover and bind instances without
     // HTTP port scanning. Refreshed on project lifecycle events.
     err |= InstanceInfoFile::WriteInstanceInfo ();
-    err |= ACAPI_ProjectOperation_CatchProjectEvent (
+    err |= TAPIR_ProjectOperation_CatchProjectEvent (
         APINotify_New | APINotify_NewAndReset | APINotify_Open | APINotify_Save,
         InstanceInfoProjectEventHandler);
 
     return err;
+    } catch (const std::bad_alloc&) {
+        return APIERR_MEMFULL;
+    } catch (...) {
+        return APIERR_GENERAL;
+    }
 }
 
 GSErrCode FreeData (void)
 {
-    ACAPI_ProjectOperation_CatchProjectEvent (0, nullptr);
-    InstanceInfoFile::Delete ();
-    UnregisterMarqueeFocusTracker ();
-    return NoError;
+    try {
+        TAPIR_ProjectOperation_CatchProjectEvent (0, nullptr);
+        const GSErrCode notificationError = AddElementNotificationClientCommand::Shutdown ();
+        InstanceInfoFile::Delete ();
+        return notificationError;
+    } catch (const std::bad_alloc&) {
+        return APIERR_MEMFULL;
+    } catch (...) {
+        return APIERR_GENERAL;
+    }
 }

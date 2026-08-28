@@ -12,6 +12,9 @@
 
 #include "MigrationHelper.hpp"
 
+#include <new>
+#include <mutex>
+
 static
 GS::String ElementEventTypeToString (AddElementNotificationClientCommand::ElementEventType eventType)
 {
@@ -40,8 +43,20 @@ public:
     }
     virtual void Run ()
     {
-        for (auto& kv : AddElementNotificationClientCommand::clients) {
-            auto& client = kv.second;
+        try {
+        // Command callbacks can add/remove clients while this worker is
+        // delivering a previous event batch.  Never hold references into the
+        // shared map across HTTP or JSON work; copy the small client records
+        // while protected, then operate only on the snapshot.
+        std::vector<AddElementNotificationClientCommand::Client> clientsSnapshot;
+        {
+            const std::lock_guard<std::mutex> lock (AddElementNotificationClientCommand::stateMutex);
+            clientsSnapshot.reserve (AddElementNotificationClientCommand::clients.size ());
+            for (const auto& kv : AddElementNotificationClientCommand::clients)
+                clientsSnapshot.emplace_back (kv.second);
+        }
+
+        for (auto& client : clientsSnapshot) {
 
             bool isEmptyMessage = true;
             GS::ObjectState message;
@@ -63,15 +78,23 @@ public:
 
             AddElementNotificationClientCommand::SendMessageToNotificationClient (client, message);
         }
+        } catch (...) {
+            // This is a GS::Thread callback boundary.  Notification delivery
+            // is best-effort and must never terminate Archicad on a malformed
+            // event or an allocation/transport failure.
+        }
     }
 };
 
 std::map<GS::UniString, AddElementNotificationClientCommand::Client> AddElementNotificationClientCommand::clients;
-bool AddElementNotificationClientCommand::hasClientToNotifyOnNew = false;
-bool AddElementNotificationClientCommand::hasClientToNotifyOnModification = false;
-bool AddElementNotificationClientCommand::hasClientToNotifyOnReservationChanges = false;
+std::mutex AddElementNotificationClientCommand::stateMutex;
+std::atomic_bool AddElementNotificationClientCommand::hasClientToNotifyOnNew (false);
+std::atomic_bool AddElementNotificationClientCommand::hasClientToNotifyOnModification (false);
+std::atomic_bool AddElementNotificationClientCommand::hasClientToNotifyOnReservationChanges (false);
 std::unique_ptr<AddElementNotificationClientCommand::EventQueue> AddElementNotificationClientCommand::queuedEvents;
 GS::Thread AddElementNotificationClientCommand::messageSenderThread;
+std::mutex AddElementNotificationClientCommand::messageSenderMutex;
+std::atomic_bool AddElementNotificationClientCommand::messageSenderStarted (false);
 
 void AddElementNotificationClientCommand::Client::Send(HTTP::Client::Request& request, const GS::UniString* body)
 {
@@ -163,30 +186,35 @@ GS::ObjectState AddElementNotificationClientCommand::Execute (const GS::ObjectSt
 
     const GS::UniString connectionUrlStr = GS::UniString::Printf ("http://%T:%d/", host.ToPrintf (), port);
     const IO::URI::URI connectionUrl (connectionUrlStr);
-    auto result = clients.emplace(std::piecewise_construct, std::forward_as_tuple(connectionUrlStr), std::forward_as_tuple(connectionUrl, notifyOnNew, notifyOnModification, notifyOnReservationChanges));
-    if (!result.second) {
-        result.first->second.notifyOnNew = notifyOnNew;
-        result.first->second.notifyOnModification = notifyOnModification;
-        result.first->second.notifyOnReservationChanges = notifyOnReservationChanges;
+    {
+        const std::lock_guard<std::mutex> lock (stateMutex);
+        auto result = clients.emplace (std::piecewise_construct,
+            std::forward_as_tuple (connectionUrlStr),
+            std::forward_as_tuple (connectionUrl, notifyOnNew, notifyOnModification, notifyOnReservationChanges));
+        if (!result.second) {
+            result.first->second.notifyOnNew = notifyOnNew;
+            result.first->second.notifyOnModification = notifyOnModification;
+            result.first->second.notifyOnReservationChanges = notifyOnReservationChanges;
+        }
     }
 
-    if (notifyOnNew && !hasClientToNotifyOnNew) {
+    if (notifyOnNew && !hasClientToNotifyOnNew.load ()) {
         ACAPI_Element_CatchNewElement (nullptr, ElementEventHandlerProc);
-        hasClientToNotifyOnNew = true;
+        hasClientToNotifyOnNew.store (true);
     }
 
-    if (notifyOnModification && !hasClientToNotifyOnModification) {
+    if (notifyOnModification && !hasClientToNotifyOnModification.load ()) {
         GS::Array<API_Guid> elementIds;
         ACAPI_Element_GetElemList (API_ZombieElemID, &elementIds);
         for (const auto& elemId : elementIds) {
             ACAPI_Element_AttachObserver (elemId);
         }
-        hasClientToNotifyOnModification = true;
+        hasClientToNotifyOnModification.store (true);
     }
 
-    if (notifyOnReservationChanges && !hasClientToNotifyOnReservationChanges) {
+    if (notifyOnReservationChanges && !hasClientToNotifyOnReservationChanges.load ()) {
         ACAPI_Notification_CatchElementReservationChange (ElementReservationChangeHandler);
-        hasClientToNotifyOnReservationChanges = true;
+        hasClientToNotifyOnReservationChanges.store (true);
     }
 
     ACAPI_Element_InstallElementObserver (ElementEventHandlerProc);
@@ -197,17 +225,24 @@ GS::ObjectState AddElementNotificationClientCommand::Execute (const GS::ObjectSt
 void
 AddElementNotificationClientCommand::SendEventToNotificationClient (ElementEventType eventType, const GS::ObjectState& os)
 {
-    if (queuedEvents) {
-        (*queuedEvents)[eventType].push_back (os);
-        return;
+    std::vector<Client> clientsSnapshot;
+    {
+        const std::lock_guard<std::mutex> lock (stateMutex);
+        if (queuedEvents) {
+            (*queuedEvents)[eventType].push_back (os);
+            return;
+        }
+
+        clientsSnapshot.reserve (clients.size ());
+        for (const auto& kv : clients)
+            clientsSnapshot.emplace_back (kv.second);
     }
 
     GS::ObjectState message;
     const auto& events = message.AddList<GS::ObjectState> (ElementEventTypeToString (eventType));
     events (os);
 
-    for (auto& kv : clients) {
-        auto& client = kv.second;
+    for (auto& client : clientsSnapshot) {
         if (!client.acceptsNotificationsForEventType (eventType)) {
             continue;
         }
@@ -219,13 +254,104 @@ AddElementNotificationClientCommand::SendEventToNotificationClient (ElementEvent
 void
 AddElementNotificationClientCommand::SendQueuedEventsToNotificationClient ()
 {
-    if (!queuedEvents) {
-        return;
+    std::unique_ptr<EventQueue> events;
+    {
+        const std::lock_guard<std::mutex> lock (stateMutex);
+        if (!queuedEvents)
+            events = nullptr;
+        else
+            events = std::move (queuedEvents);
     }
 
-    messageSenderThread = GS::Thread (new MessageSenderTask (*queuedEvents), "ElementNotifications");
-    messageSenderThread.Start ();
-    queuedEvents.reset ();
+    const std::lock_guard<std::mutex> threadLock (messageSenderMutex);
+    if (messageSenderStarted.load ()) {
+        try {
+            // Never overwrite a running GS::Thread handle.  Its task may
+            // still execute add-on code even after the event batch moved on.
+            messageSenderThread.Join ();
+            messageSenderThread.Clear ();
+            messageSenderStarted.store (false);
+        } catch (...) {
+            // Keep the handle alive for FreeData to retry the join.  Dropping
+            // a new batch is safer than starting another sender concurrently.
+            return;
+        }
+    }
+
+    if (!events)
+        return;
+
+    try {
+        messageSenderThread = GS::Thread (new MessageSenderTask (*events), "ElementNotifications");
+        messageSenderStarted.store (true);
+        messageSenderThread.Start ();
+    } catch (...) {
+        messageSenderStarted.store (false);
+        try {
+            messageSenderThread.Clear ();
+        } catch (...) {
+        }
+    }
+}
+
+GSErrCode
+AddElementNotificationClientCommand::Shutdown ()
+{
+    GSErrCode result = NoError;
+    const auto recordError = [&result] (GSErrCode error) {
+        if (result == NoError && error != NoError)
+            result = error;
+    };
+
+    try {
+#ifdef ServerMainVers_2800
+        GS::Array<API_Elem_Head> observedElements;
+        recordError (ACAPI_Notification_GetObservedElements (&observedElements));
+#else
+        GS::Array<API_Elem_Head> observedElements;
+        recordError (ACAPI_Element_GetObservedElements (&observedElements));
+#endif
+        for (const API_Elem_Head& elementHead : observedElements)
+            recordError (ACAPI_Element_DetachObserver (elementHead.guid));
+
+        recordError (ACAPI_Element_CatchNewElement (nullptr, nullptr));
+        recordError (ACAPI_Element_InstallElementObserver (nullptr));
+        recordError (ACAPI_Notification_CatchElementReservationChange (nullptr, nullptr));
+
+        {
+            const std::lock_guard<std::mutex> lock (stateMutex);
+            clients.clear ();
+            queuedEvents.reset ();
+        }
+        hasClientToNotifyOnNew.store (false);
+        hasClientToNotifyOnModification.store (false);
+        hasClientToNotifyOnReservationChanges.store (false);
+
+        const std::lock_guard<std::mutex> threadLock (messageSenderMutex);
+        if (messageSenderStarted.load ()) {
+            bool joined = false;
+            try {
+                messageSenderThread.Join ();
+                joined = true;
+            } catch (...) {
+                recordError (APIERR_GENERAL);
+            }
+            if (joined) {
+                try {
+                    messageSenderThread.Clear ();
+                } catch (...) {
+                    recordError (APIERR_GENERAL);
+                }
+                messageSenderStarted.store (false);
+            }
+        }
+    } catch (const std::bad_alloc&) {
+        recordError (APIERR_MEMFULL);
+    } catch (...) {
+        recordError (APIERR_GENERAL);
+    }
+
+    return result;
 }
 
 void
@@ -247,9 +373,14 @@ AddElementNotificationClientCommand::SendMessageToNotificationClient (Client& cl
 GSErrCode
 AddElementNotificationClientCommand::ElementEventHandlerProc (const API_NotifyElementType *elemType)
 {
+    if (elemType == nullptr)
+        return APIERR_BADPARS;
+
+    try {
     if (elemType->notifID == APINotifyElement_BeginEvents) {
         SendQueuedEventsToNotificationClient ();
-        queuedEvents.reset (new EventQueue ());
+        const std::lock_guard<std::mutex> lock (stateMutex);
+        queuedEvents = std::make_unique<EventQueue> ();
     } else if (elemType->notifID == APINotifyElement_EndEvents) {
         SendQueuedEventsToNotificationClient ();
     } else {
@@ -270,7 +401,7 @@ AddElementNotificationClientCommand::ElementEventHandlerProc (const API_NotifyEl
                     message.Add ("copiedElementId", CreateGuidObjectState (parentElement.header.guid));
                 }
                 SendEventToNotificationClient (ElementEventType::New, message);
-                if (hasClientToNotifyOnModification) {
+                if (hasClientToNotifyOnModification.load ()) {
                     ACAPI_Element_AttachObserver (elemType->elemHead.guid);
                 }
                 break;
@@ -300,6 +431,11 @@ AddElementNotificationClientCommand::ElementEventHandlerProc (const API_NotifyEl
     }
 
     return NoError;
+    } catch (const std::bad_alloc&) {
+        return APIERR_MEMFULL;
+    } catch (...) {
+        return APIERR_GENERAL;
+    }
 }
 
 static API_ElemTypeID
@@ -317,6 +453,7 @@ AddElementNotificationClientCommand::ElementReservationChangeHandler (
     const GS::HashSet<API_Guid>&          released,
     const GS::HashSet<API_Guid>&          /*deleted*/)
 {
+    try {
     std::map<short, GS::UniString> userIdToNameMap;
     for (const auto& kv : reserved) {
 #ifdef ServerMainVers_2800
@@ -350,6 +487,11 @@ AddElementNotificationClientCommand::ElementReservationChangeHandler (
     }
 
     return NoError;
+    } catch (const std::bad_alloc&) {
+        return APIERR_MEMFULL;
+    } catch (...) {
+        return APIERR_GENERAL;
+    }
 }
 
 RemoveElementNotificationClientCommand::RemoveElementNotificationClientCommand () :
@@ -406,8 +548,11 @@ GS::ObjectState RemoveElementNotificationClientCommand::Execute (const GS::Objec
 
     const GS::UniString connectionUrlStr = GS::UniString::Printf ("http://%T:%d/", host.ToPrintf (), port);
 
-    if (AddElementNotificationClientCommand::clients.erase (connectionUrlStr) == 0) {
-        return CreateFailedExecutionResult (APIERR_BADPARS, "No such notification client registered.");
+    {
+        const std::lock_guard<std::mutex> lock (AddElementNotificationClientCommand::stateMutex);
+        if (AddElementNotificationClientCommand::clients.erase (connectionUrlStr) == 0) {
+            return CreateFailedExecutionResult (APIERR_BADPARS, "No such notification client registered.");
+        }
     }
 
     return CreateSuccessfulExecutionResult ();

@@ -1,5 +1,6 @@
 #include "ElementCommands.hpp"
 #include "MigrationHelper.hpp"
+#include "PerfTrace.hpp"
 #include "GSUnID.hpp"
 #include "Plane.hpp"
 #include "CoordTypedef.hpp"
@@ -8,6 +9,7 @@
 #include "NativeImage.hpp"
 #include "MemoryOChannel32.hpp"
 #include "Base64Converter.hpp"
+#include "NativeOwnership.hpp"
 #ifdef ServerMainVers_2800
 #include "ACAPI/ZoneBoundaryQuery.hpp"
 #endif
@@ -15,7 +17,54 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
-#include <optional>
+#include <chrono>
+#include <cstring>
+#include <limits>
+#include <new>
+
+namespace {
+
+constexpr GSSize MaxNativeTextContentBytes = 8 * 1024 * 1024;
+
+static bool IsFiniteBounds (const API_Box3D& bounds)
+{
+    return std::isfinite (bounds.xMin) && std::isfinite (bounds.yMin) &&
+        std::isfinite (bounds.xMax) && std::isfinite (bounds.yMax);
+}
+
+static bool IsFiniteBounds (const API_Box& bounds)
+{
+    return std::isfinite (bounds.xMin) && std::isfinite (bounds.yMin) &&
+        std::isfinite (bounds.xMax) && std::isfinite (bounds.yMax);
+}
+
+static bool AddBoundedTextContent (GS::ObjectState& target, const API_ElementMemo& memo, GSErrCode memoError)
+{
+#ifdef ServerMainVers_2800
+    if (memoError == NoError && memo.textContent != nullptr &&
+        memo.textContent->GetLength () <= static_cast<USize> (MaxNativeTextContentBytes / sizeof (GS::uchar_t))) {
+        target.Add ("content", *memo.textContent);
+        return true;
+    }
+#else
+    if (memoError == NoError && memo.textContent != nullptr && *memo.textContent != nullptr) {
+        const GSSize textBytes = BMhGetSize (reinterpret_cast<GSHandle> (memo.textContent));
+        if (textBytes > 0 && textBytes <= MaxNativeTextContentBytes) {
+            const char* text = *memo.textContent;
+            GSSize textLength = 0;
+            while (textLength < textBytes && text[textLength] != '\0')
+                ++textLength;
+            if (textLength < textBytes) {
+                target.Add ("content", GS::UniString (reinterpret_cast<const GS::uchar_t*> (text)));
+                return true;
+            }
+        }
+    }
+#endif
+    return false;
+}
+
+}
 
 struct API_RoomUpdateParams {
     bool keepStampPos;
@@ -88,6 +137,44 @@ static GS::UniString StructureTypeToString (API_ModelElemStructureType structure
             return "Profile";
         default:
             return "Basic";
+    }
+}
+
+static GS::UniString WallReferenceLineLocationToString (API_WallReferenceLineLocationID location)
+{
+    switch (location) {
+        case APIWallRefLine_Outside:
+            return "Outside";
+        case APIWallRefLine_Center:
+            return "Center";
+        case APIWallRefLine_Inside:
+            return "Inside";
+        case APIWallRefLine_CoreOutside:
+            return "CoreOutside";
+        case APIWallRefLine_CoreCenter:
+            return "CoreCenter";
+        case APIWallRefLine_CoreInside:
+            return "CoreInside";
+        default:
+            return "Unknown";
+    }
+}
+
+static GS::UniString WallZoneRelationToString (API_ZoneRelID relation)
+{
+    switch (relation) {
+        case APIZRel_Boundary:
+            return "Boundary";
+        case APIZRel_ReduceArea:
+            return "ReduceArea";
+        case APIZRel_None:
+            return "None";
+#ifdef ServerMainVers_2700
+        case APIZRel_SubtractFromZone:
+            return "SubtractFromZone";
+#endif
+        default:
+            return "Unknown";
     }
 }
 
@@ -207,7 +294,12 @@ static GS::ObjectState CreateArrowDataObjectState (const API_ArrowData& arrowDat
 }
 
 template <typename ListProxyType>
-static GSErrCode GetElementsFromCurrentDatabase (const GS::ObjectState& parameters, ListProxyType& elementsListProxy)
+static GSErrCode GetElementsFromCurrentDatabase (
+    const GS::ObjectState& parameters,
+    ListProxyType& elementsListProxy,
+    Int32 pageSize,
+    Int32& enumeratedRows,
+    Int32& emittedRows)
 {
     API_ElemTypeID elemType = API_ZombieElemID;
     GS::UniString elementTypeStr;
@@ -229,23 +321,40 @@ static GSErrCode GetElementsFromCurrentDatabase (const GS::ObjectState& paramete
     }
 
     GS::Array<API_Guid> elemList;
-    GSErrCode err = ACAPI_Element_GetElemList (elemType, &elemList, filterFlags);
+    GSErrCode err;
+    {
+        PerfTrace::ScopeTimer timer (PerfTrace::Phase::ElemList);
+        err = ACAPI_Element_GetElemList (elemType, &elemList, filterFlags);
+    }
     if (err != NoError) {
         return err;
     }
-
+    PerfTrace::ScopeTimer parentTimer (PerfTrace::Phase::ParentResolve);
     if (elemType == API_ObjectID && !includeSubElemObjects) {
         for (const API_Guid& elemGuid : elemList) {
+            if (enumeratedRows < std::numeric_limits<Int32>::max ())
+                ++enumeratedRows;
+            if (emittedRows >= pageSize)
+                return APIERR_MEMFULL;
             const API_Guid parentGuid = GetParentElemOfSectElem (elemGuid);
             API_Element elem = {};
             elem.header.guid = parentGuid;
-            if (ACAPI_Element_Get (&elem) == NoError && elem.object.owner == APINULLGuid) {
+            if (parentGuid != APINULLGuid && ACAPI_Element_Get (&elem) == NoError && elem.object.owner == APINULLGuid) {
                 elementsListProxy (CreateElementIdObjectState (parentGuid));
+                ++emittedRows;
             }
         }
     } else {
         for (const API_Guid& elemGuid : elemList) {
-            elementsListProxy (CreateElementIdObjectState (GetParentElemOfSectElem (elemGuid)));
+            if (enumeratedRows < std::numeric_limits<Int32>::max ())
+                ++enumeratedRows;
+            if (emittedRows >= pageSize)
+                return APIERR_MEMFULL;
+            const API_Guid parentGuid = GetParentElemOfSectElem (elemGuid);
+            if (parentGuid == APINULLGuid)
+                continue;
+            elementsListProxy (CreateElementIdObjectState (parentGuid));
+            ++emittedRows;
         }
     }
     return NoError;
@@ -278,6 +387,10 @@ GS::Optional<GS::UniString> GetElementsByTypeCommand::GetInputParametersSchema (
             },
             "databases": {
                 "$ref": "#/Databases"
+            },
+            "pageSize": {
+                "type": "integer",
+                "minimum": 1
             }
         },
         "additionalProperties": false,
@@ -296,6 +409,9 @@ GS::Optional<GS::UniString> GetElementsByTypeCommand::GetResponseSchema () const
 
 GS::ObjectState GetElementsByTypeCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl& /*processControl*/) const
 {
+    PerfTrace::ResetAccumulator ();
+    std::chrono::steady_clock::time_point perfTraceStart = std::chrono::steady_clock::now ();
+
     GS::UniString elementTypeStr;
     if (parameters.Get ("elementType", elementTypeStr)) {
         if (GetElementTypeFromNonLocalizedName (elementTypeStr) == API_ZombieElemID) {
@@ -306,11 +422,20 @@ GS::ObjectState GetElementsByTypeCommand::Execute (const GS::ObjectState& parame
 
     GS::ObjectState response;
     const auto& elements = response.AddList<GS::ObjectState> ("elements");
+    Int32 pageSize = std::numeric_limits<Int32>::max ();
+    if (!ReadNativePageSize (parameters, pageSize, pageSize))
+        return CreateErrorResponse (APIERR_BADPARS, "pageSize must be a positive integer.");
+    Int32 enumeratedRows = 0;
+    Int32 emittedRows = 0;
 
     GS::Array<GS::ObjectState> databases;
     bool databasesParameterExists = parameters.Get ("databases", databases);
     if (!databasesParameterExists || databases.IsEmpty ()) {
-        GetElementsFromCurrentDatabase (parameters, elements);
+        const GSErrCode err = GetElementsFromCurrentDatabase (parameters, elements, pageSize, enumeratedRows, emittedRows);
+        if (err == APIERR_MEMFULL)
+            return CreateNativePageRequiredResponse ("The element enumeration requires another page; no partial rows were returned.", enumeratedRows, 0);
+        if (err != NoError)
+            return CreateErrorResponse (err, "Failed to retrieve elements from the current database.");
     }
     else {
         const auto& executionResultForDatabases = response.AddList<GS::ObjectState> ("executionResultForDatabases");
@@ -318,7 +443,7 @@ GS::ObjectState GetElementsByTypeCommand::Execute (const GS::ObjectState& parame
         const GS::Array<API_Guid> databaseIds = databases.Transform<API_Guid> (GetGuidFromDatabaseArrayItem);
 
         auto action = [&]() -> GSErrCode {
-            return GetElementsFromCurrentDatabase (parameters, elements);
+            return GetElementsFromCurrentDatabase (parameters, elements, pageSize, enumeratedRows, emittedRows);
         };
         auto actionSuccess = [&]() -> void {
             executionResultForDatabases (CreateSuccessfulExecutionResult ());
@@ -329,9 +454,16 @@ GS::ObjectState GetElementsByTypeCommand::Execute (const GS::ObjectState& parame
 
         GSErrCode err = ExecuteActionForEachDatabase (databaseIds, action,  actionSuccess, actionFailure);
         if (err != NoError) {
+            if (err == APIERR_MEMFULL) {
+                return CreateNativePageRequiredResponse ("The element enumeration requires another page; no partial rows were returned.", enumeratedRows, 0);
+            }
             return CreateErrorResponse (err, "Failed to retrieve the starting database or to switch back to it after execution.");
         }
     }
+
+    PerfTrace::SetRequestedReturned (enumeratedRows, emittedRows);
+    const double totalMs = std::chrono::duration<double, std::milli> (std::chrono::steady_clock::now () - perfTraceStart).count ();
+    PerfTrace::WriteLine (GS::UniString (GetName ()), PerfTrace::NextSeq (), totalMs);
 
     return response;
 }
@@ -355,6 +487,10 @@ GS::Optional<GS::UniString> GetAllElementsCommand::GetInputParametersSchema () c
             },
             "databases": {
                 "$ref": "#/Databases"
+            },
+            "pageSize": {
+                "type": "integer",
+                "minimum": 1
             }
         },
         "additionalProperties": false,
@@ -379,6 +515,14 @@ GS::Optional<GS::UniString> GetDetailsOfElementsCommand::GetInputParametersSchem
         "properties": {
             "elements": {
                 "$ref": "#/Elements"
+            },
+            "detailProfile": {
+                "type": "string",
+                "enum": ["full", "drafting"]
+            },
+            "pageSize": {
+                "type": "integer",
+                "minimum": 1
             }
         },
         "additionalProperties": false,
@@ -390,92 +534,33 @@ GS::Optional<GS::UniString> GetDetailsOfElementsCommand::GetInputParametersSchem
 
 GS::Optional<GS::UniString> GetDetailsOfElementsCommand::GetResponseSchema () const
 {
-    return R"({
-        "type": "object",
-        "properties": {
-            "detailsOfElements": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "description": "Details of an element.",
-                    "properties": {
-                        "type": {
-                            "$ref": "#/ElementType"
-                        },
-                        "id": {
-                            "type": "string"
-                        },
-                        "elementId": {
-                            "$ref": "#/ElementId",
-                            "description": "Stable Archicad GUID of the returned element."
-                        },
-                        "floorIndex": {
-                            "type": "number"
-                        },
-                        "layerIndex": {
-                            "type": "number"
-                        },
-                        "drawIndex": {
-                            "type": "number"
-                        },
-                        "bounds": {
-                            "$ref": "#/Bounds2D",
-                            "description": "Axis-aligned element bounds in Archicad model coordinates. Absent when Archicad cannot calculate bounds for the element in the current database."
-                        },
-                        "details": {
-                            "$ref": "#/TypeSpecificDetails"
-                        },
-                        "floorPlanPolygons": {
-                            "type": "array",
-                            "description": "Cut-fill polygons as drawn on the floor plan (wall joins resolved by ArchiCAD). Available for elements with a cut-fill representation (walls, columns, beams). Absent when the element has no cut fill or when the floor plan database is not accessible.",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "coordinates": {
-                                        "type": "array",
-                                        "items": {
-                                            "$ref": "#/2DCoordinate"
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    },
-                    "additionalProperties": false,
-                    "required": [
-                        "type",
-                        "elementId",
-                        "id",
-                        "floorIndex",
-                        "layerIndex",
-                        "drawIndex",
-                        "details"
-                    ]
-                }
-            }
-        },
-        "additionalProperties": false,
-        "required": [
-            "detailsOfElements"
-        ]
-    })";
+    // EXPERIMENT: response schema validation of multi-megabyte detail batches
+    // dominated the framework-side cost (E-026 validator crash history). No
+    // response schema => the framework skips response validation.
+    return {};
 }
 
 // ── Floor plan polygon infrastructure (used by GetDetailsOfElements) ─────────
 
 struct FloorPlanCollectorContext {
     GS::Array<GS::Array<API_Coord>> polys;
+    GSSize coordinateCount = 0;
+    bool invalid = false;
     bool inCutFill = false;
 };
 
 static thread_local FloorPlanCollectorContext* tl_floorPlanCtx = nullptr;
 
+constexpr GSSize MaxCutFillPolygons = 10'000;
+constexpr GSSize MaxCutFillCoordinates = 200'000;
+
 static GSErrCode CollectCutFillPolygons (const API_PrimElement* primElem,
                                           const void* par1, const void* par2, const void* /*par3*/)
 {
-    if (tl_floorPlanCtx == nullptr)
+    if (tl_floorPlanCtx == nullptr || primElem == nullptr)
         return NoError;
 
+    try {
     switch (primElem->header.typeID) {
         case API_PrimCtrl_HatchBorderBegID: {
             const auto* border = static_cast<const API_PrimHatchBorder*> (par1);
@@ -489,27 +574,94 @@ static GSErrCode CollectCutFillPolygons (const API_PrimElement* primElem,
             if (!tl_floorPlanCtx->inCutFill)
                 break;
             const Int32 nCoords = primElem->poly.nCoords;
-            if (nCoords < 3)
-                break;
+            if (nCoords < 3 || static_cast<GSSize> (nCoords) > MaxCutFillCoordinates ||
+                tl_floorPlanCtx->coordinateCount > MaxCutFillCoordinates - static_cast<GSSize> (nCoords)) {
+                tl_floorPlanCtx->invalid = true;
+                return APIERR_MEMFULL;
+            }
             const auto* coords = static_cast<const API_Coord*> (par1);
-            const auto* pends  = static_cast<const Int32*> (par2);
-            Int32 start = 1;
+            const auto* pends = static_cast<const Int32*> (par2);
             const Int32 nSubPolys = primElem->poly.nSubPolys;
+            if (nSubPolys < 1 || nSubPolys > nCoords || (pends == nullptr && nSubPolys != 1)) {
+                tl_floorPlanCtx->invalid = true;
+                return APIERR_BADPARS;
+            }
+            if (static_cast<GSSize> (nSubPolys) > MaxCutFillPolygons ||
+                static_cast<GSSize> (tl_floorPlanCtx->polys.GetSize ()) > MaxCutFillPolygons - static_cast<GSSize> (nSubPolys)) {
+                tl_floorPlanCtx->invalid = true;
+                return APIERR_MEMFULL;
+            }
+            if (coords == nullptr) {
+                tl_floorPlanCtx->invalid = true;
+                return APIERR_BADPARS;
+            }
+            Int32 start = 1;
             for (Int32 sub = 1; sub <= nSubPolys; ++sub) {
                 const Int32 end = (pends != nullptr) ? pends[sub] : nCoords;
+                if (end < start || end > nCoords) {
+                    tl_floorPlanCtx->invalid = true;
+                    return APIERR_BADPARS;
+                }
                 GS::Array<API_Coord> ring;
-                for (Int32 i = start; i <= end; ++i)
+                for (Int32 i = start; i <= end; ++i) {
+                    if (!std::isfinite (coords[i].x) || !std::isfinite (coords[i].y)) {
+                        tl_floorPlanCtx->invalid = true;
+                        return APIERR_BADPARS;
+                    }
                     ring.Push (coords[i]);
+                }
                 if (ring.GetSize () >= 3)
                     tl_floorPlanCtx->polys.Push (ring);
                 start = end + 1;
             }
+            tl_floorPlanCtx->coordinateCount += static_cast<GSSize> (nCoords);
             break;
         }
         default:
             break;
     }
     return NoError;
+    } catch (const std::bad_alloc&) {
+        tl_floorPlanCtx->invalid = true;
+        return APIERR_MEMFULL;
+    } catch (...) {
+        tl_floorPlanCtx->invalid = true;
+        return APIERR_BADPARS;
+    }
+}
+
+static bool IsPureDraftingType (API_ElemTypeID typeID)
+{
+    switch (typeID) {
+        case API_LineID:
+        case API_PolyLineID:
+        case API_ArcID:
+        case API_CircleID:
+        case API_SplineID:
+        case API_TextID:
+        case API_LabelID:
+        case API_HatchID:
+        case API_HotspotID:
+        case API_DrawingID:
+        case API_PictureID:
+        case API_DetailID:
+        case API_WorksheetID:
+        case API_GroupID:
+        case API_CameraID:
+        case API_CamSetID:
+        case API_CutPlaneID:
+        case API_ChangeMarkerID:
+        case API_SectElemID:
+        case API_ElevationID:
+        case API_InteriorElevationID:
+        case API_DimensionID:
+        case API_RadialDimensionID:
+        case API_LevelDimensionID:
+        case API_AngleDimensionID:
+            return true;
+        default:
+            return false;
+    }
 }
 
 static void AddFloorPlanPolygonsIfAvailable (const API_Guid& guid, GS::ObjectState& os)
@@ -531,7 +683,7 @@ static void AddFloorPlanPolygonsIfAvailable (const API_Guid& guid, GS::ObjectSta
 #else
     const GSErrCode fpErr = ACAPI_Element_ShapePrimsExt (elemHead, CollectCutFillPolygons, &params);
 #endif
-    if (fpErr != NoError)
+    if (fpErr != NoError || ctx.invalid)
         return;
     if (ctx.polys.IsEmpty ())
         return;
@@ -550,12 +702,22 @@ static void AddLibPartBasedElementDetails (GS::ObjectState& os, const Int32 libI
 {
     os.Add ("libPartIndex", libInd);
     API_LibPart	lp = {};
+    LibraryPartLocationGuard lpLocationGuard (lp);
     lp.index = libInd;
-    ACAPI_LibraryPart_Get (&lp);
-    os.Add ("libPart", GS::ObjectState (
-        "name", GS::UniString (lp.docu_UName),
-        "parentUnID", CreateGuidObjectState (GS::UnID (lp.parentUnID).GetMainGuid ()),
-        "ownUnID", CreateGuidObjectState (GS::UnID (lp.ownUnID).GetMainGuid ())));
+    const GSErrCode libPartErr = ACAPI_LibraryPart_Get (&lp);
+    if (libPartErr == NoError) {
+        os.Add ("libPart", GS::ObjectState (
+            "name", GS::UniString (lp.docu_UName),
+            "parentUnID", CreateGuidObjectState (GS::UnID (lp.parentUnID).GetMainGuid ()),
+            "ownUnID", CreateGuidObjectState (GS::UnID (lp.ownUnID).GetMainGuid ())));
+    } else {
+        // Do not expose zeroed API_LibPart fields as if they were valid
+        // metadata when the library lookup failed.
+        os.Add ("libPart", GS::ObjectState (
+            "name", GS::EmptyUniString,
+            "parentUnID", CreateGuidObjectState (APINULLGuid),
+            "ownUnID", CreateGuidObjectState (APINULLGuid)));
+    }
 
     if (owner != APINULLGuid) {
         os.Add ("ownerElementId", CreateGuidObjectState (owner));
@@ -584,34 +746,50 @@ static Geometry::Point2d GridMeshVertexToPoint2d (const API_GridMeshVertex& vert
     return Geometry::Point2d (vertex.surfaceParam.x, vertex.surfaceParam.y);
 }
 
-static const API_GridMeshEdge& GetGridMeshEdge (const API_GridMesh& gridMesh, const API_GridEdgeInfo& edgeInfo)
+static const API_GridMeshEdge* GetGridMeshEdge (const API_GridMesh& gridMesh, const API_GridEdgeInfo& edgeInfo)
 {
-    return edgeInfo.mainAxis
-        ? gridMesh.meshEdgesMainAxis[edgeInfo.id]
-        : gridMesh.meshEdgesSecondaryAxis[edgeInfo.id];
+    const auto& edges = edgeInfo.mainAxis ? gridMesh.meshEdgesMainAxis : gridMesh.meshEdgesSecondaryAxis;
+    if (!edges.ContainsKey (edgeInfo.id))
+        return nullptr;
+    return &edges[edgeInfo.id];
 }
 
-static std::pair<API_Coord, API_Coord> GetFrameSurfaceParamCoords (const API_CWFrameType& cwFrame, const API_GridMesh& ownerGridMesh)
+static bool GetFrameSurfaceParamCoords (
+    const API_CWFrameType& cwFrame,
+    const API_GridMesh& ownerGridMesh,
+    API_Coord& begCoord,
+    API_Coord& endCoord)
 {
     const API_Coord& begRel = cwFrame.begRel;
     const API_Coord& endRel = cwFrame.endRel;
+    if (!ownerGridMesh.meshPolygons.ContainsKey (cwFrame.cellID))
+        return false;
     const API_GridMeshPolygon& gridMeshPolygon = ownerGridMesh.meshPolygons[cwFrame.cellID];
-    std::vector<API_GridElemID> polygonCoordsIDs;
-    const API_GridMeshEdge& edgeX = GetGridMeshEdge(ownerGridMesh, gridMeshPolygon.edges[0]);
-    const API_GridMeshEdge& edgeY = GetGridMeshEdge(ownerGridMesh, gridMeshPolygon.edges[1]);
-    const Geometry::Point2d vX1 = GridMeshVertexToPoint2d(ownerGridMesh.meshVertices[edgeX.begID]);
-    const Geometry::Point2d vX2 = GridMeshVertexToPoint2d(ownerGridMesh.meshVertices[edgeX.endID]);
-    const Geometry::Point2d vY1 = GridMeshVertexToPoint2d(ownerGridMesh.meshVertices[edgeY.begID]);
-    const Geometry::Point2d vY2 = GridMeshVertexToPoint2d(ownerGridMesh.meshVertices[edgeY.endID]);
+    const API_GridMeshEdge* edgeX = GetGridMeshEdge (ownerGridMesh, gridMeshPolygon.edges[0]);
+    const API_GridMeshEdge* edgeY = GetGridMeshEdge (ownerGridMesh, gridMeshPolygon.edges[1]);
+    if (edgeX == nullptr || edgeY == nullptr ||
+        !ownerGridMesh.meshVertices.ContainsKey (edgeX->begID) ||
+        !ownerGridMesh.meshVertices.ContainsKey (edgeX->endID) ||
+        !ownerGridMesh.meshVertices.ContainsKey (edgeY->begID) ||
+        !ownerGridMesh.meshVertices.ContainsKey (edgeY->endID)) {
+        return false;
+    }
+    const Geometry::Point2d vX1 = GridMeshVertexToPoint2d (ownerGridMesh.meshVertices[edgeX->begID]);
+    const Geometry::Point2d vX2 = GridMeshVertexToPoint2d (ownerGridMesh.meshVertices[edgeX->endID]);
+    const Geometry::Point2d vY1 = GridMeshVertexToPoint2d (ownerGridMesh.meshVertices[edgeY->begID]);
+    const Geometry::Point2d vY2 = GridMeshVertexToPoint2d (ownerGridMesh.meshVertices[edgeY->endID]);
     const Geometry::Point2d& cellOrigo = vX1;
     const Geometry::Vector2d vX = vX2 - vX1;
     const Geometry::Vector2d vY = vY2 - vY1;
-    return {API_Coord {cellOrigo.x + vX.x * begRel.x + vY.x * begRel.x, cellOrigo.y + vX.y * begRel.y + vY.y * begRel.y},
-            API_Coord {cellOrigo.x + vX.x * endRel.x + vY.x * endRel.x, cellOrigo.y + vX.y * endRel.y + vY.y * endRel.y}};
+    begCoord = API_Coord {cellOrigo.x + vX.x * begRel.x + vY.x * begRel.y, cellOrigo.y + vX.y * begRel.x + vY.y * begRel.y};
+    endCoord = API_Coord {cellOrigo.x + vX.x * endRel.x + vY.x * endRel.y, cellOrigo.y + vX.y * endRel.x + vY.y * endRel.y};
+    return true;
 }
 
 static const API_CWFrameType* FindNextFrameOfPanel (std::vector<const API_CWFrameType*>& framePtrs, std::vector<API_Coord3D>& polygonCoords)
 {
+    if (polygonCoords.empty ())
+        return nullptr;
     for (auto it = framePtrs.begin (); it != framePtrs.end (); ++it) {
         const API_CWFrameType* framePtr = *it;
         if (IsSame3DCoordinate (polygonCoords.back (), framePtr->begC)) {
@@ -651,8 +829,24 @@ static GS::ObjectState CreateUnavailableElementDetails (const GS::ObjectState* e
 
 GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl& /*processControl*/) const
 {
+    PerfTrace::ResetAccumulator ();
+    std::chrono::steady_clock::time_point perfTraceStart = std::chrono::steady_clock::now ();
+
     GS::Array<GS::ObjectState> elements;
     parameters.Get ("elements", elements);
+    Int32 pageSize = std::numeric_limits<Int32>::max ();
+    if (!ReadNativePageSize (parameters, pageSize, pageSize))
+        return CreateErrorResponse (APIERR_BADPARS, "pageSize must be a positive integer.");
+    if (elements.GetSize () > static_cast<GS::USize> (pageSize)) {
+        return CreateNativePageRequiredResponse (
+            "The details request requires another page; no partial details were returned.",
+            static_cast<Int32> (elements.GetSize ()),
+            0);
+    }
+
+    GS::UniString detailProfile;
+    parameters.Get ("detailProfile", detailProfile);
+    const bool draftingProfile = detailProfile == "drafting";
 
     GS::ObjectState response;
     const auto& detailsOfElements = response.AddList<GS::ObjectState> ("detailsOfElements");
@@ -668,7 +862,11 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
 
         API_Element elem = {};
         elem.header.guid = GetGuidFromObjectState (*elementId);
-        GSErrCode err = ACAPI_Element_Get (&elem);
+        GSErrCode err;
+        {
+            PerfTrace::ScopeTimer timer (PerfTrace::Phase::ElementGet);
+            err = ACAPI_Element_Get (&elem);
+        }
 
         if (err != NoError) {
             detailsOfElements (CreateUnavailableElementDetails (elementId, "Failed to get the details of element"));
@@ -677,26 +875,46 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
 
         GS::ObjectState detailsOfElement;
         const API_ElemTypeID typeID = GetElemTypeId (elem.header);
+        const GS::UniString typeName = GetElementTypeNonLocalizedName (typeID);
+        PerfTrace::ScopeTimer typeTimer (typeName);     // per-type timer for the rest of the loop body
 
-        detailsOfElement.Add ("type", GetElementTypeNonLocalizedName (typeID));
+        detailsOfElement.Add ("type", typeName);
         detailsOfElement.Add ("elementId", CreateGuidObjectState (elem.header.guid));
         detailsOfElement.Add ("floorIndex", elem.header.floorInd);
-        detailsOfElement.Add ("layerIndex", GetAttributeIndex (elem.header.layer));
-        detailsOfElement.Add ("drawIndex", static_cast<short> (elem.header.drwIndex));
+
+        if (!draftingProfile) {
+            Int32 layerIndex;
+            {
+                PerfTrace::ScopeTimer timer (PerfTrace::Phase::AttrLookup);
+                layerIndex = GetAttributeIndex (elem.header.layer);
+            }
+            detailsOfElement.Add ("layerIndex", layerIndex);
+            detailsOfElement.Add ("drawIndex", static_cast<short> (elem.header.drwIndex));
+        }
 
         {
             API_ElementMemo memo = {};
             const GS::OnExit guard ([&memo] () { ACAPI_DisposeElemMemoHdls (&memo); });
-            ACAPI_Element_GetMemo (elem.header.guid, &memo, APIMemoMask_ElemInfoString);
+            {
+                PerfTrace::ScopeTimer timer (PerfTrace::Phase::MemoInfo);
+                ACAPI_Element_GetMemo (elem.header.guid, &memo, APIMemoMask_ElemInfoString);
+            }
 
-            detailsOfElement.Add ("id", memo.elemInfoString != nullptr ? *memo.elemInfoString : GS::EmptyUniString);
+            detailsOfElement.Add ("id", memo.elemInfoString != nullptr
+                ? *memo.elemInfoString
+                : GS::EmptyUniString);
         }
 
         {
             API_Elem_Head elemHead = {};
             elemHead.guid = elem.header.guid;
             API_Box3D bounds = {};
-            if (ACAPI_Element_CalcBounds (&elemHead, &bounds) == NoError) {
+            GSErrCode calcBoundsErr;
+            {
+                PerfTrace::ScopeTimer timer (PerfTrace::Phase::CalcBounds);
+                calcBoundsErr = ACAPI_Element_CalcBounds (&elemHead, &bounds);
+            }
+            if (calcBoundsErr == NoError && IsFiniteBounds (bounds)) {
                 detailsOfElement.Add ("bounds", GS::ObjectState (
                     "xMin", bounds.xMin,
                     "yMin", bounds.yMin,
@@ -720,7 +938,10 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                     case APIWtyp_Poly:
                         {
                             typeSpecificDetails.Add ("geometryType", "Polygonal");
-                            AddPolygonFromMemoCoords (elem.header.guid, typeSpecificDetails, "polygonOutline", "polygonArcs");
+                            {
+                                PerfTrace::ScopeTimer timer (PerfTrace::Phase::TypeMemo);
+                                AddPolygonFromMemoCoords (elem.header.guid, typeSpecificDetails, "polygonOutline", "polygonArcs");
+                            }
                             break;
                         }
                 }
@@ -731,6 +952,10 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                 typeSpecificDetails.Add ("height", elem.wall.height);
                 typeSpecificDetails.Add ("bottomOffset", elem.wall.bottomOffset);
                 typeSpecificDetails.Add ("offset", elem.wall.offset);
+                typeSpecificDetails.Add ("referenceLineLocation", WallReferenceLineLocationToString (elem.wall.referenceLineLocation));
+                typeSpecificDetails.Add ("offsetFromOutside", elem.wall.offsetFromOutside);
+                typeSpecificDetails.Add ("sequence", elem.wall.sequence);
+                typeSpecificDetails.Add ("zoneRelation", WallZoneRelationToString (elem.wall.zoneRel));
                 typeSpecificDetails.Add ("flipped", elem.wall.flipped);
                 if (elem.wall.type == APIWtyp_Poly) {
                     typeSpecificDetails.Add ("begThickness", 0);
@@ -740,7 +965,12 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                     typeSpecificDetails.Add ("endThickness", elem.wall.thickness1);
                 }
                 if (StructureTypeToString (elem.wall.modelElemStructureType) == "Composite") {
-                    typeSpecificDetails.Add ("compositeId", CreateGuidObjectState (GetAttributeGuidFromIndex (API_CompWallID, elem.wall.composite)));
+                    API_Guid compositeGuid;
+                    {
+                        PerfTrace::ScopeTimer timer (PerfTrace::Phase::AttrLookup);
+                        compositeGuid = GetAttributeGuidFromIndex (API_CompWallID, elem.wall.composite);
+                    }
+                    typeSpecificDetails.Add ("compositeId", CreateGuidObjectState (compositeGuid));
                 }
                 break;
 
@@ -761,19 +991,32 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                 typeSpecificDetails.Add ("level", elem.slab.level);
                 typeSpecificDetails.Add ("offsetFromTop", elem.slab.offsetFromTop);
                 typeSpecificDetails.Add ("zCoordinate", GetZPos (elem.header.floorInd, elem.slab.level, stories));
-                AddPolygonWithHolesFromMemoCoords (elem.header.guid, typeSpecificDetails, "polygonOutline", "polygonArcs", "holes", "polygonOutline", "polygonArcs");
+                {
+                    PerfTrace::ScopeTimer timer (PerfTrace::Phase::TypeMemo);
+                    AddPolygonWithHolesFromMemoCoords (elem.header.guid, typeSpecificDetails, "polygonOutline", "polygonArcs", "holes", "polygonOutline", "polygonArcs");
+                }
                 break;
 
             case API_ZoneID:
                 typeSpecificDetails.Add ("name", GS::UniString (elem.zone.roomName));
                 typeSpecificDetails.Add ("numberStr", GS::UniString (elem.zone.roomNoStr));
-                typeSpecificDetails.Add ("categoryAttributeId", CreateGuidObjectState (GetAttributeGuidFromIndex (API_ZoneCatID, elem.zone.catInd)));
+                {
+                    API_Guid categoryAttributeGuid;
+                    {
+                        PerfTrace::ScopeTimer timer (PerfTrace::Phase::AttrLookup);
+                        categoryAttributeGuid = GetAttributeGuidFromIndex (API_ZoneCatID, elem.zone.catInd);
+                    }
+                    typeSpecificDetails.Add ("categoryAttributeId", CreateGuidObjectState (categoryAttributeGuid));
+                }
                 typeSpecificDetails.Add ("stampPosition", Create2DCoordinateObjectState (elem.zone.pos));
                 typeSpecificDetails.Add ("stampAngle", elem.zone.stampAngle);
                 typeSpecificDetails.Add ("fixedStampAngle", elem.zone.fixedAngle);
                 typeSpecificDetails.Add ("isManual", elem.zone.manual);
                 typeSpecificDetails.Add ("zCoordinate", GetZPos (elem.header.floorInd, elem.zone.roomBaseLev, stories));
-                AddPolygonWithHolesFromMemoCoords (elem.header.guid, typeSpecificDetails, "polygonOutline", "polygonArcs", "holes", "polygonOutline", "polygonArcs");
+                {
+                    PerfTrace::ScopeTimer timer (PerfTrace::Phase::TypeMemo);
+                    AddPolygonWithHolesFromMemoCoords (elem.header.guid, typeSpecificDetails, "polygonOutline", "polygonArcs", "holes", "polygonOutline", "polygonArcs");
+                }
                 break;
 
             case API_HatchID:
@@ -789,7 +1032,10 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                 typeSpecificDetails.Add ("buildingMaterialIndex", GetAttributeIndex (elem.hatch.buildingMaterial));
                 typeSpecificDetails.Add ("hasForegroundRGB", (elem.hatch.hatchFlags & APIHatch_HasFgRGBColor) != 0);
                 typeSpecificDetails.Add ("hasBackgroundRGB", (elem.hatch.hatchFlags & APIHatch_HasBkgRGBColor) != 0);
-                AddPolygonWithHolesFromMemoCoords (elem.header.guid, typeSpecificDetails, "polygonOutline", "polygonArcs", "holes", "polygonOutline", "polygonArcs");
+                {
+                    PerfTrace::ScopeTimer timer (PerfTrace::Phase::TypeMemo);
+                    AddPolygonWithHolesFromMemoCoords (elem.header.guid, typeSpecificDetails, "polygonOutline", "polygonArcs", "holes", "polygonOutline", "polygonArcs");
+                }
                 break;
 
             case API_OpeningID:
@@ -817,7 +1063,10 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
 
             case API_DoorID:
             case API_WindowID:
-                AddLibPartBasedElementDetails (typeSpecificDetails, elem.window.openingBase.libInd, elem.window.owner);
+                {
+                    PerfTrace::ScopeTimer timer (PerfTrace::Phase::LibPart);
+                    AddLibPartBasedElementDetails (typeSpecificDetails, elem.window.openingBase.libInd, elem.window.owner);
+                }
                 typeSpecificDetails.Add ("width", elem.window.openingBase.width);
                 typeSpecificDetails.Add ("height", elem.window.openingBase.height);
                 typeSpecificDetails.Add ("sillHeight", elem.window.lower);
@@ -841,7 +1090,10 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                 break;
 
             case API_LabelID:
-                AddLibPartBasedElementDetails (typeSpecificDetails, ((elem.label.labelClass == APILblClass_Symbol) ? elem.label.u.symbol.libInd : -1), elem.label.parent, GetElemTypeId (elem.label.parentType));
+                {
+                    PerfTrace::ScopeTimer timer (PerfTrace::Phase::LibPart);
+                    AddLibPartBasedElementDetails (typeSpecificDetails, ((elem.label.labelClass == APILblClass_Symbol) ? elem.label.u.symbol.libInd : -1), elem.label.parent, GetElemTypeId (elem.label.parentType));
+                }
                 typeSpecificDetails.Add ("begCoordinate", Create2DCoordinateObjectState (elem.label.begC));
                 typeSpecificDetails.Add ("midCoordinate", Create2DCoordinateObjectState (elem.label.midC));
                 typeSpecificDetails.Add ("endCoordinate", Create2DCoordinateObjectState (elem.label.endC));
@@ -855,18 +1107,33 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
 #else
                 auto ownerType = elem.object.ownerID;
 #endif
-                AddLibPartBasedElementDetails (typeSpecificDetails, elem.object.libInd, elem.object.owner, GetElemTypeId (ownerType));
+                {
+                    PerfTrace::ScopeTimer timer (PerfTrace::Phase::LibPart);
+                    AddLibPartBasedElementDetails (typeSpecificDetails, elem.object.libInd, elem.object.owner, GetElemTypeId (ownerType));
+                }
                 typeSpecificDetails.Add ("origin", Create3DCoordinateObjectState ({elem.object.pos.x, elem.object.pos.y, GetZPos (elem.header.floorInd, elem.object.level, stories)}));
                 double zDimension = 0.0;
                 API_ElementMemo objectMemo = {};
                 const GS::OnExit objectMemoGuard ([&objectMemo] () { ACAPI_DisposeElemMemoHdls (&objectMemo); });
-                ACAPI_Element_GetMemo(elem.header.guid, &objectMemo, APIMemoMask_AddPars);
-                const GSSize nParams = BMGetHandleSize ((GSHandle) objectMemo.params) / sizeof (API_AddParType);
-                for (GSIndex ii = 0; ii < nParams; ++ii) {
-                    API_AddParType& actParam = (*objectMemo.params)[ii];
+                GSErrCode objectMemoErr;
+                {
+                    PerfTrace::ScopeTimer timer (PerfTrace::Phase::TypeMemo);
+                    objectMemoErr = ACAPI_Element_GetMemo (elem.header.guid, &objectMemo, APIMemoMask_AddPars);
+                }
+                constexpr GSSize maxObjectParameters = 10'000;
+                GSSize nParams = 0;
+                if (objectMemoErr == NoError && objectMemo.params != nullptr && *objectMemo.params != nullptr) {
+                    const GSSize paramsBytes = BMhGetSize (reinterpret_cast<GSHandle> (objectMemo.params));
+                    if (paramsBytes > 0 && paramsBytes % static_cast<GSSize> (sizeof (API_AddParType)) == 0 &&
+                        paramsBytes <= maxObjectParameters * static_cast<GSSize> (sizeof (API_AddParType))) {
+                        nParams = paramsBytes / static_cast<GSSize> (sizeof (API_AddParType));
+                    }
+                }
+                for (GSIndex ii = 0; ii < nParams && ii < maxObjectParameters; ++ii) {
+                    const API_AddParType& actParam = (*objectMemo.params)[ii];
 
                     const GS::String name(actParam.name);
-                    if (name == "ZZYZX") {
+                    if (name == "ZZYZX" && std::isfinite (actParam.value.real)) {
                         zDimension = actParam.value.real;
                         break;
                     }
@@ -884,7 +1151,10 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                 typeSpecificDetails.Add ("detailIdStr", GS::UniString (elem.detail.detailIdStr));
                 typeSpecificDetails.Add ("isHorizontalMarker", elem.detail.horizontalMarker);
                 typeSpecificDetails.Add ("isWindowOpened", elem.detail.windOpened);
-                AddPolygonFromMemoCoords (elem.header.guid, typeSpecificDetails, "clipPolygon");
+                {
+                    PerfTrace::ScopeTimer timer (PerfTrace::Phase::TypeMemo);
+                    AddPolygonFromMemoCoords (elem.header.guid, typeSpecificDetails, "clipPolygon");
+                }
                 GS::ObjectState linkDataOS;
                 switch (elem.detail.linkData.referringLevel) {
                     case API_ReferringLevel::ReferredToView:
@@ -903,8 +1173,12 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
             } break;
 
             case API_PolyLineID: {
-                AddPolygonFromMemoCoords (elem.header.guid, typeSpecificDetails, "coordinates", "arcs");
-                typeSpecificDetails.Add ("zCoordinate", GetZPos (elem.header.floorInd, 0, stories));
+                {
+                    PerfTrace::ScopeTimer timer (PerfTrace::Phase::TypeMemo);
+                    AddPolygonFromMemoCoords (elem.header.guid, typeSpecificDetails, "coordinates", "arcs");
+                }
+                if (!draftingProfile)
+                    typeSpecificDetails.Add ("zCoordinate", GetZPos (elem.header.floorInd, 0, stories));
                 typeSpecificDetails.Add ("arrowData", CreateArrowDataObjectState (elem.polyLine.arrowData));
             } break;
 
@@ -929,26 +1203,70 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
             case API_CurtainWallPanelID: {
                 API_Element ownerCW = {};
                 ownerCW.header.guid = elem.cwPanel.owner;
-                ACAPI_Element_Get(&ownerCW);
+                if (ACAPI_Element_Get (&ownerCW) != NoError) {
+                    typeSpecificDetails.Add ("error", "Failed to read the Curtain Wall owner.");
+                    break;
+                }
 
                 API_ElementMemo cwMemo = {};
                 const GS::OnExit cwMemoGuard ([&cwMemo] () { ACAPI_DisposeElemMemoHdls (&cwMemo); });
-                ACAPI_Element_GetMemo(ownerCW.header.guid, &cwMemo, APIMemoMask_CWallSegments | APIMemoMask_CWallFrames);
+                GSErrCode cwMemoErr;
+                {
+                    PerfTrace::ScopeTimer timer (PerfTrace::Phase::TypeMemo);
+                    cwMemoErr = ACAPI_Element_GetMemo (ownerCW.header.guid, &cwMemo, APIMemoMask_CWallSegments | APIMemoMask_CWallFrames);
+                }
+                if (cwMemoErr != NoError || cwMemo.cWallSegments == nullptr ||
+                    cwMemo.cWallFrames == nullptr ||
+                    elem.cwPanel.segmentID >= ownerCW.curtainWall.nSegments) {
+                    typeSpecificDetails.Add ("error", "Curtain Wall segment memo data is unavailable or out of range.");
+                    break;
+                }
+                const GSSize segmentBytes = BMGetPtrSize (reinterpret_cast<GSPtr> (cwMemo.cWallSegments));
+                const GSSize frameBytes = BMGetPtrSize (reinterpret_cast<GSPtr> (cwMemo.cWallFrames));
+                if (segmentBytes % sizeof (*cwMemo.cWallSegments) != 0 || frameBytes % sizeof (*cwMemo.cWallFrames) != 0) {
+                    typeSpecificDetails.Add ("error", "Curtain Wall segment/frame memo byte sizes are invalid.");
+                    break;
+                }
+                const GSSize segmentCount = segmentBytes / sizeof (*cwMemo.cWallSegments);
+                const GSSize frameCount = frameBytes / sizeof (*cwMemo.cWallFrames);
+                if (static_cast<GSSize> (elem.cwPanel.segmentID) >= segmentCount || frameCount == 0) {
+                    typeSpecificDetails.Add ("error", "Curtain Wall segment/frame memo bounds are invalid.");
+                    break;
+                }
                 const API_Guid ownerCWSegment = cwMemo.cWallSegments[elem.cwPanel.segmentID].head.guid;
 
                 API_ElementMemo cwSegmentMemo = {};
                 const GS::OnExit cwSegmentMemoGuard ([&cwSegmentMemo] () { ACAPI_DisposeElemMemoHdls (&cwSegmentMemo); });
-                ACAPI_Element_GetMemo(ownerCWSegment, &cwSegmentMemo, APIMemoMask_CWSegGridMesh);
+                GSErrCode cwSegmentMemoErr;
+                {
+                    PerfTrace::ScopeTimer timer (PerfTrace::Phase::TypeMemo);
+                    cwSegmentMemoErr = ACAPI_Element_GetMemo (ownerCWSegment, &cwSegmentMemo, APIMemoMask_CWSegGridMesh);
+                }
+                if (cwSegmentMemoErr != NoError || cwSegmentMemo.cWSegGridMesh == nullptr) {
+                    typeSpecificDetails.Add ("error", "Curtain Wall grid mesh memo data is unavailable.");
+                    break;
+                }
                 const API_GridMesh& ownerGridMesh = *cwSegmentMemo.cWSegGridMesh;
 
                 API_ElementMemo cwPanelMemo = {};
                 const GS::OnExit cwPanelMemoGuard ([&cwPanelMemo] () { ACAPI_DisposeElemMemoHdls (&cwPanelMemo); });
-                ACAPI_Element_GetMemo(elem.header.guid, &cwPanelMemo, APIMemoMask_CWallPanels);
+                GSErrCode cwPanelMemoErr;
+                {
+                    PerfTrace::ScopeTimer timer (PerfTrace::Phase::TypeMemo);
+                    cwPanelMemoErr = ACAPI_Element_GetMemo (elem.header.guid, &cwPanelMemo, APIMemoMask_CWallPanels);
+                }
+                if (cwPanelMemoErr != NoError || cwPanelMemo.cWallPanelGridIDTable == nullptr ||
+                    !cwPanelMemo.cWallPanelGridIDTable->ContainsKey (elem.header.guid)) {
+                    typeSpecificDetails.Add ("error", "Curtain Wall panel grid mapping is unavailable.");
+                    break;
+                }
                 const GS::HashTable<API_Guid, GS::Array<API_GridElemID>>& cWallPanelGridIDTable = *cwPanelMemo.cWallPanelGridIDTable;
 
                 const GS::Array<API_GridElemID>& gridIDs = cWallPanelGridIDTable[elem.header.guid];
                 GS::Array<API_GridElemID> gridMeshPolygonIDs = gridIDs;
                 for (const API_GridElemID& polygonID : gridIDs) {
+                    if (!ownerGridMesh.meshPolygons.ContainsKey (polygonID))
+                        continue;
                     const API_GridMeshPolygon& gridMeshPolygon = ownerGridMesh.meshPolygons[polygonID];
                     gridMeshPolygonIDs.Append (gridMeshPolygon.neighbourIDs[API_GridMeshDirection::API_GridMeshRight]);
                     gridMeshPolygonIDs.Append (gridMeshPolygon.neighbourIDs[API_GridMeshDirection::API_GridMeshUpper]);
@@ -959,17 +1277,24 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                 std::vector<const API_CWFrameType*> framePtrs;
                 {
                     std::vector<const API_CWFrameType*> cornerFramesOfNextSegment;
-                    for (UIndex i = 0; i < ownerCW.curtainWall.nFrames; ++i) {
+                    const UIndex availableFrameCount = static_cast<UIndex> (frameCount);
+                    const UIndex frameLimit = ownerCW.curtainWall.nFrames < availableFrameCount
+                        ? ownerCW.curtainWall.nFrames
+                        : availableFrameCount;
+                    for (UIndex i = 0; i < frameLimit; ++i) {
                         const API_CWFrameType& frame = cwMemo.cWallFrames[i];
                         if (frame.segmentID == elem.cwPanel.segmentID) {
                             if (gridMeshPolygonIDs.Contains (frame.cellID)) {
-                                for (GSIndex i = 0; i < panelSurfaceCoords.size () - 1; ++i) {
+                                for (GSIndex i = 0; i + 1 < panelSurfaceCoords.size (); ++i) {
                                     const API_Coord& c1 = panelSurfaceCoords[i];
                                     const API_Coord& c2 = panelSurfaceCoords[i + 1];
-                                    auto frameSurfaceCoords = GetFrameSurfaceParamCoords (frame, ownerGridMesh);
+                                    API_Coord frameBegCoord = {};
+                                    API_Coord frameEndCoord = {};
+                                    if (!GetFrameSurfaceParamCoords (frame, ownerGridMesh, frameBegCoord, frameEndCoord))
+                                        continue;
 
-                                    if ((IsSame2DCoordinate (frameSurfaceCoords.first, c1) && IsSame2DCoordinate (frameSurfaceCoords.second, c2)) ||
-                                        (IsSame2DCoordinate (frameSurfaceCoords.first, c2) && IsSame2DCoordinate (frameSurfaceCoords.second, c1))) {
+                                    if ((IsSame2DCoordinate (frameBegCoord, c1) && IsSame2DCoordinate (frameEndCoord, c2)) ||
+                                        (IsSame2DCoordinate (frameBegCoord, c2) && IsSame2DCoordinate (frameEndCoord, c1))) {
                                         framePtrs.push_back (&frame);
                                         break;
                                     }
@@ -1046,24 +1371,59 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                 typeSpecificDetails.Add ("levelPen",     (Int32)elem.mesh.levelPen);
                 typeSpecificDetails.Add ("lineTypeIndex", GetAttributeIndex (elem.mesh.ltypeInd));
                 constexpr bool includeZCoords = true;
-                AddPolygonWithHolesFromMemoCoords (elem.header.guid, typeSpecificDetails, "polygonCoordinates", "polygonArcs", "holes", "polygonCoordinates", "polygonArcs", includeZCoords);
+                {
+                    PerfTrace::ScopeTimer timer (PerfTrace::Phase::TypeMemo);
+                    AddPolygonWithHolesFromMemoCoords (elem.header.guid, typeSpecificDetails, "polygonCoordinates", "polygonArcs", "holes", "polygonCoordinates", "polygonArcs", includeZCoords);
+                }
                 if (elem.mesh.levelLines.nSubLines > 0) {
                     API_ElementMemo memo = {};
                     const GS::OnExit guard ([&memo] () { ACAPI_DisposeElemMemoHdls (&memo); });
-                    if (ACAPI_Element_GetMemo (elem.header.guid, &memo, APIMemoMask_MeshLevel) == NoError && memo.meshLevelCoords != nullptr && memo.meshLevelEnds != nullptr) {
-                        const auto& sublines = typeSpecificDetails.AddList<GS::ObjectState> ("sublines");
-                        const GSSize nSublines = BMhGetSize (reinterpret_cast<GSHandle> (memo.meshLevelEnds)) / sizeof (Int32);
-                        Int32 iCoord = 0;
-                        for (Int32 i = 0; i < nSublines; ++i) {
-                            GS::ObjectState subline;
-                            const auto& coordinates = subline.AddList<GS::ObjectState> ("coordinates");
+                    GSErrCode meshMemoErr;
+                    {
+                        PerfTrace::ScopeTimer timer (PerfTrace::Phase::TypeMemo);
+                        meshMemoErr = ACAPI_Element_GetMemo (elem.header.guid, &memo, APIMemoMask_MeshLevel);
+                    }
+                    if (meshMemoErr == NoError && memo.meshLevelCoords != nullptr && *memo.meshLevelCoords != nullptr &&
+                        memo.meshLevelEnds != nullptr && *memo.meshLevelEnds != nullptr) {
+                        constexpr GSSize maxMeshLevelCoords = 1'000'000;
+                        constexpr GSSize maxMeshLevelSublines = 100'000;
+                        const GSSize endsBytes = BMhGetSize (reinterpret_cast<GSHandle> (memo.meshLevelEnds));
+                        const GSSize coordsBytes = BMhGetSize (reinterpret_cast<GSHandle> (memo.meshLevelCoords));
+                        const Int32 requestedSublines = elem.mesh.levelLines.nSubLines;
+                        if (endsBytes % sizeof (Int32) != 0 || coordsBytes % sizeof (API_MeshLevelCoord) != 0 ||
+                            requestedSublines <= 0 ||
+                            static_cast<GSSize> (requestedSublines) > maxMeshLevelSublines ||
+                            coordsBytes / sizeof (API_MeshLevelCoord) > maxMeshLevelCoords ||
+                            endsBytes / sizeof (Int32) < static_cast<GSSize> (requestedSublines)) {
+                            typeSpecificDetails.Add ("error", "Mesh level memo array sizes are invalid.");
+                        } else {
+                            const auto& sublines = typeSpecificDetails.AddList<GS::ObjectState> ("sublines");
+                            const GSSize nSublines = static_cast<GSSize> (requestedSublines);
+                            const GSSize nLevelCoords = coordsBytes / sizeof (API_MeshLevelCoord);
+                            Int32 iCoord = 0;
+                            bool invalidMeshCoordinate = false;
+                            for (GSSize i = 0; i < nSublines; ++i) {
+                                GS::ObjectState subline;
+                                const auto& coordinates = subline.AddList<GS::ObjectState> ("coordinates");
 
-                            const Int32 nCoords = (*memo.meshLevelEnds)[i];
-                            for (; iCoord < nCoords; ++iCoord) {
-                                const API_MeshLevelCoord& coord = (*memo.meshLevelCoords)[iCoord];
-                                coordinates (Create3DCoordinateObjectState (coord.c));
+                                const Int32 nCoords = (*memo.meshLevelEnds)[i];
+                                if (nCoords < iCoord || static_cast<GSSize> (nCoords) > nLevelCoords) {
+                                    typeSpecificDetails.Add ("error", "Mesh level memo contains an invalid subline endpoint.");
+                                    break;
+                                }
+                                for (; iCoord < nCoords; ++iCoord) {
+                                    const API_MeshLevelCoord& coord = (*memo.meshLevelCoords)[iCoord];
+                                    if (!std::isfinite (coord.c.x) || !std::isfinite (coord.c.y) || !std::isfinite (coord.c.z)) {
+                                        typeSpecificDetails.Add ("error", "Mesh level memo contains a non-finite coordinate.");
+                                        invalidMeshCoordinate = true;
+                                        break;
+                                    }
+                                    coordinates (Create3DCoordinateObjectState (coord.c));
+                                }
+                                if (invalidMeshCoordinate)
+                                    break;
+                                sublines (subline);
                             }
-                            sublines (subline);
                         }
                     }
                 }
@@ -1081,64 +1441,93 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                 typeSpecificDetails.Add ("drawingScale",  elem.drawing.drawingScale);
                 typeSpecificDetails.Add ("modelOffset",   Create2DCoordinateObjectState (elem.drawing.modelOffset));
                 typeSpecificDetails.Add ("isCutWithFrame", elem.drawing.isCutWithFrame);
-                typeSpecificDetails.Add ("bounds", GS::ObjectState (
-                    "xMin", elem.drawing.bounds.xMin,
-                    "yMin", elem.drawing.bounds.yMin,
-                    "xMax", elem.drawing.bounds.xMax,
-                    "yMax", elem.drawing.bounds.yMax));
+                if (IsFiniteBounds (elem.drawing.bounds)) {
+                    typeSpecificDetails.Add ("bounds", GS::ObjectState (
+                        "xMin", elem.drawing.bounds.xMin,
+                        "yMin", elem.drawing.bounds.yMin,
+                        "xMax", elem.drawing.bounds.xMax,
+                        "yMax", elem.drawing.bounds.yMax));
+                }
                 if (elem.drawing.isCutWithFrame) {
-                    AddPolygonFromMemoCoords (elem.header.guid, typeSpecificDetails, "clipPolygon");
+                    {
+                        PerfTrace::ScopeTimer timer (PerfTrace::Phase::TypeMemo);
+                        AddPolygonFromMemoCoords (elem.header.guid, typeSpecificDetails, "clipPolygon");
+                    }
                 }
             } break;
 
             case API_LineID: {
                 typeSpecificDetails.Add ("begCoordinate", Create2DCoordinateObjectState (elem.line.begC));
                 typeSpecificDetails.Add ("endCoordinate", Create2DCoordinateObjectState (elem.line.endC));
-                typeSpecificDetails.Add ("lineTypeIndex", GetAttributeIndex (elem.line.ltypeInd));
+                if (!draftingProfile) {
+                    Int32 lineTypeIndex;
+                    {
+                        PerfTrace::ScopeTimer timer (PerfTrace::Phase::AttrLookup);
+                        lineTypeIndex = GetAttributeIndex (elem.line.ltypeInd);
+                    }
+                    typeSpecificDetails.Add ("lineTypeIndex", lineTypeIndex);
+                }
                 typeSpecificDetails.Add ("linePen", static_cast<Int32> (elem.line.linePen.penIndex));
-                typeSpecificDetails.Add ("roomSeparator", elem.line.roomSeparator);
+                if (!draftingProfile)
+                    typeSpecificDetails.Add ("roomSeparator", elem.line.roomSeparator);
                 typeSpecificDetails.Add ("arrowData", CreateArrowDataObjectState (elem.line.arrowData));
             } break;
 
             case API_ArcID:
             case API_CircleID: {
-                typeSpecificDetails.Add ("origin", Create2DCoordinateObjectState (elem.arc.origC));
-                typeSpecificDetails.Add ("radius", elem.arc.r);
-                typeSpecificDetails.Add ("axisAngle", elem.arc.angle);
-                typeSpecificDetails.Add ("ratio", elem.arc.ratio);
-                typeSpecificDetails.Add ("beginAngle", elem.arc.begAng);
-                typeSpecificDetails.Add ("endAngle", elem.arc.endAng);
-                typeSpecificDetails.Add ("reflected", elem.arc.reflected);
+                if (!draftingProfile) {
+                    typeSpecificDetails.Add ("origin", Create2DCoordinateObjectState (elem.arc.origC));
+                    typeSpecificDetails.Add ("radius", elem.arc.r);
+                    typeSpecificDetails.Add ("axisAngle", elem.arc.angle);
+                    typeSpecificDetails.Add ("ratio", elem.arc.ratio);
+                    typeSpecificDetails.Add ("beginAngle", elem.arc.begAng);
+                    typeSpecificDetails.Add ("endAngle", elem.arc.endAng);
+                    typeSpecificDetails.Add ("reflected", elem.arc.reflected);
+                }
                 typeSpecificDetails.Add ("whole", elem.arc.whole);
-                typeSpecificDetails.Add ("lineTypeIndex", GetAttributeIndex (elem.arc.ltypeInd));
+                if (!draftingProfile) {
+                    Int32 arcLineTypeIndex;
+                    {
+                        PerfTrace::ScopeTimer timer (PerfTrace::Phase::AttrLookup);
+                        arcLineTypeIndex = GetAttributeIndex (elem.arc.ltypeInd);
+                    }
+                    typeSpecificDetails.Add ("lineTypeIndex", arcLineTypeIndex);
+                }
                 typeSpecificDetails.Add ("linePen", static_cast<Int32> (elem.arc.linePen.penIndex));
-                typeSpecificDetails.Add ("roomSeparator", elem.arc.roomSeparator);
+                if (!draftingProfile)
+                    typeSpecificDetails.Add ("roomSeparator", elem.arc.roomSeparator);
                 typeSpecificDetails.Add ("arrowData", CreateArrowDataObjectState (elem.arc.arrowData));
             } break;
 
             case API_TextID: {
-                typeSpecificDetails.Add ("anchorCoordinate", Create2DCoordinateObjectState (elem.text.loc));
                 typeSpecificDetails.Add ("angle", elem.text.angle);
-                typeSpecificDetails.Add ("width", elem.text.width);
-                typeSpecificDetails.Add ("height", elem.text.height);
                 typeSpecificDetails.Add ("size", elem.text.size);
                 typeSpecificDetails.Add ("fontIndex", static_cast<Int32> (elem.text.font));
-                typeSpecificDetails.Add ("anchor", static_cast<Int32> (elem.text.anchor));
-                typeSpecificDetails.Add ("justification", static_cast<Int32> (elem.text.just));
-                typeSpecificDetails.Add ("fixedAngle", elem.text.fixedAngle);
-                typeSpecificDetails.Add ("fixedSize", elem.text.fixedSize);
-                typeSpecificDetails.Add ("lineCount", elem.text.nLine);
                 typeSpecificDetails.Add ("pen", static_cast<Int32> (elem.text.pen));
+                if (!draftingProfile) {
+                    typeSpecificDetails.Add ("anchorCoordinate", Create2DCoordinateObjectState (elem.text.loc));
+                    typeSpecificDetails.Add ("width", elem.text.width);
+                    typeSpecificDetails.Add ("height", elem.text.height);
+                    typeSpecificDetails.Add ("anchor", static_cast<Int32> (elem.text.anchor));
+                    typeSpecificDetails.Add ("justification", static_cast<Int32> (elem.text.just));
+                    typeSpecificDetails.Add ("fixedAngle", elem.text.fixedAngle);
+                    typeSpecificDetails.Add ("fixedSize", elem.text.fixedSize);
+                    typeSpecificDetails.Add ("lineCount", elem.text.nLine);
+                }
 
                 API_ElementMemo memo = {};
                 const GS::OnExit guard ([&memo] () { ACAPI_DisposeElemMemoHdls (&memo); });
-                if (ACAPI_Element_GetMemo (elem.header.guid, &memo, APIMemoMask_TextContent) == NoError && memo.textContent != nullptr) {
-#ifdef ServerMainVers_2800
-                    typeSpecificDetails.Add ("content", *memo.textContent);
-#else
-                    typeSpecificDetails.Add ("content", GS::UniString (reinterpret_cast<GS::uchar_t*> (*memo.textContent)));
-#endif
+                GSErrCode textMemoErr;
+                {
+                    PerfTrace::ScopeTimer timer (PerfTrace::Phase::TypeMemo);
+                    // TextContent is the ANSI/UTF-8 memo. Request the Unicode
+                    // variant because the AC28 API exposes textContent as a
+                    // GS::UniString*; reading the ANSI buffer as that object
+                    // turns UTF-8 bytes into CJK-like UTF-16 mojibake.
+                    textMemoErr = ACAPI_Element_GetMemo (elem.header.guid, &memo, APIMemoMask_TextContentUni);
                 }
+                if (!AddBoundedTextContent (typeSpecificDetails, memo, textMemoErr))
+                    typeSpecificDetails.Add ("contentStatus", "unavailable");
             } break;
 
             default:
@@ -1147,10 +1536,18 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
         }
 
         detailsOfElement.Add ("details", typeSpecificDetails);
-        AddFloorPlanPolygonsIfAvailable (elem.header.guid, detailsOfElement);
+        {
+            PerfTrace::ScopeTimer timer (PerfTrace::Phase::ShapePrims);
+            if (!IsPureDraftingType (typeID))
+                AddFloorPlanPolygonsIfAvailable (elem.header.guid, detailsOfElement);
+        }
 
         detailsOfElements (detailsOfElement);
     }
+
+    PerfTrace::SetRequestedReturned (static_cast<int> (elements.GetSize ()), static_cast<int> (elements.GetSize ()));
+    const double totalMs = std::chrono::duration<double, std::milli> (std::chrono::steady_clock::now () - perfTraceStart).count ();
+    PerfTrace::WriteLine (GS::UniString (GetName ()), PerfTrace::NextSeq (), totalMs);
 
     return response;
 }
@@ -1571,6 +1968,7 @@ GS::ObjectState SetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
             }
 
             API_ElementMemo clipMemo = {};
+            const GS::OnExit clipMemoGuard ([&clipMemo] () { ACAPI_DisposeElemMemoHdls (&clipMemo); });
             UInt64 memoMask = 0;
             bool hasMemoChanges = false;
 
@@ -1584,18 +1982,31 @@ GS::ObjectState SetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                         if (first.x == last.x && first.y == last.y)
                             clipCoords.Pop ();
                     }
-                    const Int32 nUnique = clipCoords.GetSize ();
+                    if (static_cast<GSSize> (clipCoords.GetSize ()) > static_cast<GSSize> (std::numeric_limits<Int32>::max () - 1)) {
+                        executionResults (CreateFailedExecutionResult (APIERR_BADPARS, "Drawing clip polygon is too large."));
+                        continue;
+                    }
+                    const Int32 nUnique = static_cast<Int32> (clipCoords.GetSize ());
                     // AC polygon convention: coords[1..nUnique] = vertices, coords[nUnique+1] = closing duplicate of coords[1]
                     // Handle size = nUnique+2 (index 0 unused, 1..nUnique vertices, nUnique+1 closing)
-                    clipMemo.coords = reinterpret_cast<API_Coord**> (BMAllocateHandle ((nUnique + 2) * sizeof (API_Coord), ALLOCATE_CLEAR, 0));
-                    clipMemo.pends  = reinterpret_cast<Int32**>     (BMAllocateHandle (2 * sizeof (Int32), ALLOCATE_CLEAR, 0));
-                    if (clipMemo.coords != nullptr && clipMemo.pends != nullptr) {
+                    const GSSize coordCount = static_cast<GSSize> (nUnique) + 2;
+                    if (coordCount > std::numeric_limits<GSSize>::max () / sizeof (API_Coord)) {
+                        executionResults (CreateFailedExecutionResult (APIERR_BADPARS, "Drawing clip polygon is too large."));
+                        continue;
+                    }
+                    clipMemo.coords = reinterpret_cast<API_Coord**> (BMAllocateHandle (coordCount * sizeof (API_Coord), ALLOCATE_CLEAR, 0));
+                    clipMemo.pends  = reinterpret_cast<Int32**>     (BMAllocateHandle (static_cast<GSSize> (2) * sizeof (Int32), ALLOCATE_CLEAR, 0));
+                    if (clipMemo.coords != nullptr && *clipMemo.coords != nullptr &&
+                        clipMemo.pends != nullptr && *clipMemo.pends != nullptr) {
                         for (Int32 i = 0; i < nUnique; ++i)
                             (*clipMemo.coords)[i + 1] = Get2DCoordinateFromObjectState (clipCoords[i]);
                         (*clipMemo.coords)[nUnique + 1] = (*clipMemo.coords)[1]; // closing vertex
                         (*clipMemo.pends)[1] = nUnique + 1;
                         memoMask = APIMemoMask_Polygon;
                         hasMemoChanges = true;
+                    } else {
+                        executionResults (CreateFailedExecutionResult (APIERR_MEMFULL, "Failed to allocate drawing clip polygon memo data."));
+                        continue;
                     }
                 }
             }
@@ -1605,7 +2016,6 @@ GS::ObjectState SetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                 err = ACAPI_Element_Change (&elem, &mask,
                                             hasMemoChanges ? &clipMemo : nullptr,
                                             memoMask, withDel);
-                ACAPI_DisposeElemMemoHdls (&clipMemo);
                 if (err != NoError) {
                     executionResults (CreateFailedExecutionResult (err, "Failed to change element"));
                     continue;
@@ -1670,6 +2080,21 @@ GetSelectedElementsCommand::GetSelectedElementsCommand () :
 GS::String GetSelectedElementsCommand::GetName () const
 {
     return "GetSelectedElements";
+}
+
+GS::Optional<GS::UniString> GetSelectedElementsCommand::GetInputParametersSchema () const
+{
+    return R"({
+        "type": "object",
+        "properties": {
+            "pageSize": {
+                "type": "integer",
+                "minimum": 1
+            }
+        },
+        "additionalProperties": false,
+        "required": []
+    })";
 }
 
 GS::Optional<GS::UniString> GetSelectedElementsCommand::GetResponseSchema () const
@@ -1739,12 +2164,16 @@ GS::Optional<GS::UniString> GetSelectedElementsCommand::GetResponseSchema () con
                 },
                 "additionalProperties": false,
                 "required": ["shape", "source", "multiStory", "rotation", "bounds", "points"]
-            }
+            },
+            "error": { "$ref": "#/Error" },
+            "pageRequired": { "type": "boolean", "enum": [true] },
+            "resourceLimit": { "type": "boolean", "enum": [true] },
+            "code": { "type": "string" },
+            "message": { "type": "string" },
+            "enumerated": { "type": "integer" },
+            "emitted": { "type": "integer" }
         },
-        "additionalProperties": false,
-        "required": [
-            "elements", "focusElements", "selectionType", "elementRelationship", "selectedElementCount", "editableElementCount"
-        ]
+        "additionalProperties": false
     })";
 }
 
@@ -1764,97 +2193,67 @@ static bool IsMarqueeSelection (API_SelTypeID type)
     return type == API_MarqueePoly || type == API_MarqueeHorBox || type == API_MarqueeRotBox;
 }
 
-struct MarqueeFocusSnapshot {
-    API_SelTypeID type = API_SelEmpty;
-    bool multiStory = false;
-    double rotation = 0.0;
-    double xMin = 0.0;
-    double yMin = 0.0;
-    double xMax = 0.0;
-    double yMax = 0.0;
-    GS::Array<API_Coord> polygonPoints;
-    GS::UniString source;
-};
-
-static std::optional<MarqueeFocusSnapshot> trackedMarquee;
-static std::optional<API_Guid> marqueeEventHandlerId;
-
-static MarqueeFocusSnapshot CaptureMarqueeSnapshot (const API_SelectionInfo& selectionInfo, const GS::UniString& source)
+static bool IsSameHorizontalMarquee (const API_SelectionInfo& selection, double xMin, double yMin, double xMax, double yMax, bool multiStory)
 {
-    MarqueeFocusSnapshot snapshot;
-    snapshot.type = selectionInfo.typeID;
-    snapshot.multiStory = selectionInfo.multiStory;
-    snapshot.rotation = selectionInfo.marquee.boxRotAngle;
-    snapshot.xMin = selectionInfo.marquee.box.xMin;
-    snapshot.yMin = selectionInfo.marquee.box.yMin;
-    snapshot.xMax = selectionInfo.marquee.box.xMax;
-    snapshot.yMax = selectionInfo.marquee.box.yMax;
-    snapshot.source = source;
-    if (selectionInfo.typeID == API_MarqueePoly && selectionInfo.marquee.coords != nullptr) {
-        for (Int32 index = 1; index <= selectionInfo.marquee.nCoords; ++index)
-            snapshot.polygonPoints.Push ((*selectionInfo.marquee.coords)[index]);
-    }
-    return snapshot;
+    return selection.typeID == API_MarqueeHorBox &&
+        selection.marquee.box.xMin == xMin && selection.marquee.box.yMin == yMin &&
+        selection.marquee.box.xMax == xMax && selection.marquee.box.yMax == yMax &&
+        selection.multiStory == multiStory;
 }
 
-static void TrackMarquee (const API_SelectionInfo& selectionInfo, const GS::UniString& source)
+static void ReleaseSelectionInfo (API_SelectionInfo& selection)
 {
-    if (IsMarqueeSelection (selectionInfo.typeID))
-        trackedMarquee = CaptureMarqueeSnapshot (selectionInfo, source);
-    else
-        trackedMarquee.reset ();
+    ReleaseSelectionInfoHandles (selection);
 }
 
-class MarqueeFocusEventHandler final : public API_IMarqueeEventHandler {
-public:
-    virtual void OnMarqueeChanged (const API_SelectionInfo& selectionInfo) const override
-    {
-        TrackMarquee (selectionInfo, "event_tracker");
-    }
-};
-
-GSErrCode RegisterMarqueeFocusTracker ()
+// ACAPI_Selection_Get returns an owned coordinate handle.  A shallow copy of
+// API_SelectionInfo therefore aliases the handle and is unsafe when the
+// source and copy are both disposed.  Keep restoration state in an explicit
+// deep copy instead.
+static bool CloneSelectionInfo (const API_SelectionInfo& source, API_SelectionInfo& destination)
 {
-    API_SelectionInfo selectionInfo = {};
-    const GSErrCode selectionError = ACAPI_Selection_Get (&selectionInfo, nullptr, false);
-    if (selectionError == NoError && IsMarqueeSelection (selectionInfo.typeID)) {
-        TrackMarquee (selectionInfo, "live_query");
-        BMKillHandle (reinterpret_cast<GSHandle*> (&selectionInfo.marquee.coords));
-    }
-
-    API_Guid handlerId;
-    const GSErrCode err = ACAPI_Notification_RegisterEventHandler (GS::NewOwned<MarqueeFocusEventHandler> (), handlerId);
-    if (err == NoError)
-        marqueeEventHandlerId = handlerId;
-    return err;
+    return CloneSelectionInfoHandles (source, destination);
 }
 
-void UnregisterMarqueeFocusTracker ()
+static bool AddMarqueeToResponse (GS::ObjectState& response, const API_SelectionInfo& selectionInfo, const GS::UniString& source)
 {
-    if (marqueeEventHandlerId.has_value ()) {
-        ACAPI_Notification_UnregisterEventHandler (*marqueeEventHandlerId);
-        marqueeEventHandlerId.reset ();
+    constexpr GSSize maxResponseMarqueePoints = 200'000;
+    if (!std::isfinite (selectionInfo.marquee.box.xMin) ||
+        !std::isfinite (selectionInfo.marquee.box.yMin) ||
+        !std::isfinite (selectionInfo.marquee.box.xMax) ||
+        !std::isfinite (selectionInfo.marquee.box.yMax) ||
+        !std::isfinite (selectionInfo.marquee.boxRotAngle)) {
+        return false;
     }
-    trackedMarquee.reset ();
-}
 
-static void AddMarqueeToResponse (GS::ObjectState& response, const MarqueeFocusSnapshot& snapshot)
-{
     GS::ObjectState marquee;
-    marquee.Add ("shape", SelectionTypeToString (snapshot.type));
-    marquee.Add ("source", snapshot.source);
-    marquee.Add ("multiStory", snapshot.multiStory);
-    marquee.Add ("rotation", snapshot.rotation);
+    marquee.Add ("shape", SelectionTypeToString (selectionInfo.typeID));
+    marquee.Add ("source", source);
+    marquee.Add ("multiStory", selectionInfo.multiStory);
+    marquee.Add ("rotation", selectionInfo.marquee.boxRotAngle);
     const auto& points = marquee.AddList<GS::ObjectState> ("points");
 
-    double xMin = snapshot.xMin;
-    double yMin = snapshot.yMin;
-    double xMax = snapshot.xMax;
-    double yMax = snapshot.yMax;
-    if (snapshot.type == API_MarqueePoly && !snapshot.polygonPoints.IsEmpty ()) {
+    double xMin = selectionInfo.marquee.box.xMin;
+    double yMin = selectionInfo.marquee.box.yMin;
+    double xMax = selectionInfo.marquee.box.xMax;
+    double yMax = selectionInfo.marquee.box.yMax;
+    const GSSize marqueeCoordBytes = selectionInfo.marquee.coords != nullptr && *selectionInfo.marquee.coords != nullptr
+        ? BMhGetSize (reinterpret_cast<GSHandle> (selectionInfo.marquee.coords))
+        : 0;
+    const GSSize marqueeCoordCapacity = marqueeCoordBytes / sizeof (API_Coord);
+    const bool hasValidPolygonCoords = selectionInfo.typeID == API_MarqueePoly
+        && selectionInfo.marquee.coords != nullptr
+        && *selectionInfo.marquee.coords != nullptr
+        && selectionInfo.marquee.nCoords >= 1
+        && static_cast<GSSize> (selectionInfo.marquee.nCoords) <= maxResponseMarqueePoints
+        && static_cast<GSSize> (selectionInfo.marquee.nCoords) + 1 <= marqueeCoordCapacity;
+    if (hasValidPolygonCoords) {
         xMin = DBL_MAX; yMin = DBL_MAX;
         xMax = -DBL_MAX; yMax = -DBL_MAX;
-        for (const API_Coord& coord : snapshot.polygonPoints) {
+        for (Int32 index = 1; index <= selectionInfo.marquee.nCoords; ++index) {
+            const API_Coord& coord = (*selectionInfo.marquee.coords)[index];
+            if (!std::isfinite (coord.x) || !std::isfinite (coord.y))
+                return false;
             points (GS::ObjectState ("x", coord.x, "y", coord.y));
             xMin = std::min (xMin, coord.x); yMin = std::min (yMin, coord.y);
             xMax = std::max (xMax, coord.x); yMax = std::max (yMax, coord.y);
@@ -1862,8 +2261,8 @@ static void AddMarqueeToResponse (GS::ObjectState& response, const MarqueeFocusS
     } else {
         const double centerX = (xMin + xMax) / 2.0;
         const double centerY = (yMin + yMax) / 2.0;
-        const double cosine = std::cos (snapshot.rotation);
-        const double sine = std::sin (snapshot.rotation);
+        const double cosine = std::cos (selectionInfo.marquee.boxRotAngle);
+        const double sine = std::sin (selectionInfo.marquee.boxRotAngle);
         const API_Coord corners[] = { { xMin, yMin }, { xMax, yMin }, { xMax, yMax }, { xMin, yMax } };
         xMin = DBL_MAX; yMin = DBL_MAX;
         xMax = -DBL_MAX; yMax = -DBL_MAX;
@@ -1872,6 +2271,8 @@ static void AddMarqueeToResponse (GS::ObjectState& response, const MarqueeFocusS
             const double dy = corner.y - centerY;
             const double x = centerX + dx * cosine - dy * sine;
             const double y = centerY + dx * sine + dy * cosine;
+            if (!std::isfinite (x) || !std::isfinite (y))
+                return false;
             points (GS::ObjectState ("x", x, "y", y));
             xMin = std::min (xMin, x); yMin = std::min (yMin, y);
             xMax = std::max (xMax, x); yMax = std::max (yMax, y);
@@ -1879,15 +2280,44 @@ static void AddMarqueeToResponse (GS::ObjectState& response, const MarqueeFocusS
     }
     marquee.Add ("bounds", GS::ObjectState ("xMin", xMin, "yMin", yMin, "xMax", xMax, "yMax", yMax));
     response.Add ("marquee", marquee);
+    return true;
 }
 
-GS::ObjectState GetSelectedElementsCommand::Execute (const GS::ObjectState& /*parameters*/, GS::ProcessControl& /*processControl*/) const
+GS::ObjectState GetSelectedElementsCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl& /*processControl*/) const
 {
+    Int32 pageSize = std::numeric_limits<Int32>::max ();
+    if (!ReadNativePageSize (parameters, pageSize, pageSize))
+        return CreateErrorResponse (APIERR_BADPARS, "pageSize must be a positive integer.");
+
+    API_SelectionInfo selectionSummary = {};
+    const GSErrCode summaryErr = ACAPI_Selection_Get (&selectionSummary, nullptr, false);
+    const GS::OnExit selectionSummaryGuard ([&selectionSummary] () { ReleaseSelectionInfo (selectionSummary); });
+    if (summaryErr != NoError && summaryErr != APIERR_NOSEL) {
+        return CreateErrorResponse (summaryErr, "Failed to retrieve the active selection summary.");
+    }
+    if (summaryErr == NoError && selectionSummary.sel_nElem > pageSize) {
+        return CreateNativePageRequiredResponse (
+            "The active selection requires another page; no partial rows were returned.",
+            selectionSummary.sel_nElem,
+            0);
+    }
+
     API_SelectionInfo selectionInfo = {};
     GS::Array<API_Neig> selectedNeigs;
     GSErrCode err = ACAPI_Selection_Get (&selectionInfo, &selectedNeigs, false);
+    const GS::OnExit selectionInfoGuard ([&selectionInfo] () { ReleaseSelectionInfo (selectionInfo); });
     if (err != NoError && err != APIERR_NOSEL) {
         return CreateErrorResponse (err, "Failed to retrieve selected elements.");
+    }
+    if (err == NoError && selectedNeigs.GetSize () > static_cast<GS::USize> (pageSize)) {
+        const GSSize count = selectedNeigs.GetSize ();
+        const Int32 enumerated = count > static_cast<GSSize> (std::numeric_limits<Int32>::max ())
+            ? std::numeric_limits<Int32>::max ()
+            : static_cast<Int32> (count);
+        return CreateNativePageRequiredResponse (
+            "The active selection requires another page; no partial rows were returned.",
+            enumerated,
+            0);
     }
 
     GS::ObjectState response;
@@ -1902,13 +2332,9 @@ GS::ObjectState GetSelectedElementsCommand::Execute (const GS::ObjectState& /*pa
     response.Add ("editableElementCount", err == APIERR_NOSEL ? 0 : selectionInfo.sel_nElemEdit);
 
     if (IsMarqueeSelection (selectionType)) {
-        const GS::OnExit marqueeGuard ([&selectionInfo] () {
-            BMKillHandle (reinterpret_cast<GSHandle*> (&selectionInfo.marquee.coords));
-        });
-        TrackMarquee (selectionInfo, "live_query");
+        if (!AddMarqueeToResponse (response, selectionInfo, "live_query"))
+            return CreateErrorResponse (APIERR_BADPARS, "The active marquee contains invalid or oversized geometry.");
     }
-    if (trackedMarquee.has_value ())
-        AddMarqueeToResponse (response, *trackedMarquee);
 
     if (selectionType == API_SelEmpty) return response;
 
@@ -1923,7 +2349,7 @@ GS::ObjectState GetSelectedElementsCommand::Execute (const GS::ObjectState& /*pa
             "elementId", CreateGuidObjectState (guid),
             "elementType", GetElementTypeNonLocalizedName (GetElemTypeId (elemHead)));
         API_Box3D bounds = {};
-        if (ACAPI_Element_CalcBounds (&elemHead, &bounds) == NoError) {
+            if (ACAPI_Element_CalcBounds (&elemHead, &bounds) == NoError && IsFiniteBounds (bounds)) {
             focusElement.Add ("bounds", GS::ObjectState (
                 "xMin", bounds.xMin, "yMin", bounds.yMin,
                 "xMax", bounds.xMax, "yMax", bounds.yMax));
@@ -1960,7 +2386,11 @@ GS::Optional<GS::UniString> GetElementsInRectCommand::GetInputParametersSchema (
                 "additionalProperties": false,
                 "required": ["xMin", "yMin", "xMax", "yMax"]
             },
-            "multiStory": { "type": "boolean", "default": false }
+            "multiStory": { "type": "boolean", "default": false },
+            "pageSize": {
+                "type": "integer",
+                "minimum": 1
+            }
         },
         "additionalProperties": false,
         "required": ["bounds"]
@@ -1972,33 +2402,39 @@ GS::Optional<GS::UniString> GetElementsInRectCommand::GetResponseSchema () const
     return R"({
         "type": "object",
         "properties": {
-            "elements": { "$ref": "#/Elements" },
-            "focusElements": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "elementId": { "$ref": "#/ElementId" },
-                        "elementType": { "type": "string" },
-                        "bounds": {
+                    "elements": { "$ref": "#/Elements" },
+                    "focusElements": {
+                        "type": "array",
+                        "items": {
                             "type": "object",
                             "properties": {
-                                "xMin": { "type": "number" }, "yMin": { "type": "number" },
-                                "xMax": { "type": "number" }, "yMax": { "type": "number" }
+                                "elementId": { "$ref": "#/ElementId" },
+                                "elementType": { "type": "string" },
+                                "bounds": {
+                                    "type": "object",
+                                    "properties": {
+                                        "xMin": { "type": "number" }, "yMin": { "type": "number" },
+                                        "xMax": { "type": "number" }, "yMax": { "type": "number" }
+                                    },
+                                    "additionalProperties": false,
+                                    "required": ["xMin", "yMin", "xMax", "yMax"]
+                                }
                             },
                             "additionalProperties": false,
-                            "required": ["xMin", "yMin", "xMax", "yMax"]
+                            "required": ["elementId", "elementType"]
                         }
                     },
-                    "additionalProperties": false,
-                    "required": ["elementId", "elementType"]
-                }
-            },
-            "elementCount": { "type": "integer" },
-            "focusRestored": { "type": "boolean" }
+                    "elementCount": { "type": "integer" },
+                    "focusRestored": { "type": "boolean" },
+                    "error": { "$ref": "#/Error" },
+                    "pageRequired": { "type": "boolean", "enum": [true] },
+                    "resourceLimit": { "type": "boolean", "enum": [true] },
+                    "code": { "type": "string" },
+                    "message": { "type": "string" },
+                    "enumerated": { "type": "integer" },
+                    "emitted": { "type": "integer" }
         },
-        "additionalProperties": false,
-        "required": ["elements", "focusElements", "elementCount", "focusRestored"]
+        "additionalProperties": false
     })";
 }
 
@@ -2010,24 +2446,58 @@ GS::ObjectState GetElementsInRectCommand::Execute (const GS::ObjectState& parame
         !bounds->Get ("xMax", xMax) || !bounds->Get ("yMax", yMax)) {
         return CreateErrorResponse (APIERR_BADPARS, "bounds.xMin, bounds.yMin, bounds.xMax and bounds.yMax are required.");
     }
-    if (xMin >= xMax || yMin >= yMax) {
+    if (!std::isfinite (xMin) || !std::isfinite (yMin) || !std::isfinite (xMax) || !std::isfinite (yMax) ||
+        xMin >= xMax || yMin >= yMax) {
         return CreateErrorResponse (APIERR_BADPARS, "Rectangle bounds must have positive area.");
     }
+
+    Int32 pageSize = std::numeric_limits<Int32>::max ();
+    if (!ReadNativePageSize (parameters, pageSize, pageSize))
+        return CreateErrorResponse (APIERR_BADPARS, "pageSize must be a positive integer.");
 
     bool multiStory = false;
     parameters.Get ("multiStory", multiStory);
 
     API_SelectionInfo selectionBefore = {};
     const GSErrCode selectionBeforeErr = ACAPI_Selection_Get (&selectionBefore, nullptr, false);
+    const GS::OnExit selectionBeforeGuard ([&selectionBefore] () { ReleaseSelectionInfo (selectionBefore); });
     if (selectionBeforeErr != NoError && selectionBeforeErr != APIERR_NOSEL) {
         return CreateErrorResponse (selectionBeforeErr, "Failed to inspect the operator focus before the bounded read.");
     }
     const bool hadOriginalMarquee = selectionBeforeErr == NoError && IsMarqueeSelection (selectionBefore.typeID);
     if (selectionBeforeErr == NoError && selectionBefore.typeID == API_SelElems) {
-        if (selectionBefore.marquee.coords != nullptr)
-            BMKillHandle (reinterpret_cast<GSHandle*> (&selectionBefore.marquee.coords));
-        return CreateErrorResponse (APIERR_REFUSEDCMD, "Bounded rect read refuses to replace an active individual selection.");
+        return CreateErrorResponse (
+            APIERR_REFUSEDCMD,
+            "Bounded marquee reads require marquee focus. An individual selection is active; use the selection scope or clear the selection before using a marquee/viewport read.");
     }
+
+    API_SelectionInfo restoreSelection = {};
+    if (hadOriginalMarquee && !CloneSelectionInfo (selectionBefore, restoreSelection)) {
+        return CreateErrorResponse (APIERR_MEMFULL, "Failed to copy the current marquee safely before the bounded read.");
+    }
+    const GS::OnExit restoreSelectionGuard ([&restoreSelection] () { ReleaseSelectionInfo (restoreSelection); });
+
+    bool temporaryFocusMayBeSet = false;
+    bool focusRestoreAttempted = false;
+    GSErrCode focusRestoreErr = NoError;
+    const auto restoreOperatorFocus = [&]() -> GSErrCode {
+        if (!temporaryFocusMayBeSet || focusRestoreAttempted)
+            return focusRestoreErr;
+
+        focusRestoreAttempted = true;
+        API_SelectionInfo emptySelection = {};
+        emptySelection.typeID = API_SelEmpty;
+        try {
+            focusRestoreErr = ACAPI_Selection_SetMarquee (hadOriginalMarquee ? &restoreSelection : &emptySelection);
+        } catch (...) {
+            focusRestoreErr = APIERR_GENERAL;
+        }
+        return focusRestoreErr;
+    };
+    // GS::OnExit does not catch exceptions from its callback.  The callback
+    // above is therefore internally exception-safe: focus cleanup must never
+    // turn an otherwise handled native error into an exception at teardown.
+    const GS::OnExit focusGuard ([&restoreOperatorFocus] () { (void) restoreOperatorFocus (); });
 
     API_SelectionInfo temporaryMarquee = {};
     temporaryMarquee.typeID = API_MarqueeHorBox;
@@ -2038,22 +2508,29 @@ GS::ObjectState GetElementsInRectCommand::Execute (const GS::ObjectState& parame
     temporaryMarquee.marquee.box.yMax = yMax;
     temporaryMarquee.marquee.boxRotAngle = 0.0;
 
+    temporaryFocusMayBeSet = true;
     const GSErrCode setErr = ACAPI_Selection_SetMarquee (&temporaryMarquee);
     if (setErr != NoError) {
-        if (selectionBefore.marquee.coords != nullptr)
-            BMKillHandle (reinterpret_cast<GSHandle*> (&selectionBefore.marquee.coords));
-        return CreateErrorResponse (setErr, "Failed to set the temporary bounded read rectangle.");
+        const GSErrCode restoreErr = restoreOperatorFocus ();
+        return CreateErrorResponse (
+            restoreErr != NoError ? restoreErr : setErr,
+            restoreErr != NoError
+                ? "Failed to set the temporary bounded read rectangle and could not restore the operator focus."
+                : "Failed to set the temporary bounded read rectangle.");
     }
 
     API_SelectionInfo boundedSelection = {};
     GS::Array<API_Neig> selectedNeigs;
     const GSErrCode boundedErr = ACAPI_Selection_Get (&boundedSelection, &selectedNeigs, false);
+    const GS::OnExit boundedSelectionGuard ([&boundedSelection] () { ReleaseSelectionInfo (boundedSelection); });
 
     GS::ObjectState response;
     const auto& elements = response.AddList<GS::ObjectState> ("elements");
     const auto& focusElements = response.AddList<GS::ObjectState> ("focusElements");
     Int32 elementCount = 0;
-    if (boundedErr == NoError) {
+    const GSSize selectedCount = selectedNeigs.GetSize ();
+    const bool pageRequired = boundedErr == NoError && selectedCount > static_cast<GSSize> (pageSize);
+    if (boundedErr == NoError && !pageRequired) {
         for (const API_Neig& selectedNeig : selectedNeigs) {
             const API_Guid guid = GetParentElemOfSectElem (selectedNeig.guid);
             elements (CreateElementIdObjectState (guid));
@@ -2066,7 +2543,7 @@ GS::ObjectState GetElementsInRectCommand::Execute (const GS::ObjectState& parame
                 "elementId", CreateGuidObjectState (guid),
                 "elementType", GetElementTypeNonLocalizedName (GetElemTypeId (elemHead)));
             API_Box3D elementBounds = {};
-            if (ACAPI_Element_CalcBounds (&elemHead, &elementBounds) == NoError) {
+            if (ACAPI_Element_CalcBounds (&elemHead, &elementBounds) == NoError && IsFiniteBounds (elementBounds)) {
                 focusElement.Add ("bounds", GS::ObjectState (
                     "xMin", elementBounds.xMin, "yMin", elementBounds.yMin,
                     "xMax", elementBounds.xMax, "yMax", elementBounds.yMax));
@@ -2074,40 +2551,60 @@ GS::ObjectState GetElementsInRectCommand::Execute (const GS::ObjectState& parame
             focusElements (focusElement);
         }
     } else if (boundedErr != APIERR_NOSEL) {
-        if (boundedSelection.marquee.coords != nullptr)
-            BMKillHandle (reinterpret_cast<GSHandle*> (&boundedSelection.marquee.coords));
-        if (selectionBefore.marquee.coords != nullptr)
-            BMKillHandle (reinterpret_cast<GSHandle*> (&selectionBefore.marquee.coords));
-        return CreateErrorResponse (boundedErr, "Failed to read the temporary bounded rectangle.");
+        // Do not overwrite an unknown/current operator focus after a failed
+        // selection read.  A second read is required before it is safe to
+        // restore the temporary marquee.
+        API_SelectionInfo selectionAfterError = {};
+        const GSErrCode selectionAfterErrorErr = ACAPI_Selection_Get (&selectionAfterError, nullptr, false);
+        const GS::OnExit selectionAfterErrorGuard ([&selectionAfterError] () { ReleaseSelectionInfo (selectionAfterError); });
+        if (selectionAfterErrorErr != NoError || !IsSameHorizontalMarquee (selectionAfterError, xMin, yMin, xMax, yMax, multiStory)) {
+            const GSErrCode restoreMarqueeErr = restoreOperatorFocus ();
+            return CreateErrorResponse (
+                restoreMarqueeErr != NoError
+                    ? restoreMarqueeErr
+                    : selectionAfterErrorErr != NoError ? selectionAfterErrorErr : APIERR_REFUSEDCMD,
+                restoreMarqueeErr != NoError
+                    ? "Failed to read the temporary bounded rectangle and could not restore the operator focus."
+                    : "Failed to read the temporary bounded rectangle and could not safely verify its focus for restoration.");
+        }
+        const GSErrCode restoreMarqueeErr = restoreOperatorFocus ();
+        return CreateErrorResponse (restoreMarqueeErr != NoError ? restoreMarqueeErr : boundedErr, "Failed to read the temporary bounded rectangle.");
     }
 
     API_SelectionInfo selectionAfter = {};
     const GSErrCode selectionAfterErr = ACAPI_Selection_Get (&selectionAfter, nullptr, false);
+    const GS::OnExit selectionAfterGuard ([&selectionAfter] () { ReleaseSelectionInfo (selectionAfter); });
+    const bool focusReadUnavailable = selectionAfterErr != NoError;
     const bool focusChangedDuringRead = selectionAfterErr == NoError &&
-        (!IsMarqueeSelection (selectionAfter.typeID) ||
-         selectionAfter.marquee.box.xMin != xMin || selectionAfter.marquee.box.yMin != yMin ||
-         selectionAfter.marquee.box.xMax != xMax || selectionAfter.marquee.box.yMax != yMax);
-    if (selectionAfter.marquee.coords != nullptr)
-        BMKillHandle (reinterpret_cast<GSHandle*> (&selectionAfter.marquee.coords));
+        !IsSameHorizontalMarquee (selectionAfter, xMin, yMin, xMax, yMax, multiStory);
 
-    API_SelectionInfo restoreMarquee = {};
-    if (hadOriginalMarquee) {
-        restoreMarquee = selectionBefore;
-    } else {
-        restoreMarquee.typeID = API_SelEmpty;
-    }
-    const GSErrCode restoreErr = ACAPI_Selection_SetMarquee (&restoreMarquee);
-    if (boundedSelection.marquee.coords != nullptr)
-        BMKillHandle (reinterpret_cast<GSHandle*> (&boundedSelection.marquee.coords));
-    if (selectionBefore.marquee.coords != nullptr)
-        BMKillHandle (reinterpret_cast<GSHandle*> (&selectionBefore.marquee.coords));
-
-    if (restoreErr != NoError || focusChangedDuringRead) {
+    if (focusReadUnavailable || focusChangedDuringRead) {
+        const GSErrCode restoreMarqueeErr = restoreOperatorFocus ();
         return CreateErrorResponse (
-            restoreErr != NoError ? restoreErr : APIERR_REFUSEDCMD,
-            restoreErr != NoError
-                ? "Bounded read succeeded but the operator focus could not be restored."
-                : "Operator focus changed during the bounded read; refusing to report a potentially stale result.");
+            restoreMarqueeErr != NoError
+                ? restoreMarqueeErr
+                : focusReadUnavailable ? selectionAfterErr : APIERR_REFUSEDCMD,
+            restoreMarqueeErr != NoError
+                ? "Operator focus could not be verified after the bounded read and could not be restored."
+                : "Operator focus could not be verified after the bounded read; refusing to overwrite the current focus.");
+    }
+
+    const GSErrCode restoreErr = restoreOperatorFocus ();
+
+    if (restoreErr != NoError) {
+        return CreateErrorResponse (
+            restoreErr,
+            "Bounded read succeeded but the operator focus could not be restored.");
+    }
+
+    if (pageRequired) {
+        const Int32 enumerated = selectedCount > static_cast<GSSize> (std::numeric_limits<Int32>::max ())
+            ? std::numeric_limits<Int32>::max ()
+            : static_cast<Int32> (selectedCount);
+        return CreateNativePageRequiredResponse (
+            "The bounded rectangle requires another page; no partial rows were returned.",
+            enumerated,
+            0);
     }
 
     response.Add ("elementCount", elementCount);
@@ -2341,6 +2838,8 @@ GS::Optional<GS::UniString> GetSubelementsOfHierarchicalElementsCommand::GetResp
 template<typename APIElemType>
 static void AddSubelementsToObjectState (GS::ObjectState& subelements, APIElemType* subelemArray, const char* subelementType)
 {
+    if (subelemArray == nullptr)
+        return;
     const GSSize nSubelementsWithThisType = BMGetPtrSize (reinterpret_cast<GSPtr>(subelemArray)) / sizeof (APIElemType);
     if (nSubelementsWithThisType == 0) {
         return;
@@ -2501,6 +3000,372 @@ GS::ObjectState GetConnectedElementsCommand::Execute (const GS::ObjectState& par
     return response;
 }
 
+GetWallRelationsCommand::GetWallRelationsCommand () :
+    CommandBase (CommonSchema::Used)
+{
+}
+
+GS::String GetWallRelationsCommand::GetName () const
+{
+    return "GetWallRelations";
+}
+
+GS::Optional<GS::UniString> GetWallRelationsCommand::GetInputParametersSchema () const
+{
+    return R"({
+        "type": "object",
+        "properties": {
+            "walls": {
+                "$ref": "#/Elements",
+                "description": "At most 256 native Wall element IDs."
+            }
+        },
+        "additionalProperties": false,
+        "required": ["walls"]
+    })";
+}
+
+GS::Optional<GS::UniString> GetWallRelationsCommand::GetResponseSchema () const
+{
+    return R"({
+        "type": "object",
+        "properties": {
+            "wallRelations": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "elementId": { "$ref": "#/ElementId" },
+                        "status": { "type": "string", "enum": ["success", "error"] },
+                        "error": { "type": "string" },
+                        "connectedOutline": {
+                            "type": "array",
+                            "items": { "$ref": "#/Coordinate2D" }
+                        },
+                        "conBeg": { "$ref": "#/WallRelationItems" },
+                        "conEnd": { "$ref": "#/WallRelationItems" },
+                        "conRef": { "$ref": "#/WallRelationItems" },
+                        "con": { "$ref": "#/WallRelationItems" },
+                        "conX": { "$ref": "#/WallRelationItems" }
+                    },
+                    "additionalProperties": false,
+                    "required": ["status"]
+                }
+            }
+        },
+        "additionalProperties": false,
+        "required": ["wallRelations"]
+    })";
+}
+
+static bool AddWallRelationItems (GS::ObjectState& target, const char* key, API_ConnectionGuidItem** items, Int32 count)
+{
+    if (count < 0)
+        return false;
+    const auto& output = target.AddList<GS::ObjectState> (key);
+    if (count == 0)
+        return true;
+    if (items == nullptr || *items == nullptr)
+        return false;
+    const GSSize bytes = BMhGetSize (reinterpret_cast<GSHandle> (items));
+    if (bytes % sizeof (API_ConnectionGuidItem) != 0 || bytes / sizeof (API_ConnectionGuidItem) < static_cast<GSSize> (count))
+        return false;
+    for (Int32 index = 0; index < count; ++index) {
+        const API_ConnectionGuidItem& item = (*items)[index];
+        GS::ObjectState relation;
+        relation.Add ("elementId", CreateGuidObjectState (item.guid));
+        relation.Add ("connectedWithBeginning", item.conWithBeg);
+        output (relation);
+    }
+    return true;
+}
+
+static bool AddConnectedWallOutline (GS::ObjectState& target, const API_WallRelation& relation)
+{
+    const auto& output = target.AddList<GS::ObjectState> ("connectedOutline");
+    if (relation.connPoly.nCoords < 0)
+        return false;
+    if (relation.connPoly.nCoords == 0)
+        return true;
+    if (relation.coords == nullptr || *relation.coords == nullptr)
+        return false;
+    const GSSize bytes = BMhGetSize (reinterpret_cast<GSHandle> (relation.coords));
+    const GSSize required = static_cast<GSSize> (relation.connPoly.nCoords) + 1;
+    if (bytes % sizeof (API_Coord) != 0 || bytes / sizeof (API_Coord) < required)
+        return false;
+    for (Int32 index = 1; index <= relation.connPoly.nCoords; ++index)
+        output (Create2DCoordinateObjectState ((*relation.coords)[index]));
+    return true;
+}
+
+GS::ObjectState GetWallRelationsCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl& /*processControl*/) const
+{
+    GS::Array<GS::ObjectState> walls;
+    parameters.Get ("walls", walls);
+    if (walls.IsEmpty () || walls.GetSize () > 256)
+        return CreateErrorResponse (APIERR_BADPARS, "walls must contain between 1 and 256 Wall element IDs.");
+
+    GS::ObjectState response;
+    const auto& results = response.AddList<GS::ObjectState> ("wallRelations");
+    for (const GS::ObjectState& wallOS : walls) {
+        const GS::ObjectState* elementId = wallOS.Get ("elementId");
+        if (elementId == nullptr) {
+            GS::ObjectState result;
+            result.Add ("status", "error");
+            result.Add ("error", "elementId is missing");
+            results (result);
+            continue;
+        }
+
+        const API_Guid guid = GetGuidFromObjectState (*elementId);
+        GS::ObjectState result;
+        result.Add ("elementId", CreateGuidObjectState (guid));
+
+        API_Element element = {};
+        element.header.guid = guid;
+        GSErrCode error = ACAPI_Element_Get (&element);
+        if (error != NoError) {
+            result.Add ("status", "error");
+            result.Add ("error", GS::UniString::Printf ("Failed to load Wall (error %d).", error));
+            results (result);
+            continue;
+        }
+        if (GetElemTypeId (element.header) != API_WallID) {
+            result.Add ("status", "error");
+            result.Add ("error", "Element is not a native Wall.");
+            results (result);
+            continue;
+        }
+
+        API_WallRelation relation = {};
+        error = ACAPI_Element_GetRelations (guid, API_WallID, &relation, 0);
+        const GS::OnExit dispose ([&relation] () { ACAPI_DisposeWallRelationHdls (&relation); });
+        if (error != NoError) {
+            result.Add ("status", "error");
+            result.Add ("error", GS::UniString::Printf ("Failed to get Wall relations (error %d).", error));
+            results (result);
+            continue;
+        }
+
+        const bool relationDataValid =
+            AddWallRelationItems (result, "conBeg", relation.conBeg, relation.nConBeg) &&
+            AddWallRelationItems (result, "conEnd", relation.conEnd, relation.nConEnd) &&
+            AddWallRelationItems (result, "conRef", relation.conRef, relation.nConRef) &&
+            AddWallRelationItems (result, "con", relation.con, relation.nCon) &&
+            AddWallRelationItems (result, "conX", relation.conX, relation.nConX) &&
+            AddConnectedWallOutline (result, relation);
+        result.Add ("status", relationDataValid ? "success" : "error");
+        if (!relationDataValid)
+            result.Add ("error", "ArchiCAD returned invalid Wall relation memo bounds.");
+        results (result);
+    }
+    return response;
+}
+
+GetRoomRelationsCommand::GetRoomRelationsCommand () :
+    CommandBase (CommonSchema::Used)
+{
+}
+
+GS::String GetRoomRelationsCommand::GetName () const
+{
+    return "GetRoomRelations";
+}
+
+GS::Optional<GS::UniString> GetRoomRelationsCommand::GetInputParametersSchema () const
+{
+    return R"({
+        "type": "object",
+        "properties": {
+            "zones": {
+                "$ref": "#/Elements",
+                "description": "At most 256 native Zone element IDs."
+            },
+            "doors": {
+                "$ref": "#/Elements",
+                "description": "At most 256 native Door element IDs."
+            }
+        },
+        "additionalProperties": false,
+        "minProperties": 1
+    })";
+}
+
+GS::Optional<GS::UniString> GetRoomRelationsCommand::GetResponseSchema () const
+{
+    return R"({
+        "type": "object",
+        "properties": {
+            "zoneRelations": {
+                "type": "array",
+                "items": { "$ref": "#/ZoneRoomRelation" }
+            },
+            "doorRelations": {
+                "type": "array",
+                "items": { "$ref": "#/DoorRoomRelation" }
+            }
+        },
+        "additionalProperties": false,
+        "required": ["zoneRelations", "doorRelations"]
+    })";
+}
+
+static void AddGuidList (GS::ObjectState& target, const char* key, const GS::Array<API_Guid>& guids)
+{
+    const auto& output = target.AddList<GS::ObjectState> (key);
+    for (const API_Guid& guid : guids)
+        output (CreateGuidObjectState (guid));
+}
+
+static void AddRoomRelationGroups (GS::ObjectState& target, const API_RoomRelation& relation)
+{
+    const auto& groups = target.AddList<GS::ObjectState> ("relatedElements");
+    for (const auto& pair : relation.elementsGroupedByType) {
+#ifndef ServerMainVers_2700
+        if (pair.key == nullptr || pair.value == nullptr || pair.value->IsEmpty ())
+            continue;
+        GS::ObjectState group;
+        group.Add ("elementType", GetElementTypeNonLocalizedName (*pair.key));
+        AddGuidList (group, "elementIds", *pair.value);
+#else
+        if (pair.value.IsEmpty ())
+            continue;
+        GS::ObjectState group;
+        group.Add ("elementType", GetElementTypeNonLocalizedName (pair.key.typeID));
+        AddGuidList (group, "elementIds", pair.value);
+#endif
+        groups (group);
+    }
+}
+
+static void AddRoomRelationWallParts (GS::ObjectState& target, const API_RoomRelation& relation)
+{
+    const auto& parts = target.AddList<GS::ObjectState> ("wallParts");
+    for (const API_WallPart& part : relation.wallPart) {
+        GS::ObjectState item;
+        item.Add ("wallElementId", CreateGuidObjectState (part.guid));
+        item.Add ("roomEdge", part.roomEdge);
+        item.Add ("tBeg", part.tBeg);
+        item.Add ("tEnd", part.tEnd);
+        parts (item);
+    }
+}
+
+static void AddRoomRelationError (GS::ObjectState& target, const API_Guid& guid, const char* message, GSErrCode error)
+{
+    target.Add ("elementId", CreateGuidObjectState (guid));
+    target.Add ("status", "error");
+    target.Add ("error", GS::UniString::Printf ("%s (error %d).", message, error));
+}
+
+GS::ObjectState GetRoomRelationsCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl& /*processControl*/) const
+{
+    GS::Array<GS::ObjectState> zones;
+    GS::Array<GS::ObjectState> doors;
+    parameters.Get ("zones", zones);
+    parameters.Get ("doors", doors);
+    if (zones.GetSize () > 256 || doors.GetSize () > 256 || zones.IsEmpty () && doors.IsEmpty ())
+        return CreateErrorResponse (APIERR_BADPARS, "zones and doors must contain at most 256 IDs each and at least one ID in total.");
+
+    GS::ObjectState response;
+    const auto& zoneResults = response.AddList<GS::ObjectState> ("zoneRelations");
+    const auto& doorResults = response.AddList<GS::ObjectState> ("doorRelations");
+
+    for (const GS::ObjectState& zoneOS : zones) {
+        const GS::ObjectState* elementId = zoneOS.Get ("elementId");
+        if (elementId == nullptr) {
+            GS::ObjectState result;
+            result.Add ("status", "error");
+            result.Add ("error", "elementId is missing.");
+            zoneResults (result);
+            continue;
+        }
+        const API_Guid guid = GetGuidFromObjectState (*elementId);
+        API_Element element = {};
+        element.header.guid = guid;
+        GSErrCode error = ACAPI_Element_Get (&element);
+        if (error != NoError) {
+            GS::ObjectState result;
+            AddRoomRelationError (result, guid, "Failed to load Zone", error);
+            zoneResults (result);
+            continue;
+        }
+        if (GetElemTypeId (element.header) != API_ZoneID) {
+            GS::ObjectState result;
+            result.Add ("elementId", CreateGuidObjectState (guid));
+            result.Add ("status", "error");
+            result.Add ("error", "Element is not a native Zone.");
+            zoneResults (result);
+            continue;
+        }
+
+        API_RoomRelation relation = {};
+        error = ACAPI_Element_GetRelations (guid, API_ZombieElemID, &relation, 0);
+        const GS::OnExit dispose ([&relation] () { ACAPI_DisposeRoomRelationHdls (&relation); });
+        GS::ObjectState result;
+        result.Add ("elementId", CreateGuidObjectState (guid));
+        if (error != NoError) {
+            result.Add ("status", "error");
+            result.Add ("error", GS::UniString::Printf ("Failed to get Zone room relations (error %d).", error));
+            zoneResults (result);
+            continue;
+        }
+        result.Add ("status", "success");
+        AddRoomRelationGroups (result, relation);
+        AddRoomRelationWallParts (result, relation);
+        zoneResults (result);
+    }
+
+    for (const GS::ObjectState& doorOS : doors) {
+        const GS::ObjectState* elementId = doorOS.Get ("elementId");
+        if (elementId == nullptr) {
+            GS::ObjectState result;
+            result.Add ("status", "error");
+            result.Add ("error", "elementId is missing.");
+            doorResults (result);
+            continue;
+        }
+        const API_Guid guid = GetGuidFromObjectState (*elementId);
+        API_Element element = {};
+        element.header.guid = guid;
+        GSErrCode error = ACAPI_Element_Get (&element);
+        if (error != NoError) {
+            GS::ObjectState result;
+            AddRoomRelationError (result, guid, "Failed to load Door", error);
+            doorResults (result);
+            continue;
+        }
+        if (GetElemTypeId (element.header) != API_DoorID) {
+            GS::ObjectState result;
+            result.Add ("elementId", CreateGuidObjectState (guid));
+            result.Add ("status", "error");
+            result.Add ("error", "Element is not a native Door.");
+            doorResults (result);
+            continue;
+        }
+
+        API_DoorRelation relation = {};
+        error = ACAPI_Element_GetRelations (guid, API_ZoneID, &relation, 0);
+        GS::ObjectState result;
+        result.Add ("elementId", CreateGuidObjectState (guid));
+        if (error != NoError) {
+            result.Add ("status", "error");
+            result.Add ("error", GS::UniString::Printf ("Failed to get Door room relations (error %d).", error));
+            doorResults (result);
+            continue;
+        }
+        result.Add ("status", "success");
+        const auto& roomIds = result.AddList<GS::ObjectState> ("zoneElementIds");
+        if (relation.fromRoom != APINULLGuid)
+            roomIds (CreateGuidObjectState (relation.fromRoom));
+        if (relation.toRoom != APINULLGuid && relation.toRoom != relation.fromRoom)
+            roomIds (CreateGuidObjectState (relation.toRoom));
+        doorResults (result);
+    }
+
+    return response;
+}
+
 GetZoneBoundariesCommand::GetZoneBoundariesCommand () :
     CommandBase (CommonSchema::Used)
 {
@@ -2581,29 +3446,57 @@ GS::ObjectState GetZoneBoundariesCommand::Execute (
         const auto& polygonOutline = boundaryOS.AddList<GS::ObjectState> ("polygonOutline");
         const ModelerAPI::MeshBody& body = boundary.GetBody ();
         const ModelerAPI::Polygon& poly = boundary.GetPolygon ();
+        const Int32 edgeCount = poly.GetEdgeCount ();
+        if (edgeCount <= 0)
+            return CreateErrorResponse (APIERR_BADPARS, "ArchiCAD returned a zone boundary without edges.");
         {
             ModelerAPI::Edge edge;
             ModelerAPI::Vertex vertex;
-            for (Int32 edgeIdx = 1; edgeIdx <= poly.GetEdgeCount (); ++edgeIdx) {
+            Int32 lastVertexIndex2 = 0;
+            bool contourClosed = false;
+            bool hasOuterVertex = false;
+            const auto addVertex = [&] (const ModelerAPI::Vertex& modelerVertex) {
+                const API_Coord3D coordinate { modelerVertex.x, modelerVertex.y, modelerVertex.z };
+                polygonOutline (Create3DCoordinateObjectState (coordinate));
+                hasOuterVertex = true;
+            };
+            for (Int32 edgeIdx = 1; edgeIdx <= edgeCount; ++edgeIdx) {
 
                 const Int32 edgeIndex = poly.GetEdgeIndex (edgeIdx);
-
+                // ModelerAPI uses zero as the contour/hole separator.  The
+                // public ZoneBoundary response currently exposes only the
+                // outer polygon, so close it and stop before serializing hole
+                // edges instead of treating the separator as an invalid index.
                 if (edgeIndex == 0) {
-                    body.GetVertex (edge.GetVertexIndex2 (), &vertex);
-                    polygonOutline (Create3DCoordinateObjectState (*reinterpret_cast<API_Coord3D*> (&vertex)));
+                    if (lastVertexIndex2 <= 0)
+                        return CreateErrorResponse (APIERR_BADPARS, "ArchiCAD returned a zone boundary without an outer contour.");
+                    body.GetVertex (lastVertexIndex2, &vertex);
+                    addVertex (vertex);
+                    contourClosed = true;
                     break;
                 }
-                
+                // Polygon edge indices are signed: the sign carries the edge
+                // orientation, while zero separates the outer contour from
+                // hole contours.  Pass the signed index to ModelerAPI; it
+                // resolves the oriented edge as documented by the AC28
+                // ZoneBoundaryQuery example.
                 body.GetEdge (edgeIndex, &edge);
-                body.GetVertex (edge.GetVertexIndex1 (), &vertex);
+                const Int32 vertexIndex1 = edge.GetVertexIndex1 ();
+                const Int32 vertexIndex2 = edge.GetVertexIndex2 ();
+                if (vertexIndex1 <= 0 || vertexIndex2 <= 0)
+                    return CreateErrorResponse (APIERR_BADPARS, "ArchiCAD returned an invalid zone boundary vertex index.");
+                lastVertexIndex2 = vertexIndex2;
+                body.GetVertex (vertexIndex1, &vertex);
+                addVertex (vertex);
 
-                polygonOutline (Create3DCoordinateObjectState (*reinterpret_cast<API_Coord3D*> (&vertex)));
-
-                if (edgeIdx == poly.GetEdgeCount ()) {
-                    body.GetVertex (edge.GetVertexIndex2 (), &vertex);
-                    polygonOutline (Create3DCoordinateObjectState (*reinterpret_cast<API_Coord3D*> (&vertex)));
+                if (edgeIdx == edgeCount) {
+                    body.GetVertex (vertexIndex2, &vertex);
+                    addVertex (vertex);
+                    contourClosed = true;
                 }
             }
+            if (!contourClosed || !hasOuterVertex)
+                return CreateErrorResponse (APIERR_BADPARS, "ArchiCAD returned an empty zone boundary outer contour.");
         }
 
         zoneBoundaries (boundaryOS);
@@ -3479,6 +4372,10 @@ GS::ObjectState Get3DBoundingBoxesCommand::Execute (const GS::ObjectState& param
         }
         if (err != NoError) {
             boundingBoxes3D (CreateErrorResponse (err, "Failed to get the 3D bounding box"));
+            continue;
+        }
+        if (!IsFiniteBounds (box3D)) {
+            boundingBoxes3D (CreateErrorResponse (APIERR_GENERAL, "Archicad returned a non-finite 3D bounding box"));
             continue;
         }
 

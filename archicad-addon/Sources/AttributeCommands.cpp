@@ -7,6 +7,10 @@
 #include "ADBAttributeIndex.hpp"
 #endif
 
+#include <limits>
+#include <memory>
+#include <new>
+
 // Before AC27, API_AttributeIndex is a plain integer typedef with no IsPositive() method; AC27+ replaced it with
 // a class. Kept local (rather than in the shared MigrationHelper shim) since it is only used in this file.
 static bool IsPositiveAttributeIndex (const API_AttributeIndex& index)
@@ -16,6 +20,33 @@ static bool IsPositiveAttributeIndex (const API_AttributeIndex& index)
 #else
     return index > 0;
 #endif
+}
+
+static bool FitsInt32Count (GSSize count)
+{
+    return count <= static_cast<GSSize> (std::numeric_limits<Int32>::max ());
+}
+
+static bool FitsAllocation (GSSize count, GSSize elementSize)
+{
+    return elementSize > 0 && count <= std::numeric_limits<GSSize>::max () / elementSize;
+}
+
+static void TransferFillDefinitionHandles (API_AttributeDefExt& source, API_AttributeDefExt& destination)
+{
+    destination.fill_lineItems = source.fill_lineItems;
+    destination.fill_lineLength = source.fill_lineLength;
+    destination.sfill_Items = source.sfill_Items;
+
+    source.fill_lineItems = nullptr;
+    source.fill_lineLength = nullptr;
+    source.sfill_Items.sfill_HotSpots = nullptr;
+    source.sfill_Items.sfill_Lines = nullptr;
+    source.sfill_Items.sfill_Arcs = nullptr;
+    source.sfill_Items.sfill_SolidFills = nullptr;
+    source.sfill_Items.sfill_FillCoords = nullptr;
+    source.sfill_Items.sfill_SubPolys = nullptr;
+    source.sfill_Items.sfill_PolyArcs = nullptr;
 }
 
 // Shared "fields" filter for detailed Get commands, matching the {ids, properties} pattern already used by
@@ -144,10 +175,10 @@ GS::ObjectState GetAttributesByTypeCommand::Execute (const GS::ObjectState& para
     GS::ObjectState response;
     const auto& attributes = response.AddList<GS::ObjectState> ("attributes");
 
-    // Fonts are environment resources, not API_Attribute entries in AC28.
-    // Keep them on the same compact index/name response so callers can resolve
-    // API_TextType::font without exposing a second native command.
+    // Fonts use the modern environment API from AC27. AC25/26 expose the
+    // same data through the legacy API_Attribute font record.
     if (typeStr == "Font") {
+#ifdef ServerMainVers_2700
         const Int32 fontCount = ACAPI_Font_GetFontNum ();
         for (Int32 index = 1; index <= fontCount; ++index) {
             API_FontType font = {};
@@ -158,6 +189,21 @@ GS::ObjectState GetAttributesByTypeCommand::Execute (const GS::ObjectState& para
                 "index", index,
                 "name", GS::UniString (font.head.name)));
         }
+#else
+        API_AttributeIndex fontCount;
+        if (ACAPI_Attribute_GetNum (API_FontID, &fontCount) != NoError)
+            return response;
+        for (API_AttributeIndex index = 1; index <= fontCount; ++index) {
+            API_Attribute font = {};
+            font.header.typeID = API_FontID;
+            font.header.index = index;
+            if (ACAPI_Attribute_Get (&font) != NoError) continue;
+            attributes (GS::ObjectState (
+                "attributeId", CreateGuidObjectState (font.header.guid),
+                "index", GetAttributeIndex (font.header.index),
+                "name", GS::UniString (font.font.head.name)));
+        }
+#endif
         return response;
     }
 
@@ -169,6 +215,10 @@ GS::ObjectState GetAttributesByTypeCommand::Execute (const GS::ObjectState& para
 
     GS::Array<API_Attribute> attrs;
     ACAPI_Attribute_GetAttributesByType (typeID, attrs);
+    const GS::OnExit attrsGuard ([&attrs] () {
+        for (API_Attribute& attr : attrs)
+            DisposeAttribute (attr);
+    });
 
     for (API_Attribute& attr : attrs) {
         GS::ObjectState attributeDetails;
@@ -176,8 +226,6 @@ GS::ObjectState GetAttributesByTypeCommand::Execute (const GS::ObjectState& para
         attributeDetails.Add ("index", GetAttributeIndex (attr.header.index));
         attributeDetails.Add ("name", GS::UniString (attr.header.name));
         attributes (attributeDetails);
-
-        DisposeAttribute (attr);
     }
 
     return response;
@@ -330,10 +378,17 @@ GS::ObjectState GetLayerCombinationsCommand::Execute (const GS::ObjectState& par
         }
 
         API_AttributeDef attributeDef = {};
+        const GS::OnExit attributeDefGuard ([&attributeDef] () {
+            ACAPI_DisposeAttrDefsHdls (&attributeDef);
+        });
         err = ACAPI_Attribute_GetDef (API_LayerCombID, attribute.header.index, &attributeDef);
         if (err != NoError) {
             layerCombinations (CreateErrorResponse (err, "Failed to retrieve details of layer combination attribute."));
-	        ACAPI_DisposeAttrDefsHdls (&attributeDef);
+            continue;
+        }
+
+        if (attribute.layerComb.lNumb < 0) {
+            layerCombinations (CreateErrorResponse (APIERR_BADPARS, "Layer combination has an invalid layer count."));
             continue;
         }
 
@@ -343,15 +398,27 @@ GS::ObjectState GetLayerCombinationsCommand::Execute (const GS::ObjectState& par
         layerCombination.Add ("name", name);
         const auto& layers = layerCombination.AddList<GS::ObjectState> ("layers");
 #ifdef ServerMainVers_2700
+        if (attributeDef.layer_statItems == nullptr) {
+            if (attribute.layerComb.lNumb != 0)
+                layerCombinations (CreateErrorResponse (APIERR_BADPARS, "Layer combination definition has no layer data."));
+            continue;
+        }
         for (const auto& kv : *attributeDef.layer_statItems) {
 #ifdef ServerMainVers_2800
             const API_AttributeIndex& layerIndex = kv.key;
             const API_LayerStat& layerStat = kv.value;
 #else
+            if (kv.key == nullptr || kv.value == nullptr)
+                continue;
             const API_AttributeIndex& layerIndex = *kv.key;
             const API_LayerStat& layerStat = *kv.value;
 #endif
 #else
+        if (attribute.layerComb.lNumb > 0 &&
+            (attributeDef.layer_statItems == nullptr || *attributeDef.layer_statItems == nullptr)) {
+            layerCombinations (CreateErrorResponse (APIERR_BADPARS, "Layer combination definition has no layer data."));
+            continue;
+        }
         for (Int32 i = 0; i < attribute.layerComb.lNumb; ++i) {
             const API_LayerStat& layerStat = (*attributeDef.layer_statItems)[i];
             const API_AttributeIndex& layerIndex = layerStat.lInd;
@@ -363,8 +430,6 @@ GS::ObjectState GetLayerCombinationsCommand::Execute (const GS::ObjectState& par
                 "isWireframe", (layerStat.lFlags & APILay_ForceToWire) != 0,
                 "intersectionGroupNr", layerStat.conClassId));
         }
-
-        ACAPI_DisposeAttrDefsHdls (&attributeDef);
 
         layerCombinations (GS::ObjectState ("layerCombination", layerCombination));
     }
@@ -498,7 +563,7 @@ GS::ObjectState GetLinesCommand::Execute (const GS::ObjectState& parameters, GS:
                 // Clamp against the handle's real size rather than trusting attr.linetype.nItems blindly: if the
                 // two ever disagree, indexing past the handle's actual allocation crashes ArchiCAD outright
                 // instead of failing gracefully.
-                if (wantsDashItems && defs.ltype_dashItems != nullptr) {
+                if (wantsDashItems && defs.ltype_dashItems != nullptr && *defs.ltype_dashItems != nullptr) {
                     Int32 count = (Int32) (BMGetHandleSize ((GSHandle) defs.ltype_dashItems) / sizeof (API_DashItems));
                     count = GS::Min (count, attr.linetype.nItems);
                     const auto& dashItemsList = line.AddList<GS::ObjectState> ("dashItems");
@@ -507,7 +572,7 @@ GS::ObjectState GetLinesCommand::Execute (const GS::ObjectState& parameters, GS:
                         dashItemsList (GS::ObjectState ("dash", item.dash, "gap", item.gap));
                     }
                 }
-                if (wantsLineItems && defs.ltype_lineItems != nullptr) {
+                if (wantsLineItems && defs.ltype_lineItems != nullptr && *defs.ltype_lineItems != nullptr) {
                     Int32 count = (Int32) (BMGetHandleSize ((GSHandle) defs.ltype_lineItems) / sizeof (API_LineItems));
                     count = GS::Min (count, attr.linetype.nItems);
                     const auto& lineItemsList = line.AddList<GS::ObjectState> ("lineItems");
@@ -551,8 +616,11 @@ static GS::UniString FillSubTypeToString (API_FillSubtype subType)
 static GS::UniString GetBitPatternHex (const API_Pattern& pattern)
 {
     char hex[17] = {};
+    constexpr char hexDigits[] = "0123456789ABCDEF";
     for (UInt32 i = 0; i < 8; ++i) {
-        sprintf (hex + i * 2, "%02X", (unsigned char) pattern[i]);
+        const unsigned char value = static_cast<unsigned char> (pattern[i]);
+        hex[i * 2] = hexDigits[(value >> 4) & 0x0F];
+        hex[i * 2 + 1] = hexDigits[value & 0x0F];
     }
     return GS::UniString (hex);
 }
@@ -690,7 +758,7 @@ GS::ObjectState GetFillsCommand::Execute (const GS::ObjectState& parameters, GS:
         if (wantsLineItems || wantsSymbolGeometry) {
             API_AttributeDefExt fillDefs = {};
             if (ACAPI_Attribute_GetDefExt (API_FilltypeID, attr.header.index, &fillDefs) == NoError) {
-                if (wantsLineItems && fillDefs.fill_lineItems != nullptr) {
+                if (wantsLineItems && fillDefs.fill_lineItems != nullptr && *fillDefs.fill_lineItems != nullptr) {
                     Int32 count = (Int32) (BMGetHandleSize ((GSHandle) fillDefs.fill_lineItems) / sizeof (API_FillLine));
                     count = GS::Min (count, attr.filltype.linNumb);
                     const auto& lineItemsList = fill.AddList<GS::ObjectState> ("lineItems");
@@ -701,17 +769,21 @@ GS::ObjectState GetFillsCommand::Execute (const GS::ObjectState& parameters, GS:
                             "direction", item.lDir,
                             "offsetLine", item.lOffsetLine,
                             "offset", Create2DCoordinateObjectState (item.lOffset));
-                        if (item.lPartNumb > 0 && fillDefs.fill_lineLength != nullptr) {
+                        if (item.lPartNumb > 0 && item.lPartOffs >= 0 && fillDefs.fill_lineLength != nullptr && *fillDefs.fill_lineLength != nullptr) {
                             Int32 lengthCount = (Int32) (BMGetHandleSize ((GSHandle) fillDefs.fill_lineLength) / sizeof (double));
                             const auto& lengthsList = lineItem.AddList<double> ("lineLengths");
-                            for (short j = 0; j < item.lPartNumb && (item.lPartOffs + j) < lengthCount; ++j) {
-                                lengthsList ((*fillDefs.fill_lineLength)[item.lPartOffs + j]);
+                            const GSSize start = static_cast<GSSize> (item.lPartOffs);
+                            const GSSize requested = static_cast<GSSize> (item.lPartNumb);
+                            if (start <= static_cast<GSSize> (lengthCount) && requested <= static_cast<GSSize> (lengthCount) - start) {
+                                for (GSSize j = 0; j < requested; ++j) {
+                                    lengthsList ((*fillDefs.fill_lineLength)[start + j]);
+                                }
                             }
                         }
                         lineItemsList (lineItem);
                     }
                 }
-                if (wantsField.Wants ("symbolLines") && attr.filltype.subType == APIFill_Symbol && fillDefs.sfill_Items.sfill_Lines != nullptr) {
+                if (wantsField.Wants ("symbolLines") && attr.filltype.subType == APIFill_Symbol && fillDefs.sfill_Items.sfill_Lines != nullptr && *fillDefs.sfill_Items.sfill_Lines != nullptr) {
                     Int32 count = (Int32) (BMGetHandleSize ((GSHandle) fillDefs.sfill_Items.sfill_Lines) / sizeof (API_SFill_Line));
                     count = GS::Min (count, attr.filltype.linNumb);
                     const auto& symbolLinesList = fill.AddList<GS::ObjectState> ("symbolLines");
@@ -720,7 +792,7 @@ GS::ObjectState GetFillsCommand::Execute (const GS::ObjectState& parameters, GS:
                         symbolLinesList (GS::ObjectState ("begin", Create2DCoordinateObjectState (item.begC), "end", Create2DCoordinateObjectState (item.endC)));
                     }
                 }
-                if (wantsField.Wants ("symbolArcs") && attr.filltype.subType == APIFill_Symbol && fillDefs.sfill_Items.sfill_Arcs != nullptr) {
+                if (wantsField.Wants ("symbolArcs") && attr.filltype.subType == APIFill_Symbol && fillDefs.sfill_Items.sfill_Arcs != nullptr && *fillDefs.sfill_Items.sfill_Arcs != nullptr) {
                     Int32 count = (Int32) (BMGetHandleSize ((GSHandle) fillDefs.sfill_Items.sfill_Arcs) / sizeof (API_SFill_Arc));
                     count = GS::Min (count, attr.filltype.arcNumb);
                     const auto& symbolArcsList = fill.AddList<GS::ObjectState> ("symbolArcs");
@@ -729,7 +801,7 @@ GS::ObjectState GetFillsCommand::Execute (const GS::ObjectState& parameters, GS:
                         symbolArcsList (GS::ObjectState ("begin", Create2DCoordinateObjectState (item.begC), "origin", Create2DCoordinateObjectState (item.origC), "angle", item.angle));
                     }
                 }
-                if (wantsField.Wants ("symbolHotspots") && attr.filltype.subType == APIFill_Symbol && fillDefs.sfill_Items.sfill_HotSpots != nullptr) {
+                if (wantsField.Wants ("symbolHotspots") && attr.filltype.subType == APIFill_Symbol && fillDefs.sfill_Items.sfill_HotSpots != nullptr && *fillDefs.sfill_Items.sfill_HotSpots != nullptr) {
                     Int32 count = (Int32) (BMGetHandleSize ((GSHandle) fillDefs.sfill_Items.sfill_HotSpots) / sizeof (API_Coord));
                     count = GS::Min (count, attr.filltype.hotNumb);
                     const auto& symbolHotspotsList = fill.AddList<GS::ObjectState> ("symbolHotspots");
@@ -1120,7 +1192,7 @@ GS::ObjectState GetPenTablesCommand::Execute (const GS::ObjectState& parameters,
         }
         if (wantsField.Wants ("pens")) {
             API_AttributeDefExt penTableDefs = {};
-            if (ACAPI_Attribute_GetDefExt (API_PenTableID, attr.header.index, &penTableDefs) == NoError && penTableDefs.penTable_Items != nullptr) {
+            if (ACAPI_Attribute_GetDefExt (API_PenTableID, attr.header.index, &penTableDefs) == NoError && penTableDefs.penTable_Items != nullptr && *penTableDefs.penTable_Items != nullptr) {
                 Int32 count = (Int32) (BMGetHandleSize ((GSHandle) penTableDefs.penTable_Items) / sizeof (API_PenType));
                 const auto& pensList = penTable.AddList<GS::ObjectState> ("pens");
                 for (Int32 i = 0; i < count; ++i) {
@@ -2087,7 +2159,7 @@ GS::ObjectState GetCompositesCommand::Execute (const GS::ObjectState& parameters
         if (wantsSkins || wantsSeparators) {
             API_AttributeDefExt compositeDefs = {};
             if (ACAPI_Attribute_GetDefExt (API_CompWallID, attr.header.index, &compositeDefs) == NoError) {
-                if (wantsSkins && compositeDefs.cwall_compItems != nullptr) {
+                if (wantsSkins && compositeDefs.cwall_compItems != nullptr && *compositeDefs.cwall_compItems != nullptr) {
                     Int32 count = (Int32) (BMGetHandleSize ((GSHandle) compositeDefs.cwall_compItems) / sizeof (API_CWallComponent));
                     count = GS::Min (count, (Int32) attr.compWall.nComps);
                     const auto& skinsList = composite.AddList<GS::ObjectState> ("skins");
@@ -2110,7 +2182,7 @@ GS::ObjectState GetCompositesCommand::Execute (const GS::ObjectState& parameters
                         skinsList (skin);
                     }
                 }
-                if (wantsSeparators && compositeDefs.cwall_compLItems != nullptr) {
+                if (wantsSeparators && compositeDefs.cwall_compLItems != nullptr && *compositeDefs.cwall_compLItems != nullptr) {
                     Int32 count = (Int32) (BMGetHandleSize ((GSHandle) compositeDefs.cwall_compLItems) / sizeof (API_CWallLineComponent));
                     count = GS::Min (count, (Int32) attr.compWall.nComps + 1);
                     const auto& separatorsList = composite.AddList<GS::ObjectState> ("separators");
@@ -2698,6 +2770,9 @@ GS::ObjectState CreateAttributesCommandBase::Execute (const GS::ObjectState& par
         API_Attribute attr = {};
         attr.header.typeID = attrTypeID;
         API_AttributeDef attrDef = {};
+        const GS::OnExit attrDefGuard ([&attrDef] () {
+            ACAPI_DisposeAttrDefsHdls (&attrDef);
+        });
 
         GS::UniString name;
         if (data.Get ("name", name)) {
@@ -2744,8 +2819,6 @@ GS::ObjectState CreateAttributesCommandBase::Execute (const GS::ObjectState& par
                 continue;
             }
         }
-
-	    ACAPI_DisposeAttrDefsHdls (&attrDef);
 
         attributeIds (CreateAttributeIdObjectState (attr.header.guid));
     }
@@ -3100,21 +3173,37 @@ void CreateLayerCombinationsCommand::SetTypeSpecificParameters (const GS::Object
     GS::Array<GS::ObjectState> layers;
     parameters.Get ("layers", layers);
 
-    attribute.layerComb.lNumb = layers.GetSize ();
+    const GSSize layerCount = static_cast<GSSize> (layers.GetSize ());
+    if (layerCount > static_cast<GSSize> (std::numeric_limits<Int32>::max ()))
+        return;
+
+    attribute.layerComb.lNumb = static_cast<Int32> (layerCount);
 
 #ifdef ServerMainVers_2700
-	attributeDef.layer_statItems = new GS::HashTable<API_AttributeIndex, API_LayerStat> ();
+	std::unique_ptr<GS::HashTable<API_AttributeIndex, API_LayerStat>> layerStats (
+		new (std::nothrow) GS::HashTable<API_AttributeIndex, API_LayerStat> ());
+	if (layerStats == nullptr)
+		return;
 #else
-	attributeDef.layer_statItems = (API_LayerStat **) BMAllocateHandle (attribute.layerComb.lNumb * sizeof (API_LayerStat), ALLOCATE_CLEAR, 0);
+	if (layerCount > 0) {
+		const GSSize layerBytes = layerCount * sizeof (API_LayerStat);
+		attributeDef.layer_statItems = (API_LayerStat **) BMAllocateHandle (layerBytes, ALLOCATE_CLEAR, 0);
+		if (attributeDef.layer_statItems == nullptr || *attributeDef.layer_statItems == nullptr) {
+			if (attributeDef.layer_statItems != nullptr)
+				BMKillHandle (reinterpret_cast<GSHandle*> (&attributeDef.layer_statItems));
+			attributeDef.layer_statItems = nullptr;
+			return;
+		}
+	}
 #endif
 
-    size_t i = 0;
+    GSSize i = 0;
     for (const GS::ObjectState& layer : layers) {
 #ifdef ServerMainVers_2700
         UNUSED_VARIABLE(i);
 		API_LayerStat layerStat = {};
 #else
-        API_LayerStat& layerStat = (*attributeDef.layer_statItems)[i++];
+        API_LayerStat& layerStat = (*attributeDef.layer_statItems)[static_cast<GSSize> (i++)];
 #endif
         bool isHidden = false;
         layer.Get ("isHidden", isHidden);
@@ -3138,12 +3227,19 @@ void CreateLayerCombinationsCommand::SetTypeSpecificParameters (const GS::Object
         API_AttributeIndex layerIndex;
         if (GetAttributeIndexFromAttributeId (layer, API_LayerID, layerIndex)) {
 #ifdef ServerMainVers_2700
-            attributeDef.layer_statItems->Add (layerIndex, layerStat);
+            layerStats->Add (layerIndex, layerStat);
 #else
             layerStat.lInd = layerIndex;
 #endif
         }
     }
+
+#ifdef ServerMainVers_2700
+	// Transfer ownership only after the complete table has been built.  If any
+	// ObjectState/API operation above throws, the unique_ptr still cleans up the
+	// temporary table instead of leaving an API-owned pointer behind.
+	attributeDef.layer_statItems = layerStats.release ();
+#endif
 }
 
 CreateLinesCommand::CreateLinesCommand () :
@@ -3302,7 +3398,12 @@ void CreateLinesCommand::SetTypeSpecificParameters (const GS::ObjectState& param
         if (ACAPI_Attribute_GetDef (API_LinetypeID, attribute.header.index, &existingDef) == NoError) {
             attributeDef.ltype_dashItems = existingDef.ltype_dashItems;
             attributeDef.ltype_lineItems = existingDef.ltype_lineItems;
+            existingDef.ltype_dashItems = nullptr;
+            existingDef.ltype_lineItems = nullptr;
         }
+        // GetDef allocates handles even on some error paths.  Dispose the local definition after
+        // transferring the two handles that are now owned by attributeDef.
+        ACAPI_DisposeAttrDefsHdls (&existingDef);
     }
 
     // Only touch linetype.type (and the period/height/dashItems/lineItems that go with it) if lineType was
@@ -3316,6 +3417,10 @@ void CreateLinesCommand::SetTypeSpecificParameters (const GS::ObjectState& param
 
     if (lineType == "Dashed") {
         attribute.linetype.type = APILine_DashedLine;
+        if (attributeDef.ltype_lineItems != nullptr) {
+            BMKillHandle (reinterpret_cast<GSHandle*> (&attributeDef.ltype_lineItems));
+            attributeDef.ltype_lineItems = nullptr;
+        }
         parameters.Get ("period", attribute.linetype.period);
 
         // Only touch nItems/ltype_dashItems if dashItems was actually supplied. Leaving them alone when the
@@ -3323,32 +3428,65 @@ void CreateLinesCommand::SetTypeSpecificParameters (const GS::ObjectState& param
         // existing dash pattern instead of wiping it out (nItems would otherwise drop to 0).
         GS::Array<GS::ObjectState> dashItems;
         if (parameters.Get ("dashItems", dashItems)) {
-            UInt32 nItems = dashItems.GetSize ();
-            attribute.linetype.nItems = (Int32) nItems;
+            const GSSize nItems = static_cast<GSSize> (dashItems.GetSize ());
+            if (!FitsInt32Count (nItems) || !FitsAllocation (nItems, sizeof (API_DashItems))) {
+                attribute.linetype.nItems = 0;
+                return;
+            }
+            attribute.linetype.nItems = static_cast<Int32> (nItems);
 
             if (nItems > 0) {
-                attributeDef.ltype_dashItems = (API_DashItems**) BMAllocateHandle (nItems * sizeof (API_DashItems), ALLOCATE_CLEAR, 0);
-                for (UInt32 i = 0; i < nItems; ++i) {
+                API_DashItems** replacement = (API_DashItems**) BMAllocateHandle (nItems * sizeof (API_DashItems), ALLOCATE_CLEAR, 0);
+                if (replacement == nullptr || *replacement == nullptr) {
+                    if (replacement != nullptr)
+                        BMKillHandle (reinterpret_cast<GSHandle*> (&replacement));
+                    attribute.linetype.nItems = 0;
+                    return;
+                }
+                if (attributeDef.ltype_dashItems != nullptr)
+                    BMKillHandle (reinterpret_cast<GSHandle*> (&attributeDef.ltype_dashItems));
+                attributeDef.ltype_dashItems = replacement;
+                for (GSSize i = 0; i < nItems; ++i) {
                     API_DashItems& item = (*attributeDef.ltype_dashItems)[i];
                     dashItems[i].Get ("dash", item.dash);
                     dashItems[i].Get ("gap", item.gap);
                 }
+            } else if (attributeDef.ltype_dashItems != nullptr) {
+                BMKillHandle (reinterpret_cast<GSHandle*> (&attributeDef.ltype_dashItems));
+                attributeDef.ltype_dashItems = nullptr;
             }
         }
     } else if (lineType == "Symbol") {
         attribute.linetype.type = APILine_SymbolLine;
+        if (attributeDef.ltype_dashItems != nullptr) {
+            BMKillHandle (reinterpret_cast<GSHandle*> (&attributeDef.ltype_dashItems));
+            attributeDef.ltype_dashItems = nullptr;
+        }
         parameters.Get ("period", attribute.linetype.period);
         parameters.Get ("height", attribute.linetype.height);
 
         // Same reasoning as dashItems above: only rebuild lineItems/nItems if lineItems was actually supplied.
         GS::Array<GS::ObjectState> lineItems;
         if (parameters.Get ("lineItems", lineItems)) {
-            UInt32 nItems = lineItems.GetSize ();
-            attribute.linetype.nItems = (Int32) nItems;
+            const GSSize nItems = static_cast<GSSize> (lineItems.GetSize ());
+            if (!FitsInt32Count (nItems) || !FitsAllocation (nItems, sizeof (API_LineItems))) {
+                attribute.linetype.nItems = 0;
+                return;
+            }
+            attribute.linetype.nItems = static_cast<Int32> (nItems);
 
             if (nItems > 0) {
-                attributeDef.ltype_lineItems = (API_LineItems**) BMAllocateHandle (nItems * sizeof (API_LineItems), ALLOCATE_CLEAR, 0);
-                for (UInt32 i = 0; i < nItems; ++i) {
+                API_LineItems** replacement = (API_LineItems**) BMAllocateHandle (nItems * sizeof (API_LineItems), ALLOCATE_CLEAR, 0);
+                if (replacement == nullptr || *replacement == nullptr) {
+                    if (replacement != nullptr)
+                        BMKillHandle (reinterpret_cast<GSHandle*> (&replacement));
+                    attribute.linetype.nItems = 0;
+                    return;
+                }
+                if (attributeDef.ltype_lineItems != nullptr)
+                    BMKillHandle (reinterpret_cast<GSHandle*> (&attributeDef.ltype_lineItems));
+                attributeDef.ltype_lineItems = replacement;
+                for (GSSize i = 0; i < nItems; ++i) {
                     API_LineItems& item = (*attributeDef.ltype_lineItems)[i];
                     const GS::ObjectState& itemData = lineItems[i];
 
@@ -3385,10 +3523,20 @@ void CreateLinesCommand::SetTypeSpecificParameters (const GS::ObjectState& param
                     itemData.Get ("beginAngle", item.itemBegAngle);
                     itemData.Get ("endAngle", item.itemEndAngle);
                 }
+            } else if (attributeDef.ltype_lineItems != nullptr) {
+                BMKillHandle (reinterpret_cast<GSHandle*> (&attributeDef.ltype_lineItems));
+                attributeDef.ltype_lineItems = nullptr;
             }
         }
     } else {
         attribute.linetype.type = APILine_SolidLine;
+        if (attributeDef.ltype_dashItems != nullptr)
+            BMKillHandle (reinterpret_cast<GSHandle*> (&attributeDef.ltype_dashItems));
+        if (attributeDef.ltype_lineItems != nullptr)
+            BMKillHandle (reinterpret_cast<GSHandle*> (&attributeDef.ltype_lineItems));
+        attributeDef.ltype_dashItems = nullptr;
+        attributeDef.ltype_lineItems = nullptr;
+        attribute.linetype.nItems = 0;
     }
 }
 
@@ -3612,6 +3760,9 @@ GS::ObjectState CreateFillsCommand::Execute (const GS::ObjectState& parameters, 
     for (const GS::ObjectState& data : fillDataArray) {
         API_Attribute fill = {};
         API_AttributeDefExt fillDefs = {};
+        const GS::OnExit fillDefsGuard ([&fillDefs] () {
+            ACAPI_DisposeAttrDefsHdlsExt (&fillDefs);
+        });
         fill.header.typeID = API_FilltypeID;
 
         GS::UniString name;
@@ -3648,11 +3799,16 @@ GS::ObjectState CreateFillsCommand::Execute (const GS::ObjectState& parameters, 
         // "if (data.Get (...))" block overwrites the corresponding seeded handle with a freshly allocated one
         // when the caller does supply that geometry, exactly like CreateProfiles' profile_vectorImageItems.
         API_AttributeDefExt existingDefs = {};
+        const GS::OnExit existingDefsGuard ([&existingDefs] () {
+            ACAPI_DisposeAttrDefsHdlsExt (&existingDefs);
+        });
         if (doesExist) {
-            ACAPI_Attribute_GetDefExt (API_FilltypeID, fill.header.index, &existingDefs);
-            fillDefs.fill_lineItems = existingDefs.fill_lineItems;
-            fillDefs.fill_lineLength = existingDefs.fill_lineLength;
-            fillDefs.sfill_Items = existingDefs.sfill_Items;
+            const GSErrCode existingDefsErr = ACAPI_Attribute_GetDefExt (API_FilltypeID, fill.header.index, &existingDefs);
+            if (existingDefsErr != NoError) {
+                attributeIds (CreateErrorResponse (existingDefsErr, "Failed to read existing fill geometry."));
+                continue;
+            }
+            TransferFillDefinitionHandles (existingDefs, fillDefs);
         }
 
         // Only touch filltype.subType if subType was actually supplied, so an overwriteExisting call that omits
@@ -3762,43 +3918,86 @@ GS::ObjectState CreateFillsCommand::Execute (const GS::ObjectState& parameters, 
         // otherwise drop to 0).
         GS::Array<GS::ObjectState> lineItems;
         if (data.Get ("lineItems", lineItems)) {
-            UInt32 nItems = lineItems.GetSize ();
-            fill.filltype.linNumb = (Int32) nItems;
+            const GSSize nItems = static_cast<GSSize> (lineItems.GetSize ());
+            if (!FitsInt32Count (nItems) || !FitsAllocation (nItems, sizeof (API_FillLine))) {
+                attributeIds (CreateErrorResponse (APIERR_BADPARS, "Too many fill line items."));
+                continue;
+            }
 
+            GSSize totalLengths = 0;
+            bool invalidLengthData = false;
+            for (const GS::ObjectState& itemData : lineItems) {
+                GS::Array<double> lineLengths;
+                itemData.Get ("lineLengths", lineLengths);
+                const GSSize itemLengthCount = static_cast<GSSize> (lineLengths.GetSize ());
+                if (itemLengthCount > static_cast<GSSize> (std::numeric_limits<short>::max ()) ||
+                    (itemLengthCount % 2) != 0 ||
+                    totalLengths > static_cast<GSSize> (std::numeric_limits<Int32>::max ()) - itemLengthCount) {
+                    invalidLengthData = true;
+                    break;
+                }
+                totalLengths += itemLengthCount;
+            }
+            if (invalidLengthData) {
+                attributeIds (CreateErrorResponse (APIERR_BADPARS, "Invalid fill line length data."));
+                continue;
+            }
+            if (!FitsAllocation (totalLengths, sizeof (double))) {
+                attributeIds (CreateErrorResponse (APIERR_BADPARS, "Fill line length data is too large."));
+                continue;
+            }
+
+            API_FillLine** replacementLines = nullptr;
+            double** replacementLengths = nullptr;
             if (nItems > 0) {
-                fillDefs.fill_lineItems = (API_FillLine**) BMAllocateHandle (nItems * sizeof (API_FillLine), ALLOCATE_CLEAR, 0);
-
-                UInt32 totalLengths = 0;
-                for (const GS::ObjectState& itemData : lineItems) {
-                    GS::Array<double> lineLengths;
-                    itemData.Get ("lineLengths", lineLengths);
-                    totalLengths += lineLengths.GetSize ();
+                replacementLines = (API_FillLine**) BMAllocateHandle (nItems * sizeof (API_FillLine), ALLOCATE_CLEAR, 0);
+                if (replacementLines == nullptr || *replacementLines == nullptr) {
+                    if (replacementLines != nullptr)
+                        BMKillHandle (reinterpret_cast<GSHandle*> (&replacementLines));
+                    attributeIds (CreateErrorResponse (APIERR_MEMFULL, "Failed to allocate fill line items."));
+                    continue;
                 }
-                if (totalLengths > 0) {
-                    fillDefs.fill_lineLength = (double**) BMAllocateHandle (totalLengths * sizeof (double), ALLOCATE_CLEAR, 0);
+            }
+            if (totalLengths > 0) {
+                replacementLengths = (double**) BMAllocateHandle (totalLengths * sizeof (double), ALLOCATE_CLEAR, 0);
+                if (replacementLengths == nullptr || *replacementLengths == nullptr) {
+                    if (replacementLengths != nullptr)
+                        BMKillHandle (reinterpret_cast<GSHandle*> (&replacementLengths));
+                    if (replacementLines != nullptr)
+                        BMKillHandle (reinterpret_cast<GSHandle*> (&replacementLines));
+                    attributeIds (CreateErrorResponse (APIERR_MEMFULL, "Failed to allocate fill line lengths."));
+                    continue;
+                }
+            }
+
+            if (fillDefs.fill_lineItems != nullptr)
+                BMKillHandle (reinterpret_cast<GSHandle*> (&fillDefs.fill_lineItems));
+            if (fillDefs.fill_lineLength != nullptr)
+                BMKillHandle (reinterpret_cast<GSHandle*> (&fillDefs.fill_lineLength));
+            fillDefs.fill_lineItems = replacementLines;
+            fillDefs.fill_lineLength = replacementLengths;
+            fill.filltype.linNumb = static_cast<Int32> (nItems);
+
+            GSSize lengthOffset = 0;
+            for (GSSize i = 0; i < nItems; ++i) {
+                const GS::ObjectState& itemData = lineItems[i];
+                API_FillLine& item = (*fillDefs.fill_lineItems)[i];
+
+                itemData.Get ("frequency", item.lFreq);
+                itemData.Get ("direction", item.lDir);
+                itemData.Get ("offsetLine", item.lOffsetLine);
+                if (const GS::ObjectState* offset = itemData.Get ("offset")) {
+                    item.lOffset = Get2DCoordinateFromObjectState (*offset);
                 }
 
-                Int32 lengthOffset = 0;
-                for (UInt32 i = 0; i < nItems; ++i) {
-                    const GS::ObjectState& itemData = lineItems[i];
-                    API_FillLine& item = (*fillDefs.fill_lineItems)[i];
-
-                    itemData.Get ("frequency", item.lFreq);
-                    itemData.Get ("direction", item.lDir);
-                    itemData.Get ("offsetLine", item.lOffsetLine);
-                    if (const GS::ObjectState* offset = itemData.Get ("offset")) {
-                        item.lOffset = Get2DCoordinateFromObjectState (*offset);
-                    }
-
-                    GS::Array<double> lineLengths;
-                    itemData.Get ("lineLengths", lineLengths);
-                    item.lPartNumb = (short) lineLengths.GetSize ();
-                    item.lPartOffs = lengthOffset;
-                    for (UInt32 j = 0; j < lineLengths.GetSize (); ++j) {
-                        (*fillDefs.fill_lineLength)[lengthOffset + j] = lineLengths[j];
-                    }
-                    lengthOffset += (Int32) lineLengths.GetSize ();
+                GS::Array<double> lineLengths;
+                itemData.Get ("lineLengths", lineLengths);
+                item.lPartNumb = static_cast<short> (lineLengths.GetSize ());
+                item.lPartOffs = static_cast<Int32> (lengthOffset);
+                for (GSSize j = 0; j < static_cast<GSSize> (lineLengths.GetSize ()); ++j) {
+                    (*fillDefs.fill_lineLength)[lengthOffset + j] = lineLengths[j];
                 }
+                lengthOffset += static_cast<GSSize> (lineLengths.GetSize ());
             }
         }
 
@@ -3808,12 +4007,27 @@ GS::ObjectState CreateFillsCommand::Execute (const GS::ObjectState& parameters, 
         // (sfill_SolidFills) are not supported - not used by any real-world example seen so far.
         GS::Array<GS::ObjectState> symbolLines;
         if (data.Get ("symbolLines", symbolLines)) {
-            UInt32 nItems = symbolLines.GetSize ();
-            fill.filltype.linNumb = (Int32) nItems;
+            const GSSize nItems = static_cast<GSSize> (symbolLines.GetSize ());
+            if (!FitsInt32Count (nItems) || !FitsAllocation (nItems, sizeof (API_SFill_Line))) {
+                attributeIds (CreateErrorResponse (APIERR_BADPARS, "Too many symbol fill line items."));
+                continue;
+            }
 
+            API_SFill_Line** replacement = nullptr;
             if (nItems > 0) {
-                fillDefs.sfill_Items.sfill_Lines = (API_SFill_Line**) BMAllocateHandle (nItems * sizeof (API_SFill_Line), ALLOCATE_CLEAR, 0);
-                for (UInt32 i = 0; i < nItems; ++i) {
+                replacement = (API_SFill_Line**) BMAllocateHandle (nItems * sizeof (API_SFill_Line), ALLOCATE_CLEAR, 0);
+                if (replacement == nullptr || *replacement == nullptr) {
+                    if (replacement != nullptr)
+                        BMKillHandle (reinterpret_cast<GSHandle*> (&replacement));
+                    attributeIds (CreateErrorResponse (APIERR_MEMFULL, "Failed to allocate symbol fill lines."));
+                    continue;
+                }
+            }
+            if (fillDefs.sfill_Items.sfill_Lines != nullptr)
+                BMKillHandle (reinterpret_cast<GSHandle*> (&fillDefs.sfill_Items.sfill_Lines));
+            fillDefs.sfill_Items.sfill_Lines = replacement;
+            fill.filltype.linNumb = static_cast<Int32> (nItems);
+            for (GSSize i = 0; i < nItems; ++i) {
                     API_SFill_Line& item = (*fillDefs.sfill_Items.sfill_Lines)[i];
                     if (const GS::ObjectState* begin = symbolLines[i].Get ("begin")) {
                         item.begC = Get2DCoordinateFromObjectState (*begin);
@@ -3821,18 +4035,32 @@ GS::ObjectState CreateFillsCommand::Execute (const GS::ObjectState& parameters, 
                     if (const GS::ObjectState* end = symbolLines[i].Get ("end")) {
                         item.endC = Get2DCoordinateFromObjectState (*end);
                     }
-                }
             }
         }
 
         GS::Array<GS::ObjectState> symbolArcs;
         if (data.Get ("symbolArcs", symbolArcs)) {
-            UInt32 nItems = symbolArcs.GetSize ();
-            fill.filltype.arcNumb = (Int32) nItems;
+            const GSSize nItems = static_cast<GSSize> (symbolArcs.GetSize ());
+            if (!FitsInt32Count (nItems) || !FitsAllocation (nItems, sizeof (API_SFill_Arc))) {
+                attributeIds (CreateErrorResponse (APIERR_BADPARS, "Too many symbol fill arc items."));
+                continue;
+            }
 
+            API_SFill_Arc** replacement = nullptr;
             if (nItems > 0) {
-                fillDefs.sfill_Items.sfill_Arcs = (API_SFill_Arc**) BMAllocateHandle (nItems * sizeof (API_SFill_Arc), ALLOCATE_CLEAR, 0);
-                for (UInt32 i = 0; i < nItems; ++i) {
+                replacement = (API_SFill_Arc**) BMAllocateHandle (nItems * sizeof (API_SFill_Arc), ALLOCATE_CLEAR, 0);
+                if (replacement == nullptr || *replacement == nullptr) {
+                    if (replacement != nullptr)
+                        BMKillHandle (reinterpret_cast<GSHandle*> (&replacement));
+                    attributeIds (CreateErrorResponse (APIERR_MEMFULL, "Failed to allocate symbol fill arcs."));
+                    continue;
+                }
+            }
+            if (fillDefs.sfill_Items.sfill_Arcs != nullptr)
+                BMKillHandle (reinterpret_cast<GSHandle*> (&fillDefs.sfill_Items.sfill_Arcs));
+            fillDefs.sfill_Items.sfill_Arcs = replacement;
+            fill.filltype.arcNumb = static_cast<Int32> (nItems);
+            for (GSSize i = 0; i < nItems; ++i) {
                     API_SFill_Arc& item = (*fillDefs.sfill_Items.sfill_Arcs)[i];
                     if (const GS::ObjectState* begin = symbolArcs[i].Get ("begin")) {
                         item.begC = Get2DCoordinateFromObjectState (*begin);
@@ -3841,20 +4069,33 @@ GS::ObjectState CreateFillsCommand::Execute (const GS::ObjectState& parameters, 
                         item.origC = Get2DCoordinateFromObjectState (*origin);
                     }
                     symbolArcs[i].Get ("angle", item.angle);
-                }
             }
         }
 
         GS::Array<GS::ObjectState> symbolHotspots;
         if (data.Get ("symbolHotspots", symbolHotspots)) {
-            UInt32 nItems = symbolHotspots.GetSize ();
-            fill.filltype.hotNumb = (Int32) nItems;
+            const GSSize nItems = static_cast<GSSize> (symbolHotspots.GetSize ());
+            if (!FitsInt32Count (nItems) || !FitsAllocation (nItems, sizeof (API_Coord))) {
+                attributeIds (CreateErrorResponse (APIERR_BADPARS, "Too many symbol fill hotspots."));
+                continue;
+            }
 
+            API_Coord** replacement = nullptr;
             if (nItems > 0) {
-                fillDefs.sfill_Items.sfill_HotSpots = (API_Coord**) BMAllocateHandle (nItems * sizeof (API_Coord), ALLOCATE_CLEAR, 0);
-                for (UInt32 i = 0; i < nItems; ++i) {
-                    (*fillDefs.sfill_Items.sfill_HotSpots)[i] = Get2DCoordinateFromObjectState (symbolHotspots[i]);
+                replacement = (API_Coord**) BMAllocateHandle (nItems * sizeof (API_Coord), ALLOCATE_CLEAR, 0);
+                if (replacement == nullptr || *replacement == nullptr) {
+                    if (replacement != nullptr)
+                        BMKillHandle (reinterpret_cast<GSHandle*> (&replacement));
+                    attributeIds (CreateErrorResponse (APIERR_MEMFULL, "Failed to allocate symbol fill hotspots."));
+                    continue;
                 }
+            }
+            if (fillDefs.sfill_Items.sfill_HotSpots != nullptr)
+                BMKillHandle (reinterpret_cast<GSHandle*> (&fillDefs.sfill_Items.sfill_HotSpots));
+            fillDefs.sfill_Items.sfill_HotSpots = replacement;
+            fill.filltype.hotNumb = static_cast<Int32> (nItems);
+            for (GSSize i = 0; i < nItems; ++i) {
+                    (*fillDefs.sfill_Items.sfill_HotSpots)[i] = Get2DCoordinateFromObjectState (symbolHotspots[i]);
             }
         }
 
@@ -3862,20 +4103,17 @@ GS::ObjectState CreateFillsCommand::Execute (const GS::ObjectState& parameters, 
             GSErrCode err = ACAPI_Attribute_ModifyExt (&fill, &fillDefs);
             if (err != NoError) {
                 attributeIds (CreateErrorResponse (err, "Failed to modify."));
-                ACAPI_DisposeAttrDefsHdlsExt (&fillDefs);
                 continue;
             }
         } else {
             GSErrCode err = ACAPI_Attribute_CreateExt (&fill, &fillDefs);
             if (err != NoError) {
                 attributeIds (CreateErrorResponse (err, "Failed to create."));
-                ACAPI_DisposeAttrDefsHdlsExt (&fillDefs);
                 continue;
             }
         }
 
         attributeIds (CreateAttributeIdObjectState (fill.header.guid));
-        ACAPI_DisposeAttrDefsHdlsExt (&fillDefs);
     }
 
     return response;
@@ -3961,7 +4199,8 @@ void CreateZoneCategoriesCommand::SetTypeSpecificParameters (const GS::ObjectSta
     templateAttr.header.typeID = API_ZoneCatID;
     templateAttr.header.index = templateIndex;
     if (ACAPI_Attribute_Get (&templateAttr) == NoError) {
-        GS::ucscpy (attribute.zoneCat.stampName, templateAttr.zoneCat.stampName);
+        GS::ucsncpy (attribute.zoneCat.stampName, templateAttr.zoneCat.stampName, GS::ArraySize (attribute.zoneCat.stampName));
+        attribute.zoneCat.stampName[GS::ArraySize (attribute.zoneCat.stampName) - 1] = 0;
         attribute.zoneCat.stampMainGuid = templateAttr.zoneCat.stampMainGuid;
         attribute.zoneCat.stampRevGuid = templateAttr.zoneCat.stampRevGuid;
     }
@@ -4457,6 +4696,9 @@ GS::ObjectState CreatePenTablesCommand::Execute (const GS::ObjectState& paramete
     for (const GS::ObjectState& penTableData : penTableDataArray) {
         API_Attribute penTable = {};
         API_AttributeDefExt penTableDefs = {};
+        const GS::OnExit penTableDefsGuard ([&penTableDefs] () {
+            ACAPI_DisposeAttrDefsHdlsExt (&penTableDefs);
+        });
         penTable.header.typeID = API_PenTableID;
 
         GS::UniString name;
@@ -4515,24 +4757,33 @@ GS::ObjectState CreatePenTablesCommand::Execute (const GS::ObjectState& paramete
             }
         }
 
-        penTableDefs.penTable_Items = new GS::Array<API_Pen> ();
+        std::unique_ptr<GS::Array<API_Pen>> penItems (new (std::nothrow) GS::Array<API_Pen> ());
+        if (penItems == nullptr) {
+            attributeIds (CreateErrorResponse (APIERR_MEMFULL, "Failed to allocate Pen Table items."));
+            continue;
+        }
         if (sourceIndex.IsPositive ()) {
             API_AttributeDefExt sourceDefs = {};
+            const GS::OnExit sourceDefsGuard ([&sourceDefs] () {
+                ACAPI_DisposeAttrDefsHdlsExt (&sourceDefs);
+            });
             if (ACAPI_Attribute_GetDefExt (API_PenTableID, sourceIndex, &sourceDefs) == NoError && sourceDefs.penTable_Items != nullptr) {
                 for (const API_Pen& sourcePen : *sourceDefs.penTable_Items) {
-                    penTableDefs.penTable_Items->Push (sourcePen);
+                    penItems->Push (sourcePen);
                 }
-                ACAPI_DisposeAttrDefsHdlsExt (&sourceDefs);
             }
         }
-        for (short i = (short) penTableDefs.penTable_Items->GetSize (); i < 255; ++i) {
+        if (penItems->GetSize () > 255) {
+            attributeIds (CreateErrorResponse (APIERR_BADPARS, "Source Pen Table contains too many pens."));
+            continue;
+        }
+        for (GSSize i = static_cast<GSSize> (penItems->GetSize ()); i < 255; ++i) {
             API_Pen pen = {};
-            pen.index = i + 1;
+            pen.index = static_cast<short> (i + 1);
             pen.rgb = { 0.0, 0.0, 0.0 };
             pen.width = 0.1;
-            penTableDefs.penTable_Items->Push (pen);
+            penItems->Push (pen);
         }
-
         GS::Array<GS::ObjectState> pens;
         penTableData.Get ("pens", pens);
         for (const GS::ObjectState& penData : pens) {
@@ -4542,30 +4793,32 @@ GS::ObjectState CreatePenTablesCommand::Execute (const GS::ObjectState& paramete
                 continue;
             }
 
-            API_Pen& pen = (*penTableDefs.penTable_Items)[penIndex - 1];
+            API_Pen& pen = (*penItems)[static_cast<GSSize> (penIndex - 1)];
             GetColor (penData, "color", pen.rgb);
             penData.Get ("width", pen.width);
             SetCharProperty (&penData, "description", pen.description);
         }
 
+        // Transfer ownership only after all caller data has been applied.  The
+        // surrounding definition guard disposes the API-owned array on every
+        // return path after this point.
+        penTableDefs.penTable_Items = penItems.release ();
+
         if (doesExist) {
             GSErrCode err = ACAPI_Attribute_ModifyExt (&penTable, &penTableDefs);
             if (err != NoError) {
                 attributeIds (CreateErrorResponse (err, "Failed to modify."));
-                ACAPI_DisposeAttrDefsHdlsExt (&penTableDefs);
                 continue;
             }
         } else {
             GSErrCode err = ACAPI_Attribute_CreateExt (&penTable, &penTableDefs);
             if (err != NoError) {
                 attributeIds (CreateErrorResponse (err, "Failed to create."));
-                ACAPI_DisposeAttrDefsHdlsExt (&penTableDefs);
                 continue;
             }
         }
 
         attributeIds (CreateAttributeIdObjectState (penTable.header.guid));
-        ACAPI_DisposeAttrDefsHdlsExt (&penTableDefs);
     }
 
     return response;
@@ -4589,6 +4842,9 @@ GS::ObjectState CreatePenTablesCommand::Execute (const GS::ObjectState& paramete
     for (const GS::ObjectState& penTableData : penTableDataArray) {
         API_Attribute penTable = {};
         API_AttributeDefExt penTableDefs = {};
+        const GS::OnExit penTableDefsGuard ([&penTableDefs] () {
+            ACAPI_DisposeAttrDefsHdlsExt (&penTableDefs);
+        });
         penTable.header.typeID = API_PenTableID;
 
         GS::UniString name;
@@ -4641,23 +4897,30 @@ GS::ObjectState CreatePenTablesCommand::Execute (const GS::ObjectState& paramete
             }
         }
 
-        penTableDefs.penTable_Items = (API_PenType**) BMAllocateHandle (255 * sizeof (API_PenType), ALLOCATE_CLEAR, 0);
+        penTableDefs.penTable_Items = (API_PenType**) BMAllocateHandle (static_cast<GSSize> (255) * sizeof (API_PenType), ALLOCATE_CLEAR, 0);
+        if (penTableDefs.penTable_Items == nullptr || *penTableDefs.penTable_Items == nullptr) {
+            attributeIds (CreateErrorResponse (APIERR_MEMFULL, "Failed to allocate Pen Table items."));
+            continue;
+        }
 
         bool seeded = false;
         if (IsPositiveAttributeIndex (sourceIndex)) {
             API_AttributeDefExt sourceDefs = {};
-            if (ACAPI_Attribute_GetDefExt (API_PenTableID, sourceIndex, &sourceDefs) == NoError && sourceDefs.penTable_Items != nullptr) {
-                for (UInt32 i = 0; i < 255; ++i) {
+            const GS::OnExit sourceDefsGuard ([&sourceDefs] () {
+                ACAPI_DisposeAttrDefsHdlsExt (&sourceDefs);
+            });
+            if (ACAPI_Attribute_GetDefExt (API_PenTableID, sourceIndex, &sourceDefs) == NoError &&
+                sourceDefs.penTable_Items != nullptr && *sourceDefs.penTable_Items != nullptr) {
+                for (GSSize i = 0; i < 255; ++i) {
                     (*penTableDefs.penTable_Items)[i] = (*sourceDefs.penTable_Items)[i];
                 }
                 seeded = true;
-                ACAPI_DisposeAttrDefsHdlsExt (&sourceDefs);
             }
         }
         if (!seeded) {
-            for (short i = 0; i < 255; ++i) {
+            for (GSSize i = 0; i < 255; ++i) {
                 API_PenType& pen = (*penTableDefs.penTable_Items)[i];
-                pen.head.index = ACAPI_CreateAttributeIndex (i + 1);
+                pen.head.index = ACAPI_CreateAttributeIndex (static_cast<Int32> (i + 1));
                 pen.width = 0.1;
             }
         }
@@ -4671,7 +4934,7 @@ GS::ObjectState CreatePenTablesCommand::Execute (const GS::ObjectState& paramete
                 continue;
             }
 
-            API_PenType& pen = (*penTableDefs.penTable_Items)[penIndex - 1];
+            API_PenType& pen = (*penTableDefs.penTable_Items)[static_cast<GSSize> (penIndex - 1)];
             GetColor (penData, "color", pen.rgb);
             penData.Get ("width", pen.width);
             SetCharProperty (&penData, "description", pen.description);
@@ -4681,20 +4944,17 @@ GS::ObjectState CreatePenTablesCommand::Execute (const GS::ObjectState& paramete
             GSErrCode err = ACAPI_Attribute_ModifyExt (&penTable, &penTableDefs);
             if (err != NoError) {
                 attributeIds (CreateErrorResponse (err, "Failed to modify."));
-                ACAPI_DisposeAttrDefsHdlsExt (&penTableDefs);
                 continue;
             }
         } else {
             GSErrCode err = ACAPI_Attribute_CreateExt (&penTable, &penTableDefs);
             if (err != NoError) {
                 attributeIds (CreateErrorResponse (err, "Failed to create."));
-                ACAPI_DisposeAttrDefsHdlsExt (&penTableDefs);
                 continue;
             }
         }
 
         attributeIds (CreateAttributeIdObjectState (penTable.header.guid));
-        ACAPI_DisposeAttrDefsHdlsExt (&penTableDefs);
     }
 
     return response;
@@ -5302,6 +5562,9 @@ GS::ObjectState CreateCompositesCommand::Execute (const GS::ObjectState& paramet
     for (const GS::ObjectState& compositeData : compositeDataArray) {
         API_Attribute composite = {};
         API_AttributeDefExt	compositeDefs = {};
+        const GS::OnExit compositeDefsGuard ([&compositeDefs] () {
+            ACAPI_DisposeAttrDefsHdlsExt (&compositeDefs);
+        });
         composite.header.typeID = API_CompWallID;
 
         GS::UniString name;
@@ -5359,15 +5622,26 @@ GS::ObjectState CreateCompositesCommand::Execute (const GS::ObjectState& paramet
             attributeIds (CreateErrorResponse (Error, "Skin array is empty."));
             continue;
         }
-        if (separators.GetSize () != skins.GetSize () + 1) {
+        const GSSize componentCount = static_cast<GSSize> (skins.GetSize ());
+        const GSSize separatorCount = static_cast<GSSize> (separators.GetSize ());
+        if (componentCount == std::numeric_limits<GSSize>::max () || separatorCount != componentCount + 1) {
             attributeIds (CreateErrorResponse (Error, "Invalid separator count."));
             continue;
         }
+        if (!FitsInt32Count (componentCount) || componentCount > static_cast<GSSize> (std::numeric_limits<short>::max ()) ||
+            !FitsAllocation (componentCount, sizeof (API_CWallComponent)) ||
+            !FitsAllocation (separatorCount, sizeof (API_CWallLineComponent))) {
+            attributeIds (CreateErrorResponse (APIERR_BADPARS, "Composite contains too many components."));
+            continue;
+        }
 
-        UInt32 componentCount = skins.GetSize ();
         double totalThickness = 0.0;
         compositeDefs.cwall_compItems = (API_CWallComponent**) BMAllocateHandle (componentCount * sizeof (API_CWallComponent), ALLOCATE_CLEAR, 0);
-        for (UInt32 i = 0; i < componentCount; i++) {
+        if (compositeDefs.cwall_compItems == nullptr || *compositeDefs.cwall_compItems == nullptr) {
+            attributeIds (CreateErrorResponse (APIERR_MEMFULL, "Failed to allocate composite components."));
+            continue;
+        }
+        for (GSSize i = 0; i < componentCount; i++) {
             const GS::ObjectState& skinData = skins[i];
             API_CWallComponent& compData = (*compositeDefs.cwall_compItems)[i];
 
@@ -5391,11 +5665,15 @@ GS::ObjectState CreateCompositesCommand::Execute (const GS::ObjectState& paramet
             totalThickness += compData.fillThick;
         }
 
-        composite.compWall.nComps = (short) componentCount;
+        composite.compWall.nComps = static_cast<short> (componentCount);
         composite.compWall.totalThick = totalThickness;
 
-        compositeDefs.cwall_compLItems = (API_CWallLineComponent**) BMAllocateHandle ((componentCount + 1) * sizeof (API_CWallLineComponent), ALLOCATE_CLEAR, 0);
-        for (UInt32 i = 0; i < componentCount + 1; i++) {
+        compositeDefs.cwall_compLItems = (API_CWallLineComponent**) BMAllocateHandle (separatorCount * sizeof (API_CWallLineComponent), ALLOCATE_CLEAR, 0);
+        if (compositeDefs.cwall_compLItems == nullptr || *compositeDefs.cwall_compLItems == nullptr) {
+            attributeIds (CreateErrorResponse (APIERR_MEMFULL, "Failed to allocate composite separator data."));
+            continue;
+        }
+        for (GSSize i = 0; i < separatorCount; i++) {
             const GS::ObjectState& separatorData = separators[i];
             API_CWallLineComponent& lineData = (*compositeDefs.cwall_compLItems)[i];
 
@@ -5413,20 +5691,17 @@ GS::ObjectState CreateCompositesCommand::Execute (const GS::ObjectState& paramet
             GSErrCode err = ACAPI_Attribute_ModifyExt (&composite, &compositeDefs);
             if (err != NoError) {
                 attributeIds (CreateErrorResponse (err, "Failed to modify attribute."));
-                ACAPI_DisposeAttrDefsHdlsExt (&compositeDefs);
                 continue;
             }
         } else {
             GSErrCode err = ACAPI_Attribute_CreateExt (&composite, &compositeDefs);
             if (err != NoError) {
                 attributeIds (CreateErrorResponse (err, "Failed to create attribute."));
-                ACAPI_DisposeAttrDefsHdlsExt (&compositeDefs);
                 continue;
             }
         }
 
         attributeIds (CreateAttributeIdObjectState (composite.header.guid));
-        ACAPI_DisposeAttrDefsHdlsExt (&compositeDefs);
     }
 
     return response;

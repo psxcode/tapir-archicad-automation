@@ -3,6 +3,9 @@
 #include "SchemaDefinitions.hpp"
 #include "MigrationHelper.hpp"
 
+#include <limits>
+#include <new>
+
 constexpr double EPS = 0.001;
 constexpr const char* CommandNamespace = "TapirCommand";
 
@@ -36,7 +39,10 @@ bool CommandBase::IsProcessWindowVisible () const
 GS::Optional<GS::UniString> CommandBase::GetSchemaDefinitions () const
 {
     if (mCommonSchema == CommonSchema::Used) {
-        return GetCommonSchemaDefinitions ();
+        const GS::Optional<GS::UniString> definitions = GetCommonSchemaDefinitions ();
+        if (definitions.IsEmpty ())
+            return {};
+        return definitions;
     } else {
         return {};
     }
@@ -71,6 +77,42 @@ GS::ObjectState CreateSuccessfulExecutionResult ()
 {
     return GS::ObjectState (
         "success", true);
+}
+
+GS::ObjectState CreateNativePageRequiredResponse (const GS::UniString& message, const Int32 enumerated, const Int32 emitted)
+{
+    GS::ObjectState response;
+    response.Add ("pageRequired", true);
+    response.Add ("code", "NATIVE_PAGE_REQUIRED");
+    response.Add ("message", message);
+    response.Add ("enumerated", enumerated);
+    response.Add ("emitted", emitted);
+    return response;
+}
+
+GS::ObjectState CreateNativeResourceLimitResponse (const GS::UniString& message, const Int32 enumerated, const Int32 emitted)
+{
+    GS::ObjectState response;
+    response.Add ("resourceLimit", true);
+    response.Add ("code", "NATIVE_RESOURCE_LIMIT");
+    response.Add ("message", message);
+    response.Add ("enumerated", enumerated);
+    response.Add ("emitted", emitted);
+    return response;
+}
+
+bool ReadNativePageSize (const GS::ObjectState& parameters, const Int32 defaultValue, Int32& pageSize)
+{
+    pageSize = defaultValue;
+    Int32 requested = 0;
+    if (!parameters.Get ("pageSize", requested))
+        return true;
+
+    if (requested < 1)
+        return false;
+
+    pageSize = requested;
+    return true;
 }
 
 API_Guid GetGuidFromObjectState (const GS::ObjectState& os)
@@ -136,43 +178,97 @@ GS::ObjectState CreatePolyArcObjectState (const API_PolyArc& a)
 
 std::vector<PolygonData> GetPolygonsFromMemoCoords (const API_Guid& elemGuid, bool includeZCoords)
 {
+    try {
     API_ElementMemo memo = {};
     const GS::OnExit guard ([&memo] () { ACAPI_DisposeElemMemoHdls (&memo); });
     const UInt64 mask = includeZCoords ? APIMemoMask_Polygon | APIMemoMask_MeshPolyZ : APIMemoMask_Polygon;
-    if (ACAPI_Element_GetMemo (elemGuid, &memo, mask) != NoError || memo.coords == nullptr) {
+    if (ACAPI_Element_GetMemo (elemGuid, &memo, mask) != NoError || memo.coords == nullptr || *memo.coords == nullptr) {
         return {};
     }
 
-    const GSSize nPolys = memo.pends == nullptr
-        ? 1
-        : BMhGetSize (reinterpret_cast<GSHandle> (memo.pends)) / sizeof (Int32) - 1;
+    const GSSize coordsBytes = BMhGetSize (reinterpret_cast<GSHandle> (memo.coords));
+    constexpr GSSize maxMemoCoordinates = 1'000'000;
+    constexpr GSSize maxMemoPolygons = 100'000;
+    constexpr GSSize maxMemoArcs = 1'000'000;
+    if (coordsBytes < static_cast<GSSize> (2 * sizeof (API_Coord)) ||
+        coordsBytes % static_cast<GSSize> (sizeof (API_Coord)) != 0 ||
+        coordsBytes > maxMemoCoordinates * static_cast<GSSize> (sizeof (API_Coord)))
+        return {};
+    const GSSize coordCount = coordsBytes / sizeof (API_Coord);
+    if (coordCount < 2 || coordCount > maxMemoCoordinates || coordCount > static_cast<GSSize> (std::numeric_limits<Int32>::max ()))
+        return {};
+
+    GSSize nPolys = 1;
+    if (memo.pends != nullptr) {
+        if (*memo.pends == nullptr)
+            return {};
+        const GSSize pendsBytes = BMhGetSize (reinterpret_cast<GSHandle> (memo.pends));
+        if (pendsBytes < static_cast<GSSize> (sizeof (Int32)) ||
+            pendsBytes % static_cast<GSSize> (sizeof (Int32)) != 0 ||
+            pendsBytes > (maxMemoPolygons + 1) * static_cast<GSSize> (sizeof (Int32)))
+            return {};
+        nPolys = pendsBytes / sizeof (Int32) - 1;
+        if (nPolys == 0 || nPolys > coordCount || nPolys > maxMemoPolygons)
+            return {};
+    }
+
+    if (includeZCoords) {
+        if (memo.meshPolyZ == nullptr || *memo.meshPolyZ == nullptr)
+            return {};
+        const GSSize zBytes = BMhGetSize (reinterpret_cast<GSHandle> (memo.meshPolyZ));
+        if (coordCount > std::numeric_limits<GSSize>::max () / static_cast<GSSize> (sizeof (double)) ||
+            zBytes < coordCount * static_cast<GSSize> (sizeof (double)) ||
+            zBytes % static_cast<GSSize> (sizeof (double)) != 0)
+            return {};
+    }
+
     std::vector<std::pair<GS::Int32, GS::Int32>> startEndIndices;
     startEndIndices.reserve (nPolys);
     std::vector<PolygonData> polygons (nPolys);
     Int32 startIndex = 1;
     for (GSIndex iPoly = 0; iPoly < nPolys; ++iPoly) {
         Int32 endIndex = memo.pends == nullptr
-            ? (BMhGetSize (reinterpret_cast<GSHandle> (memo.coords)) / sizeof (API_Coord)) - 1
+            ? static_cast<Int32> (coordCount - 1)
             : (*memo.pends)[iPoly + 1];
+        if (endIndex < startIndex || endIndex >= static_cast<Int32> (coordCount))
+            return {};
         startEndIndices.emplace_back (startIndex, endIndex);
         std::vector<API_Coord>& coords = polygons[iPoly].coords;
         coords.reserve (endIndex - startIndex + 1);
         for (GSIndex iCoord = startIndex; iCoord <= endIndex; ++iCoord) {
-            coords.push_back ((*memo.coords)[iCoord]);
+            const API_Coord coordinate = (*memo.coords)[iCoord];
+            if (!std::isfinite (coordinate.x) || !std::isfinite (coordinate.y))
+                return {};
+            coords.push_back (coordinate);
         }
         if (includeZCoords) {
             std::vector<double>& zCoords = polygons[iPoly].zCoords;
             zCoords.reserve (endIndex - startIndex + 1);
             for (GSIndex iCoord = startIndex; iCoord <= endIndex; ++iCoord) {
-                zCoords.push_back ((*memo.meshPolyZ)[iCoord]);
+                const double z = (*memo.meshPolyZ)[iCoord];
+                if (!std::isfinite (z))
+                    return {};
+                zCoords.push_back (z);
             }
         }
         startIndex = endIndex + 1;
     }
 
-    const GSSize nArcs = BMhGetSize (reinterpret_cast<GSHandle> (memo.parcs)) / sizeof (API_PolyArc);
+    if (memo.parcs == nullptr)
+        return polygons;
+    if (*memo.parcs == nullptr)
+        return {};
+    const GSSize parcsBytes = BMhGetSize (reinterpret_cast<GSHandle> (memo.parcs));
+    if (parcsBytes < 0 || parcsBytes % static_cast<GSSize> (sizeof (API_PolyArc)) != 0)
+        return {};
+    const GSSize nArcs = parcsBytes / sizeof (API_PolyArc);
+    if (nArcs > maxMemoArcs)
+        return {};
     for (GSIndex iArc = 0; iArc < nArcs; ++iArc) {
-        API_PolyArc& arc = (*memo.parcs)[iArc];
+        API_PolyArc arc = (*memo.parcs)[iArc];
+        if (arc.begIndex < 1 || arc.endIndex < arc.begIndex ||
+            arc.endIndex >= static_cast<Int32> (coordCount) || !std::isfinite (arc.arcAngle))
+            return {};
         GSIndex iPoly = 0;
         for (; iPoly < nPolys; ++iPoly) {
             const auto& startEndPair = startEndIndices[iPoly];
@@ -182,10 +278,15 @@ std::vector<PolygonData> GetPolygonsFromMemoCoords (const API_Guid& elemGuid, bo
                 break;
             }
         }
+        if (iPoly >= nPolys)
+            return {};
         polygons[iPoly].arcs.push_back (arc);
     }
 
     return polygons;
+    } catch (const std::bad_alloc&) {
+        return {};
+    }
 }
 
 void AddPolygonFromMemoCoords (const API_Guid& elemGuid, GS::ObjectState& os, const GS::String& coordsFieldName, const GS::Optional<GS::String>& arcsFieldName)
@@ -324,15 +425,23 @@ Stories GetStories ()
     Stories stories;
     API_StoryInfo storyInfo = {};
 
+    const GS::OnExit storyInfoGuard ([&storyInfo] () {
+        if (storyInfo.data != nullptr)
+            BMKillHandle (reinterpret_cast<GSHandle*> (&storyInfo.data));
+    });
+
     GSErrCode err = ACAPI_ProjectSetting_GetStorySettings (&storyInfo);
 
-    if (err == NoError) {
-        const short numberOfStories = storyInfo.lastStory - storyInfo.firstStory + 1;
-        for (short i = 0; i < numberOfStories; ++i) {
+    if (err == NoError && storyInfo.data != nullptr && *storyInfo.data != nullptr) {
+        const Int32 numberOfStories = static_cast<Int32> (storyInfo.lastStory)
+            - static_cast<Int32> (storyInfo.firstStory) + 1;
+        const GSSize dataCount = BMhGetSize (reinterpret_cast<GSHandle> (storyInfo.data)) / sizeof (API_StoryType);
+        if (numberOfStories <= 0 || static_cast<GSSize> (numberOfStories) > dataCount)
+            return stories;
+        for (Int32 i = 0; i < numberOfStories; ++i) {
             const Story story = { (*storyInfo.data)[i].index, (*storyInfo.data)[i].level };
             stories.emplace ((*storyInfo.data)[i].index, story);
         }
-        BMKillHandle ((GSHandle*) &storyInfo.data);
     }
 
     return stories;

@@ -2,6 +2,9 @@
 
 #include "MigrationHelper.hpp"
 
+#include <limits>
+#include <memory>
+
 namespace {
 
 GS::ObjectState CreateDatabasesResponse (const GS::Array<GS::ObjectState>& databases)
@@ -353,7 +356,13 @@ GS::ObjectState CreateLayoutCommand::Execute (const GS::ObjectState& parameters,
 #endif
 
         API_LayoutInfo masterLayoutInfo = {};
-        if (GetLayoutInfoForDatabase (masterLayoutDbInfo.databaseUnId, masterLayoutInfo)) {
+        const bool masterLayoutInfoRead = GetLayoutInfoForDatabase (masterLayoutDbInfo.databaseUnId, masterLayoutInfo);
+        // ACAPI_Navigator_GetLayoutSets allocates customData for the caller.  The
+        // layout creation path only copies scalar settings, so keep the returned
+        // table under RAII even when the API reports an error.
+        std::unique_ptr<GS::HashTable<API_Guid, GS::UniString>> masterLayoutCustomData (masterLayoutInfo.customData);
+        masterLayoutInfo.customData = nullptr;
+        if (masterLayoutInfoRead) {
             layoutInfo.sizeX = masterLayoutInfo.sizeX;
             layoutInfo.sizeY = masterLayoutInfo.sizeY;
             layoutInfo.leftMargin = masterLayoutInfo.leftMargin;
@@ -570,7 +579,7 @@ GS::Optional<GS::UniString> CreateDrawingsCommand::GetInputParametersSchema () c
                         "layoutDatabaseId": { "$ref": "#/DatabaseId" },
                         "name": { "type": "string", "minLength": 1 },
                         "position": { "$ref": "#/Coordinate2D" },
-                        "scale": { "type": "number", "exclusiveMinimum": 0.0 },
+                        "scale": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
                         "clipPolygon": { "type": "array", "items": { "$ref": "#/Coordinate2D" }, "minItems": 3 }
                     },
                     "additionalProperties": false,
@@ -639,11 +648,17 @@ GS::ObjectState CreateDrawingsCommand::Execute (const GS::ObjectState& parameter
                 continue;
             }
 
-            element.drawing.drawingGuid = GetGuidFromObjectState (*item.Get ("navigatorItemId"));
+            const GS::ObjectState* navigatorItemId = item.Get ("navigatorItemId");
+            const GS::ObjectState* position = item.Get ("position");
+            if (navigatorItemId == nullptr || position == nullptr) {
+                elementResults.Push (CreateErrorResponse (APIERR_BADPARS, "navigatorItemId and position are required."));
+                continue;
+            }
+            element.drawing.drawingGuid = GetGuidFromObjectState (*navigatorItemId);
             SetCharProperty (&item, "name", element.drawing.name);
             element.drawing.nameType = APIName_CustomName;
             element.drawing.anchorPoint = APIAnc_MM;
-            element.drawing.pos = Get2DCoordinateFromObjectState (*item.Get ("position"));
+            element.drawing.pos = Get2DCoordinateFromObjectState (*position);
             if (!item.Get ("scale", element.drawing.ratio)) {
                 element.drawing.ratio = 1.0;
             }
@@ -657,25 +672,37 @@ GS::ObjectState CreateDrawingsCommand::Execute (const GS::ObjectState& parameter
                 if (IsSame2DCoordinate (first, last))
                     clipCoords.Pop ();
             }
-            const Int32 nClip = (Int32) clipCoords.GetSize ();
+            const GSSize clipCoordinateCount = static_cast<GSSize> (clipCoords.GetSize ());
+            if (clipCoordinateCount > static_cast<GSSize> (std::numeric_limits<Int32>::max () - 1)) {
+                elementResults.Push (CreateErrorResponse (APIERR_BADPARS, "Drawing clip polygon is too large."));
+                continue;
+            }
+            const Int32 nClip = static_cast<Int32> (clipCoordinateCount);
 
             API_ElementMemo memo = {};
+            const GS::OnExit memoGuard ([&memo] () { ACAPI_DisposeElemMemoHdls (&memo); });
             if (nClip >= 3) {
                 element.drawing.isCutWithFrame = true;
                 element.drawing.poly.nSubPolys = 1;
                 element.drawing.poly.nCoords   = nClip + 1;
                 element.drawing.poly.nArcs     = 0;
-                memo.coords = reinterpret_cast<API_Coord**> (BMAllocateHandle ((nClip + 2) * sizeof (API_Coord), ALLOCATE_CLEAR, 0));
-                memo.pends  = reinterpret_cast<Int32**>     (BMAllocateHandle (2 * sizeof (Int32), ALLOCATE_CLEAR, 0));
-                if (memo.coords != nullptr && memo.pends != nullptr) {
-                    for (Int32 i = 0; i < nClip; ++i)
-                        (*memo.coords)[i + 1] = Get2DCoordinateFromObjectState (clipCoords[i]);
-                    (*memo.coords)[nClip + 1] = (*memo.coords)[1];
-                    (*memo.pends)[1] = nClip + 1;
+                const GSSize coordCount = clipCoordinateCount + 2;
+                if (coordCount > std::numeric_limits<GSSize>::max () / sizeof (API_Coord)) {
+                    elementResults.Push (CreateErrorResponse (APIERR_BADPARS, "Drawing clip polygon is too large."));
+                    continue;
                 }
+                memo.coords = reinterpret_cast<API_Coord**> (BMAllocateHandle (coordCount * sizeof (API_Coord), ALLOCATE_CLEAR, 0));
+                memo.pends  = reinterpret_cast<Int32**>     (BMAllocateHandle (static_cast<GSSize> (2) * sizeof (Int32), ALLOCATE_CLEAR, 0));
+                if (memo.coords == nullptr || *memo.coords == nullptr || memo.pends == nullptr || *memo.pends == nullptr) {
+                    elementResults.Push (CreateErrorResponse (APIERR_MEMFULL, "Failed to allocate drawing clip polygon memo data."));
+                    continue;
+                }
+                for (Int32 i = 0; i < nClip; ++i)
+                    (*memo.coords)[i + 1] = Get2DCoordinateFromObjectState (clipCoords[i]);
+                (*memo.coords)[nClip + 1] = (*memo.coords)[1];
+                (*memo.pends)[1] = nClip + 1;
             }
             err = ACAPI_Element_Create (&element, &memo);
-            ACAPI_DisposeElemMemoHdls (&memo);
 
             if (err != NoError) {
                 elementResults.Push (CreateErrorResponse (err, "Failed to create drawing."));
@@ -837,6 +864,7 @@ GS::ObjectState GetLayoutSettingsCommand::Execute (const GS::ObjectState& parame
             layoutSettingsList (CreateErrorResponse (err, "Failed to get layout settings."));
             continue;
         }
+        std::unique_ptr<GS::HashTable<API_Guid, GS::UniString>> customData (layoutInfo.customData);
 
         GS::ObjectState layoutResult (
             "layoutName",               GS::UniString (layoutInfo.layoutName),
@@ -875,7 +903,6 @@ GS::ObjectState GetLayoutSettingsCommand::Execute (const GS::ObjectState& parame
             }
         }
 
-        delete layoutInfo.customData;
         layoutInfo.customData = nullptr;
 
         layoutSettingsList (layoutResult);
@@ -1017,6 +1044,7 @@ GS::ObjectState SetLayoutSettingsCommand::Execute (const GS::ObjectState& parame
             executionResults.Push (CreateFailedExecutionResult (err, "Failed to read current layout settings."));
             continue;
         }
+        std::unique_ptr<GS::HashTable<API_Guid, GS::UniString>> customData (layoutInfo.customData);
 
 #ifdef ServerMainVers_2600
         SetUCharProperty (&item, "layoutName", layoutInfo.layoutName);
@@ -1050,8 +1078,8 @@ GS::ObjectState SetLayoutSettingsCommand::Execute (const GS::ObjectState& parame
 #endif
             }
 
-            delete layoutInfo.customData;
-            layoutInfo.customData = new GS::HashTable<API_Guid, GS::UniString> ();
+            customData = std::make_unique<GS::HashTable<API_Guid, GS::UniString>> ();
+            layoutInfo.customData = customData.get ();
             for (const auto& cd : customDataItems) {
                 GS::UniString keyStr, value;
                 if (!cd.Get ("customSchemeKey", keyStr)) {
@@ -1067,7 +1095,6 @@ GS::ObjectState SetLayoutSettingsCommand::Execute (const GS::ObjectState& parame
         }
 
         err = ACAPI_Navigator_ChangeLayoutSets (&layoutInfo, &dbInfo.databaseUnId);
-        delete layoutInfo.customData;
         layoutInfo.customData = nullptr;
 
         if (err != NoError) {
@@ -1075,6 +1102,7 @@ GS::ObjectState SetLayoutSettingsCommand::Execute (const GS::ObjectState& parame
         } else if (showMasterBelowProvided) {
             API_LayoutInfo verifyInfo = {};
             const GSErrCode verifyErr = ACAPI_Navigator_GetLayoutSets (&verifyInfo, &dbInfo.databaseUnId);
+            std::unique_ptr<GS::HashTable<API_Guid, GS::UniString>> verifyCustomData (verifyInfo.customData);
             if (verifyErr == NoError && verifyInfo.showMasterBelow != showMasterBelowRequested) {
                 executionResults.Push (CreateFailedExecutionResult (APIERR_NOTSUPPORTED,
                     "showMasterBelow cannot be changed for this layout type via the API."));

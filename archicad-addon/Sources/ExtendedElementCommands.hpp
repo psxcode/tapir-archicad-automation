@@ -11,7 +11,7 @@ GS::Optional<GS::UniString> BuildMeshPolyMemoFromGeometry (
     const GS::Array<GS::ObjectState>& polygonArcs,
     const GS::Array<GS::ObjectState>& holes);
 
-void BuildMeshSublinesMemoFromGeometry (
+GSErrCode BuildMeshSublinesMemoFromGeometry (
     API_Element& elem,
     API_ElementMemo& memo,
     const GS::Array<GS::ObjectState>& sublines);

@@ -264,7 +264,6 @@ GS::ObjectState ChangeWindowCommand::Execute (const GS::ObjectState& parameters,
 {
     const GS::ObjectState* navigatorItemId = parameters.Get ("navigatorItemId");
     if (navigatorItemId != nullptr) {
-#if defined (ServerMainVers_2700)
         API_Guid navGuid = GetGuidFromObjectState (*navigatorItemId);
         if (navGuid == APINULLGuid) {
             return CreateFailedExecutionResult (APIERR_BADPARS, "navigatorItemId is corrupt or missing");
@@ -292,16 +291,33 @@ GS::ObjectState ChangeWindowCommand::Execute (const GS::ObjectState& parameters,
         }
 
         // ACAPI_View_GoToView applies the view's saved settings (layer combo,
-        // scale, MVO, dim, zoom). The whole point of accepting navigatorItemId
-        // is to apply those settings, so AC25/26 (without GoToView) rejects
-        // rather than silently falling back to a plain database/window switch.
+        // scale, MVO, dim, zoom) on AC27+.  Older SDKs do not expose that
+        // function, but they do expose the legacy navigator transition.  It
+        // changes the active window/story and is therefore preferable to the
+        // old NOTSUPPORTED response for story-aware rendering.  Node still
+        // verifies GetStories.actStory after either route; a successful native
+        // command without a visible story transition is not sufficient.
+#if defined (ServerMainVers_2700)
         const GS::UniString guidStr = APIGuidToString (navGuid);
         err = ACAPI_View_GoToView (guidStr.ToCStr ().Get ());
         return err == NoError
             ? CreateSuccessfulExecutionResult ()
             : CreateErrorResponse (err, "Failed to activate the view");
 #else
-        return CreateFailedExecutionResult (APIERR_NOTSUPPORTED, "navigatorItemId requires Archicad 27 or later; use databaseId instead.");
+        // ACAPI_Navigator_ChangeNavigatorItem only updates the Navigator
+        // state on AC25/26; it does not activate the visible window.  The
+        // legacy SDK example uses the Automate API for the actual transition
+        // and then explicitly changes the story for Floor Plan items.
+        err = ACAPI_Automate (APIDo_ChangeWindowID, &navigatorItem.db);
+        if (err == NoError && navigatorItem.db.typeID == APIWind_FloorPlanID) {
+            API_StoryCmdType storyCommand = {};
+            storyCommand.action = APIStory_GoTo;
+            storyCommand.index = navigatorItem.floorNum;
+            err = ACAPI_Environment (APIEnv_ChangeStorySettingsID, &storyCommand);
+        }
+        return err == NoError
+            ? CreateSuccessfulExecutionResult ()
+            : CreateErrorResponse (err, "Failed to activate the navigator item");
 #endif
     }
 
