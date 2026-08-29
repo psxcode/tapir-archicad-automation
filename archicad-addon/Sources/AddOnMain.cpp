@@ -91,7 +91,7 @@ GSErrCode RegisterCommand (CommandGroup& group, const GS::UniString& version, co
         // has taken ownership across the ABI boundary.
         const GS::Optional<GS::UniString> schemaDefinitions = command->GetSchemaDefinitions ();
         const GS::Optional<GS::UniString> inputSchema = command->GetInputParametersSchema ();
-        const GS::Optional<GS::UniString> responseSchema = command->GetResponseSchema ();
+        const GS::Optional<GS::UniString> responseSchema = command->GetRawResponseSchema ();
         (void) schemaDefinitions;
 
         // Build all metadata before transferring ownership to Archicad.  No

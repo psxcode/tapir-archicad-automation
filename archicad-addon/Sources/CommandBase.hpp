@@ -30,6 +30,10 @@ public:
     virtual GS::Optional<GS::UniString> GetSchemaDefinitions () const override final;
     virtual GS::Optional<GS::UniString> GetInputParametersSchema () const override;
     virtual GS::Optional<GS::UniString> GetResponseSchema () const override;
+    // The raw response schema is kept for generated command documentation.  A
+    // command may leave the API-facing response schema empty when its error
+    // envelope is intentionally broader than its success shape.
+    virtual GS::Optional<GS::UniString> GetRawResponseSchema () const;
 
 private:
     CommonSchema mCommonSchema;

@@ -58,6 +58,13 @@ GS::Optional<GS::UniString> CommandBase::GetResponseSchema () const
     return {};
 }
 
+GS::Optional<GS::UniString> CommandBase::GetRawResponseSchema () const
+{
+    // Preserve the existing documentation for legacy commands while allowing
+    // project-owned commands to opt out of Archicad-side response validation.
+    return GetResponseSchema ();
+}
+
 GS::ObjectState CreateErrorResponse (GSErrCode errorCode, const GS::UniString& errorMessage)
 {
     GS::ObjectState error;

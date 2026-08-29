@@ -229,31 +229,84 @@ GS::Optional<GS::UniString> ValidateCoordinateArrayField (
         }
     }
 
+    GSSize effectiveSize = static_cast<GSSize> (coordinates.GetSize ());
+    if (effectiveSize > 1 && IsSame2DCoordinate (coordinates.GetFirst (), coordinates.GetLast ())) {
+        --effectiveSize;
+    }
+    if (effectiveSize < minimumSize) {
+        return GS::UniString::Printf (
+            "'%s' must contain at least %d distinct coordinates after removing a closing duplicate.",
+            fieldName,
+            static_cast<int> (minimumSize));
+    }
+
+    for (GSSize i = 0; i < effectiveSize; ++i) {
+        for (GSSize j = i + 1; j < effectiveSize; ++j) {
+            if (IsSame2DCoordinate (coordinates[i], coordinates[j])) {
+                return GS::UniString::Printf ("'%s' contains duplicate coordinates and is not a valid polygon.", fieldName);
+            }
+        }
+    }
+
+    double twiceArea = 0.0;
+    for (GSSize i = 0; i < effectiveSize; ++i) {
+        const GSSize next = (i + 1 < effectiveSize) ? i + 1 : 0;
+        const API_Coord current = Get2DCoordinateFromObjectState (coordinates[i]);
+        const API_Coord following = Get2DCoordinateFromObjectState (coordinates[next]);
+        twiceArea += current.x * following.y - following.x * current.y;
+    }
+    if (std::abs (twiceArea) <= 1.0e-12) {
+        return GS::UniString::Printf ("'%s' must enclose a non-zero area.", fieldName);
+    }
+
     return {};
 }
 
-GS::Optional<GS::UniString> ValidateArcArrayField (const GS::ObjectState& payload)
+GS::Optional<GS::UniString> ValidateArcArray (
+    const GS::Array<GS::ObjectState>& arcs,
+    const GSSize coordinateCount,
+    const char* fieldName)
 {
-    if (!payload.Contains ("polygonArcs")) {
-        return {};
-    }
-
-    GS::Array<GS::ObjectState> arcs;
-    if (!payload.Get ("polygonArcs", arcs)) {
-        return "'polygonArcs' must be an array.";
-    }
-
     for (const GS::ObjectState& arc : arcs) {
         Int32 beginIndex = 0;
         Int32 endIndex = 0;
         double angle = 0.0;
         if (!arc.Get ("begIndex", beginIndex) || !arc.Get ("endIndex", endIndex) ||
-            !arc.Get ("arcAngle", angle) || beginIndex < 0 || endIndex < beginIndex || !std::isfinite (angle)) {
-            return "Every polygon arc must contain valid indices and a finite 'arcAngle'.";
+            !arc.Get ("arcAngle", angle) || beginIndex < 0 || endIndex < beginIndex ||
+            static_cast<GSSize> (beginIndex) >= coordinateCount ||
+            static_cast<GSSize> (endIndex) >= coordinateCount || !std::isfinite (angle)) {
+            return GS::UniString::Printf (
+                "Every polygon arc in '%s' must contain ordered indices within the coordinate array and a finite 'arcAngle'.",
+                fieldName);
         }
     }
 
     return {};
+}
+
+GS::Optional<GS::UniString> ValidateArcArrayField (
+    const GS::ObjectState& payload,
+    const char* coordinateFieldName,
+    const char* fieldName)
+{
+    if (!payload.Contains ("polygonArcs")) {
+        return {};
+    }
+
+    GS::Array<GS::ObjectState> coordinates;
+    if (!payload.Get (coordinateFieldName, coordinates)) {
+        return GS::UniString::Printf ("'polygonArcs' requires '%s'.", coordinateFieldName);
+    }
+    GS::Array<GS::ObjectState> arcs;
+    if (!payload.Get ("polygonArcs", arcs)) {
+        return "'polygonArcs' must be an array.";
+    }
+
+    GSSize coordinateCount = static_cast<GSSize> (coordinates.GetSize ());
+    if (coordinateCount > 1 && IsSame2DCoordinate (coordinates.GetFirst (), coordinates.GetLast ())) {
+        --coordinateCount;
+    }
+    return ValidateArcArray (arcs, coordinateCount, fieldName);
 }
 
 GS::Optional<GS::UniString> ValidateHolesField (const GS::ObjectState& payload)
@@ -268,10 +321,35 @@ GS::Optional<GS::UniString> ValidateHolesField (const GS::ObjectState& payload)
     }
 
     for (const GS::ObjectState& hole : holes) {
-        const char* coordinateField = hole.Contains ("polygonCoordinates") ? "polygonCoordinates" : "polygonOutline";
+        const bool hasPolygonCoordinates = hole.Contains ("polygonCoordinates");
+        const bool hasPolygonOutline = hole.Contains ("polygonOutline");
+        if (hasPolygonCoordinates && hasPolygonOutline) {
+            return "A hole must use either 'polygonCoordinates' or 'polygonOutline', not both.";
+        }
+        if (!hasPolygonCoordinates && !hasPolygonOutline) {
+            return "Every hole must contain 'polygonCoordinates' or 'polygonOutline'.";
+        }
+
+        const char* coordinateField = hasPolygonCoordinates ? "polygonCoordinates" : "polygonOutline";
         auto error = ValidateCoordinateArrayField (hole, coordinateField, true, false, 3);
         if (error.HasValue ()) {
             return error;
+        }
+
+        if (hole.Contains ("polygonArcs")) {
+            GS::Array<GS::ObjectState> coordinates;
+            GS::Array<GS::ObjectState> arcs;
+            if (!hole.Get (coordinateField, coordinates) || !hole.Get ("polygonArcs", arcs)) {
+                return "A hole's 'polygonArcs' must be an array associated with its coordinates.";
+            }
+            GSSize coordinateCount = static_cast<GSSize> (coordinates.GetSize ());
+            if (coordinateCount > 1 && IsSame2DCoordinate (coordinates.GetFirst (), coordinates.GetLast ())) {
+                --coordinateCount;
+            }
+            error = ValidateArcArray (arcs, coordinateCount, "hole polygonArcs");
+            if (error.HasValue ()) {
+                return error;
+            }
         }
     }
 
@@ -522,8 +600,11 @@ GS::Optional<GS::UniString> ValidatePayload (
         if (error.HasValue ()) return error;
         error = ValidateCoordinateArrayField (payload, "polygonOutline", false, false, 3);
         if (error.HasValue ()) return error;
-        error = ValidateArcArrayField (payload);
-        if (error.HasValue ()) return error;
+        if (payload.Contains ("polygonArcs")) {
+            const char* coordinateFieldName = isCreate ? "polygonCoordinates" : "polygonOutline";
+            error = ValidateArcArrayField (payload, coordinateFieldName, "polygonArcs");
+            if (error.HasValue ()) return error;
+        }
         error = ValidateHolesField (payload);
         if (error.HasValue ()) return error;
         if (isCreate && !payload.Contains ("level")) {
@@ -1077,6 +1158,15 @@ GS::Optional<GS::UniString> MutateElementsCommand::GetInputParametersSchema () c
 
 GS::Optional<GS::UniString> MutateElementsCommand::GetResponseSchema () const
 {
+    // The command returns either the typed success envelope below or the
+    // framework-wide {"error": {code, message}} response from preflight.
+    // Handing only the success schema to Archicad would make it discard the
+    // useful error response as a schema-validation failure.
+    return {};
+}
+
+GS::Optional<GS::UniString> MutateElementsCommand::GetRawResponseSchema () const
+{
     // nativeDetails intentionally remains an open object.  It is the existing
     // detail projection and can contain bounded, type-specific fields.  The
     // envelope itself remains schema-checked, including explicit partial and
@@ -1166,13 +1256,23 @@ GS::ObjectState MutateElementsCommand::Execute (
         changedGuids = requestedElementGuids;
     }
 
+    const bool mutationComplete = MutationResultIsComplete (operation, mutationResult, items.GetSize ());
+    // A partial update must still expose the observed state of every requested
+    // element, including items whose delegated executor reported failure.  A
+    // readback of successful items only can make a failed scalar/memo update
+    // look as if the element had never been part of the operation.
+    GS::Array<API_Guid> readbackGuids = changedGuids;
+    if (operation == "update" && !mutationComplete) {
+        readbackGuids = requestedElementGuids;
+    }
+
     bool readbackVerified = true;
     GSSize appliedCount = static_cast<GSSize> (changedGuids.GetSize ());
     GS::ObjectState readback;
     if (operation == "delete") {
         readback = BuildDeleteReadback (changedGuids, typeID, readbackVerified, appliedCount);
     } else {
-        readback = BuildElementReadback (changedGuids, typeID, processControl, readbackVerified);
+        readback = BuildElementReadback (readbackGuids, typeID, processControl, readbackVerified);
     }
 
     GS::ObjectState response;
@@ -1180,7 +1280,6 @@ GS::ObjectState MutateElementsCommand::Execute (
     response.Add ("elementType", elementTypeName);
     response.Add ("requestedCount", static_cast<Int32> (items.GetSize ()));
     response.Add ("appliedCount", static_cast<Int32> (appliedCount));
-    const bool mutationComplete = MutationResultIsComplete (operation, mutationResult, items.GetSize ());
     response.Add ("mutationComplete", mutationComplete);
     response.Add ("readbackVerified", readbackVerified);
     response.Add ("partial", !mutationComplete || !readbackVerified);

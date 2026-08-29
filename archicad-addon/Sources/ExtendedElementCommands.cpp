@@ -1133,21 +1133,21 @@ GS::Optional<GS::UniString> BuildSlabMemoFromGeometry (
     for (const GS::ObjectState& hole : holes) {
         GS::Array<GS::ObjectState> holePolygonOutline;
         GS::Array<GS::ObjectState> holePolygonArcs;
-        if (GetHoleGeometry (hole, holePolygonOutline, holePolygonArcs) && holePolygonOutline.GetSize () >= 3) {
-            const GSSize holeCoordinateCount = static_cast<GSSize> (holePolygonOutline.GetSize ());
-            const GSSize holeArcCount = static_cast<GSSize> (holePolygonArcs.GetSize ());
-            const GSSize maxInt32 = static_cast<GSSize> (std::numeric_limits<Int32>::max ());
-            const GSSize currentCoordinateCount = static_cast<GSSize> (element.slab.poly.nCoords);
-            const GSSize currentArcCount = static_cast<GSSize> (element.slab.poly.nArcs);
-            if (currentCoordinateCount > maxInt32 - 1 || currentArcCount > maxInt32 ||
-                static_cast<GSSize> (element.slab.poly.nSubPolys) >= maxInt32 ||
-                holeCoordinateCount > maxInt32 - currentCoordinateCount - 1 ||
-                holeArcCount > maxInt32 - currentArcCount)
-                return "Slab polygon dimensions exceed the supported range.";
-            element.slab.poly.nCoords += static_cast<Int32> (holeCoordinateCount) + 1;
-            ++element.slab.poly.nSubPolys;
-            element.slab.poly.nArcs += static_cast<Int32> (holeArcCount);
-        }
+        if (!GetHoleGeometry (hole, holePolygonOutline, holePolygonArcs) || holePolygonOutline.GetSize () < 3)
+            return "Invalid slab hole geometry.";
+        const GSSize holeCoordinateCount = static_cast<GSSize> (holePolygonOutline.GetSize ());
+        const GSSize holeArcCount = static_cast<GSSize> (holePolygonArcs.GetSize ());
+        const GSSize maxInt32 = static_cast<GSSize> (std::numeric_limits<Int32>::max ());
+        const GSSize currentCoordinateCount = static_cast<GSSize> (element.slab.poly.nCoords);
+        const GSSize currentArcCount = static_cast<GSSize> (element.slab.poly.nArcs);
+        if (currentCoordinateCount > maxInt32 - 1 || currentArcCount > maxInt32 ||
+            static_cast<GSSize> (element.slab.poly.nSubPolys) >= maxInt32 ||
+            holeCoordinateCount > maxInt32 - currentCoordinateCount - 1 ||
+            holeArcCount > maxInt32 - currentArcCount)
+            return "Slab polygon dimensions exceed the supported range.";
+        element.slab.poly.nCoords += static_cast<Int32> (holeCoordinateCount) + 1;
+        ++element.slab.poly.nSubPolys;
+        element.slab.poly.nArcs += static_cast<Int32> (holeArcCount);
     }
 
     // ACAPI_Element_GetDefaults does not always allocate the polygon memo handles for
@@ -1260,11 +1260,11 @@ GS::Optional<GS::UniString> BuildSlabMemoFromGeometry (
     for (const GS::ObjectState& hole : holes) {
         GS::Array<GS::ObjectState> holePolygonOutline;
         GS::Array<GS::ObjectState> holePolygonArcs;
-        if (GetHoleGeometry (hole, holePolygonOutline, holePolygonArcs)) {
-            memoErr = AddPolyToMemo (holePolygonOutline, holePolygonArcs, iCoord, iArc, iPends, memo, &edgeTrimSideType, &element.slab.sideMat, needToProcessVertexIDs);
-            if (memoErr != NoError)
-                return "Failed to populate slab hole memo data.";
-        }
+        if (!GetHoleGeometry (hole, holePolygonOutline, holePolygonArcs) || holePolygonOutline.GetSize () < 3)
+            return "Invalid slab hole geometry.";
+        memoErr = AddPolyToMemo (holePolygonOutline, holePolygonArcs, iCoord, iArc, iPends, memo, &edgeTrimSideType, &element.slab.sideMat, needToProcessVertexIDs);
+        if (memoErr != NoError)
+            return "Failed to populate slab hole memo data.";
     }
 
     // vertexIDs[0] must hold the max vertex ID used across the whole shape - an undocumented
@@ -1450,9 +1450,8 @@ static GS::Optional<GS::UniString> ApplySlabPolygonChange (
     for (const GS::ObjectState& hole : holes) {
         GS::Array<GS::ObjectState> holePolygonOutline;
         GS::Array<GS::ObjectState> holePolygonArcs;
-        if (!GetHoleGeometry (hole, holePolygonOutline, holePolygonArcs) || holePolygonOutline.GetSize () < 3) {
-            continue;
-        }
+        if (!GetHoleGeometry (hole, holePolygonOutline, holePolygonArcs) || holePolygonOutline.GetSize () < 3)
+            return "Invalid slab hole geometry.";
         const Int32 holeNCoords = (Int32) holePolygonOutline.GetSize ();
         API_ElementMemo insMemo = {};
         const GS::OnExit insCleanup ([&insMemo] () { ACAPI_DisposeElemMemoHdls (&insMemo); });
