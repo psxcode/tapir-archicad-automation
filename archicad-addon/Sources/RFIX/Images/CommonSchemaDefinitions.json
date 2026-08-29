@@ -1364,8 +1364,16 @@
                 "type": "string",
                 "description": "The name of the parameter."
             },
+            "index1": {
+                "type": "integer",
+                "description": "Optional 1-based first index for changing one item of an array parameter without changing its dimensions."
+            },
+            "index2": {
+                "type": "integer",
+                "description": "Optional 1-based second index for a two-dimensional array parameter. Only valid together with index1; defaults to 1."
+            },
             "value": {
-                "description": "The value of the parameter."
+                "description": "The value of the parameter. For an array parameter, provide a list with exactly its current dimensions, or provide index1 (and optionally index2) with one value to change a single item. Array resizing is not supported."
             }
         },
         "additionalProperties": false,
@@ -1382,8 +1390,16 @@
                 "type": "integer",
                 "description": "The index of the parameter."
             },
+            "index1": {
+                "type": "integer",
+                "description": "Optional 1-based first index for changing one item of an array parameter without changing its dimensions."
+            },
+            "index2": {
+                "type": "integer",
+                "description": "Optional 1-based second index for a two-dimensional array parameter. Only valid together with index1; defaults to 1."
+            },
             "value": {
-                "description": "The value of the parameter."
+                "description": "The value of the parameter. For an array parameter, provide a list with exactly its current dimensions, or provide index1 (and optionally index2) with one value to change a single item. Array resizing is not supported."
             }
         },
         "additionalProperties": false,
