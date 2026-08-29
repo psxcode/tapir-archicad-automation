@@ -2087,6 +2087,25 @@ bool ApplyColumnDetails (API_Element& element, API_Element& mask, const GS::Obje
         ACAPI_ELEMENT_MASK_SET (mask, API_ColumnType, axisRotationAngle);
         changed = true;
     }
+    bool isSlanted = false;
+    if (details.Get ("isSlanted", isSlanted)) {
+        element.column.isSlanted = isSlanted;
+        ACAPI_ELEMENT_MASK_SET (mask, API_ColumnType, isSlanted);
+        changed = true;
+    }
+    auto slantAngle = GetOptionalDouble (details, "slantAngle");
+    if (slantAngle.HasValue ()) {
+        element.column.slantAngle = slantAngle.Get ();
+        ACAPI_ELEMENT_MASK_SET (mask, API_ColumnType, slantAngle);
+        // Archicad discards a column slant angle while the column remains vertical.
+        // Derive the state only when the caller did not provide it explicitly.
+        bool explicitIsSlanted = false;
+        if (!details.Get ("isSlanted", explicitIsSlanted)) {
+            element.column.isSlanted = (slantAngle.Get () != 0.0);
+            ACAPI_ELEMENT_MASK_SET (mask, API_ColumnType, isSlanted);
+        }
+        changed = true;
+    }
     return changed;
 }
 
@@ -2121,6 +2140,13 @@ bool ApplyBeamDetails (API_Element& element, API_Element& mask, const GS::Object
     if (slantAngle.HasValue ()) {
         element.beam.slantAngle = slantAngle.Get ();
         ACAPI_ELEMENT_MASK_SET (mask, API_BeamType, slantAngle);
+        // Archicad discards a beam slant angle while the beam remains horizontal.
+        // Derive the state only when the caller did not provide it explicitly.
+        bool explicitIsSlanted = false;
+        if (!details.Get ("isSlanted", explicitIsSlanted)) {
+            element.beam.isSlanted = (slantAngle.Get () != 0.0);
+            ACAPI_ELEMENT_MASK_SET (mask, API_BeamType, isSlanted);
+        }
         changed = true;
     }
     auto arcAngle = GetOptionalDouble (details, "arcAngle");
@@ -2133,6 +2159,18 @@ bool ApplyBeamDetails (API_Element& element, API_Element& mask, const GS::Object
     if (curveHeight.HasValue ()) {
         element.beam.verticalCurveHeight = curveHeight.Get ();
         ACAPI_ELEMENT_MASK_SET (mask, API_BeamType, verticalCurveHeight);
+        changed = true;
+    }
+    bool isSlanted = false;
+    if (details.Get ("isSlanted", isSlanted)) {
+        element.beam.isSlanted = isSlanted;
+        ACAPI_ELEMENT_MASK_SET (mask, API_BeamType, isSlanted);
+        changed = true;
+    }
+    auto profileAngle = GetOptionalDouble (details, "profileAngle");
+    if (profileAngle.HasValue ()) {
+        element.beam.profileAngle = profileAngle.Get ();
+        ACAPI_ELEMENT_MASK_SET (mask, API_BeamType, profileAngle);
         changed = true;
     }
     return changed;
@@ -2395,7 +2433,18 @@ GS::Optional<GS::UniString> CreateBeamsCommand::GetInputParametersSchema () cons
                         "floorIndex": { "type": "integer", "description": "Optional floor index. If omitted, derived from zCoordinate." },
                         "zCoordinate": { "type": "number" },
                         "offset": { "type": "number" },
-                        "slantAngle": { "type": "number" },
+                        "slantAngle": {
+                            "type": "number",
+                            "description": "Slant angle in radians. A non-zero value also switches the beam to slanted, unless isSlanted is given explicitly."
+                        },
+                        "isSlanted": {
+                            "type": "boolean",
+                            "description": "Optional explicit slanted state. By default it is derived from slantAngle."
+                        },
+                        "profileAngle": {
+                            "type": "number",
+                            "description": "Rotation angle of the profile around the beam's center line, in radians."
+                        },
                         "arcAngle": { "type": "number" },
                         "verticalCurveHeight": { "type": "number" },
                         "width": {
@@ -2449,6 +2498,17 @@ GS::Optional<GS::ObjectState> CreateBeamsCommand::SetTypeSpecificParameters (API
     auto slantAngle = GetOptionalDouble (parameters, "slantAngle");
     if (slantAngle.HasValue ()) {
         element.beam.slantAngle = slantAngle.Get ();
+        // Without isSlanted the new beam remains horizontal and Archicad discards
+        // the angle. An explicit value below intentionally wins over this derivation.
+        element.beam.isSlanted = (slantAngle.Get () != 0.0);
+    }
+    bool isSlanted = false;
+    if (parameters.Get ("isSlanted", isSlanted)) {
+        element.beam.isSlanted = isSlanted;
+    }
+    auto profileAngle = GetOptionalDouble (parameters, "profileAngle");
+    if (profileAngle.HasValue ()) {
+        element.beam.profileAngle = profileAngle.Get ();
     }
     auto arcAngle = GetOptionalDouble (parameters, "arcAngle");
     if (arcAngle.HasValue ()) {
@@ -3870,6 +3930,8 @@ GS::Optional<GS::UniString> ModifyBeamsCommand::GetInputParametersSchema () cons
                         "level": { "type": "number" },
                         "offset": { "type": "number" },
                         "slantAngle": { "type": "number" },
+                        "isSlanted": { "type": "boolean" },
+                        "profileAngle": { "type": "number" },
                         "arcAngle": { "type": "number" },
                         "verticalCurveHeight": { "type": "number" },
                         "width": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
@@ -4437,6 +4499,8 @@ GS::Optional<GS::UniString> ModifyColumnsCommand::GetInputParametersSchema () co
                         "height": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
                         "bottomOffset": { "type": "number" },
                         "axisRotationAngle": { "type": "number" },
+                        "slantAngle": { "type": "number" },
+                        "isSlanted": { "type": "boolean" },
                         "width": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
                         "depth": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
                         "circleBased": { "type": "boolean" },

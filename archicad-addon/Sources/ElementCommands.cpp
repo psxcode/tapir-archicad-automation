@@ -962,6 +962,8 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                 typeSpecificDetails.Add ("level", elem.beam.level);
                 typeSpecificDetails.Add ("offset", elem.beam.offset);
                 typeSpecificDetails.Add ("slantAngle", elem.beam.slantAngle);
+                typeSpecificDetails.Add ("isSlanted", elem.beam.isSlanted);
+                typeSpecificDetails.Add ("profileAngle", elem.beam.profileAngle);
                 typeSpecificDetails.Add ("arcAngle", elem.beam.curveAngle);
                 typeSpecificDetails.Add ("verticalCurveHeight", elem.beam.verticalCurveHeight);
                 break;
@@ -1040,6 +1042,8 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                 typeSpecificDetails.Add ("zCoordinate", GetZPos (elem.header.floorInd, elem.column.bottomOffset, stories));
                 typeSpecificDetails.Add ("height", elem.column.height);
                 typeSpecificDetails.Add ("bottomOffset", elem.column.bottomOffset);
+                typeSpecificDetails.Add ("slantAngle", elem.column.slantAngle);
+                typeSpecificDetails.Add ("isSlanted", elem.column.isSlanted);
                 break;
 
             case API_DoorID:

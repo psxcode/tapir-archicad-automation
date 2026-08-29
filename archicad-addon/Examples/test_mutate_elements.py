@@ -134,21 +134,26 @@ def run_test():
         "width": 0.3,
         "depth": 0.3,
     })
-    column_update = update("Column", column_guid, {"width": 0.45, "depth": 0.5})
+    column_update = update("Column", column_guid, {"width": 0.45, "depth": 0.5, "slantAngle": 0.2})
     require(column_update and column_update.get("mutationComplete"), f"column section update failed: {column_update!r}")
     column_sections = column_update["readback"]["nativeSections"][0]["segments"]
     require(column_sections, f"column section readback is empty: {column_update!r}")
+    require(details(column_update)["isSlanted"] is True,
+            f"slantAngle did not enable slanted column state: {column_update!r}")
     require(all(math.isclose(s["nominalWidth"], 0.45, rel_tol=0.0, abs_tol=1.0e-6) and
                 math.isclose(s["nominalHeight"], 0.5, rel_tol=0.0, abs_tol=1.0e-6)
                 for s in column_sections), f"not every column segment was updated: {column_sections!r}")
 
-    _, beam_guid = create("Beam", {
+    beam_result, beam_guid = create("Beam", {
         "begCoordinate": {"x": 15.0, "y": 0.0},
         "endCoordinate": {"x": 19.0, "y": 0.0},
         "zCoordinate": 3.0,
+        "slantAngle": 0.3,
         "width": 0.25,
         "height": 0.4,
     })
+    require(details(beam_result)["isSlanted"] is True,
+            f"slantAngle did not enable slanted beam state: {beam_result!r}")
     beam_update = update("Beam", beam_guid, {"width": 0.35, "height": 0.55})
     require(beam_update and beam_update.get("mutationComplete"), f"beam section update failed: {beam_update!r}")
     beam_sections = beam_update["readback"]["nativeSections"][0]["segments"]

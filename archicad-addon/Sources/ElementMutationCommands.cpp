@@ -379,9 +379,9 @@ GS::Optional<GS::UniString> ValidateAllowedPayloadFields (
     static const char* knownFields[] = {
         "begCoordinate", "endCoordinate", "coordinates", "origin", "floorIndex", "zCoordinate", "level",
         "height", "width", "depth", "thickness", "bottomOffset", "offset", "slantAngle", "arcAngle",
-        "verticalCurveHeight", "axisRotationAngle", "referenceLineLocation", "referencePlaneLocation",
+        "verticalCurveHeight", "axisRotationAngle", "profileAngle", "referenceLineLocation", "referencePlaneLocation",
         "structureType", "buildingMaterialId", "compositeId", "profileId", "anchorPoint", "coreAnchor",
-        "circleBased", "isWidthAndHeightLinked", "polygonCoordinates", "polygonOutline", "polygonArcs", "holes"
+        "circleBased", "isWidthAndHeightLinked", "isSlanted", "polygonCoordinates", "polygonOutline", "polygonArcs", "holes"
     };
 
     const auto rejectUnsupportedFields = [&] (const std::initializer_list<const char*>& allowedFields) -> GS::Optional<GS::UniString> {
@@ -425,18 +425,18 @@ GS::Optional<GS::UniString> ValidateAllowedPayloadFields (
             });
         }
         return rejectUnsupportedFields ({
-                "origin", "zCoordinate", "height", "bottomOffset", "axisRotationAngle", "width", "depth",
-                "circleBased", "isWidthAndHeightLinked", "buildingMaterialId", "profileId"
+                "origin", "zCoordinate", "height", "bottomOffset", "axisRotationAngle", "slantAngle", "width", "depth",
+                "circleBased", "isWidthAndHeightLinked", "isSlanted", "buildingMaterialId", "profileId"
         });
     } else if (typeID == API_BeamID) {
         if (isCreate) {
             return rejectUnsupportedFields ({
-                "begCoordinate", "endCoordinate", "floorIndex", "zCoordinate", "offset", "slantAngle", "arcAngle",
+                "begCoordinate", "endCoordinate", "floorIndex", "zCoordinate", "offset", "slantAngle", "isSlanted", "profileAngle", "arcAngle",
                 "verticalCurveHeight", "width", "height", "anchorPoint"
             });
         }
         return rejectUnsupportedFields ({
-                "begCoordinate", "endCoordinate", "level", "offset", "slantAngle", "arcAngle", "verticalCurveHeight",
+                "begCoordinate", "endCoordinate", "level", "offset", "slantAngle", "isSlanted", "profileAngle", "arcAngle", "verticalCurveHeight",
                 "width", "height", "isWidthAndHeightLinked", "buildingMaterialId", "profileId"
         });
     } else {
@@ -454,7 +454,7 @@ GS::Optional<GS::UniString> ValidatePayload (
 
     const char* finiteFields[] = {
         "zCoordinate", "level", "bottomOffset", "offset", "slantAngle", "arcAngle",
-        "verticalCurveHeight", "axisRotationAngle"
+        "verticalCurveHeight", "axisRotationAngle", "profileAngle"
     };
     for (const char* fieldName : finiteFields) {
         auto error = ValidateFiniteNumberField (payload, fieldName);
@@ -474,6 +474,8 @@ GS::Optional<GS::UniString> ValidatePayload (
     error = ValidateBooleanField (payload, "circleBased");
     if (error.HasValue ()) return error;
     error = ValidateBooleanField (payload, "isWidthAndHeightLinked");
+    if (error.HasValue ()) return error;
+    error = ValidateBooleanField (payload, "isSlanted");
     if (error.HasValue ()) return error;
 
     error = ValidateStructureFields (payload, typeID, isCreate);
@@ -1030,6 +1032,8 @@ GS::Optional<GS::UniString> MutateElementsCommand::GetInputParametersSchema () c
                                 "bottomOffset": { "type": "number" },
                                 "offset": { "type": "number" },
                                 "slantAngle": { "type": "number" },
+                                "isSlanted": { "type": "boolean" },
+                                "profileAngle": { "type": "number" },
                                 "arcAngle": { "type": "number" },
                                 "verticalCurveHeight": { "type": "number" },
                                 "axisRotationAngle": { "type": "number" },
