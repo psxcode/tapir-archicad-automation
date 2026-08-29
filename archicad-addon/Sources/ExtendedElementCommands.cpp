@@ -218,6 +218,287 @@ GS::Optional<GS::UniString> ParseStructureSelection (
     return {};
 }
 
+static GS::Optional<GS::UniString> ValidateFiniteNumberField (
+    const GS::ObjectState& parameters,
+    const char* fieldName,
+    bool requirePositive)
+{
+    if (!parameters.Contains (fieldName)) {
+        return {};
+    }
+
+    double value = 0.0;
+    if (!parameters.Get (fieldName, value) || !std::isfinite (value) || (requirePositive && value <= 0.0)) {
+        return GS::UniString::Printf (
+            "'%s' must be a finite %s number.",
+            fieldName,
+            requirePositive ? "positive" : "real");
+    }
+
+    return {};
+}
+
+static GS::Optional<GS::UniString> ValidateBooleanField (
+    const GS::ObjectState& parameters,
+    const char* fieldName)
+{
+    if (!parameters.Contains (fieldName)) {
+        return {};
+    }
+
+    bool value = false;
+    if (!parameters.Get (fieldName, value)) {
+        return GS::UniString::Printf ("'%s' must be a boolean.", fieldName);
+    }
+
+    return {};
+}
+
+static GS::Optional<GS::UniString> ValidateAttributeField (
+    const GS::ObjectState& parameters,
+    const char* fieldName,
+    API_AttrTypeID attributeType)
+{
+    if (!parameters.Contains (fieldName)) {
+        return {};
+    }
+
+    const GS::ObjectState* attributeId = parameters.Get (fieldName);
+    API_AttributeIndex attributeIndex = APIInvalidAttributeIndex;
+    if (attributeId == nullptr || !ResolveAttributeIndex (*attributeId, attributeType, attributeIndex)) {
+        return GS::UniString::Printf ("Invalid attribute reference in '%s'.", fieldName);
+    }
+
+    return {};
+}
+
+static GS::Optional<GS::UniString> ValidateColumnSectionPayload (const GS::ObjectState& details)
+{
+    auto error = ValidateFiniteNumberField (details, "width", true);
+    if (error.HasValue ()) return error;
+    error = ValidateFiniteNumberField (details, "depth", true);
+    if (error.HasValue ()) return error;
+    error = ValidateBooleanField (details, "circleBased");
+    if (error.HasValue ()) return error;
+    error = ValidateBooleanField (details, "isWidthAndHeightLinked");
+    if (error.HasValue ()) return error;
+
+    const bool hasBuildingMaterial = details.Contains ("buildingMaterialId");
+    const bool hasProfile = details.Contains ("profileId");
+    if (hasBuildingMaterial && hasProfile) {
+        return "Only one of 'buildingMaterialId' or 'profileId' may be provided for a column section.";
+    }
+    bool circleBased = false;
+    if (hasProfile && details.Get ("circleBased", circleBased) && circleBased) {
+        return "'circleBased=true' cannot be combined with 'profileId' for a column section.";
+    }
+
+    error = ValidateAttributeField (details, "buildingMaterialId", API_BuildingMaterialID);
+    if (error.HasValue ()) return error;
+    return ValidateAttributeField (details, "profileId", API_ProfileID);
+}
+
+static GS::Optional<GS::UniString> ValidateBeamSectionPayload (const GS::ObjectState& details)
+{
+    auto error = ValidateFiniteNumberField (details, "width", true);
+    if (error.HasValue ()) return error;
+    error = ValidateFiniteNumberField (details, "height", true);
+    if (error.HasValue ()) return error;
+    error = ValidateBooleanField (details, "isWidthAndHeightLinked");
+    if (error.HasValue ()) return error;
+
+    const bool hasBuildingMaterial = details.Contains ("buildingMaterialId");
+    const bool hasProfile = details.Contains ("profileId");
+    if (hasBuildingMaterial && hasProfile) {
+        return "Only one of 'buildingMaterialId' or 'profileId' may be provided for a beam section.";
+    }
+
+    error = ValidateAttributeField (details, "buildingMaterialId", API_BuildingMaterialID);
+    if (error.HasValue ()) return error;
+    return ValidateAttributeField (details, "profileId", API_ProfileID);
+}
+
+static bool HasColumnSectionFields (const GS::ObjectState& details)
+{
+    return details.Contains ("width") || details.Contains ("depth") || details.Contains ("circleBased") ||
+           details.Contains ("isWidthAndHeightLinked") || details.Contains ("buildingMaterialId") ||
+           details.Contains ("profileId");
+}
+
+static bool HasBeamSectionFields (const GS::ObjectState& details)
+{
+    return details.Contains ("width") || details.Contains ("height") || details.Contains ("isWidthAndHeightLinked") ||
+           details.Contains ("buildingMaterialId") || details.Contains ("profileId");
+}
+
+static GSErrCode ValidateColumnSectionMemo (API_Guid elementGuid)
+{
+    API_ElementMemo memo = {};
+    const GS::OnExit cleanup ([&memo] () {
+        ACAPI_DisposeElemMemoHdls (&memo);
+    });
+
+    const GSErrCode err = ACAPI_Element_GetMemo (elementGuid, &memo, APIMemoMask_ColumnSegment);
+    if (err != NoError) {
+        return err;
+    }
+    if (memo.columnSegments == nullptr ||
+        BMGetPtrSize (reinterpret_cast<GSPtr> (memo.columnSegments)) < sizeof (API_ColumnSegmentType)) {
+        return APIERR_BADPARS;
+    }
+    return NoError;
+}
+
+static GSErrCode ValidateBeamSectionMemo (API_Guid elementGuid)
+{
+    API_ElementMemo memo = {};
+    const GS::OnExit cleanup ([&memo] () {
+        ACAPI_DisposeElemMemoHdls (&memo);
+    });
+
+    const GSErrCode err = ACAPI_Element_GetMemo (elementGuid, &memo, APIMemoMask_BeamSegment);
+    if (err != NoError) {
+        return err;
+    }
+    if (memo.beamSegments == nullptr ||
+        BMGetPtrSize (reinterpret_cast<GSPtr> (memo.beamSegments)) < sizeof (API_BeamSegmentType)) {
+        return APIERR_BADPARS;
+    }
+    return NoError;
+}
+
+static GSErrCode ApplyColumnSectionToMemo (API_Guid elementGuid, const GS::ObjectState& details)
+{
+    API_ElementMemo memo = {};
+    const GS::OnExit cleanup ([&memo] () {
+        ACAPI_DisposeElemMemoHdls (&memo);
+    });
+
+    GSErrCode err = ACAPI_Element_GetMemo (elementGuid, &memo, APIMemoMask_ColumnSegment);
+    if (err != NoError) {
+        return err;
+    }
+    if (memo.columnSegments == nullptr) {
+        return APIERR_BADPARS;
+    }
+
+    double width = 0.0;
+    double depth = 0.0;
+    const bool hasWidth = details.Get ("width", width);
+    const bool hasDepth = details.Get ("depth", depth);
+    bool circleBased = false;
+    const bool hasCircleBased = details.Get ("circleBased", circleBased);
+    bool isWidthAndHeightLinked = false;
+    const bool hasIsWidthAndHeightLinked = details.Get ("isWidthAndHeightLinked", isWidthAndHeightLinked);
+
+    API_AttributeIndex buildingMaterial = APIInvalidAttributeIndex;
+    API_AttributeIndex profile = APIInvalidAttributeIndex;
+    const GS::ObjectState* buildingMaterialId = details.Get ("buildingMaterialId");
+    const GS::ObjectState* profileId = details.Get ("profileId");
+    if (buildingMaterialId != nullptr && !ResolveAttributeIndex (*buildingMaterialId, API_BuildingMaterialID, buildingMaterial)) {
+        return APIERR_BADPARS;
+    }
+    if (profileId != nullptr && !ResolveAttributeIndex (*profileId, API_ProfileID, profile)) {
+        return APIERR_BADPARS;
+    }
+
+    const GSSize segmentCount = BMGetPtrSize (reinterpret_cast<GSPtr> (memo.columnSegments)) / sizeof (API_ColumnSegmentType);
+    if (segmentCount == 0) {
+        return APIERR_BADPARS;
+    }
+
+    for (GSSize i = 0; i < segmentCount; ++i) {
+        API_AssemblySegmentData& segment = memo.columnSegments[i].assemblySegmentData;
+        if (hasWidth) {
+            segment.nominalWidth = width;
+        }
+        if (hasDepth) {
+            segment.nominalHeight = depth;
+        }
+        if (hasCircleBased) {
+            segment.circleBased = circleBased;
+        }
+        if (hasIsWidthAndHeightLinked) {
+            segment.isWidthAndHeightLinked = isWidthAndHeightLinked;
+        }
+        if (profileId != nullptr) {
+            segment.modelElemStructureType = API_ProfileStructure;
+            segment.profileAttr = profile;
+            segment.buildingMaterial = APIInvalidAttributeIndex;
+            segment.circleBased = false;
+        } else if (buildingMaterialId != nullptr) {
+            segment.modelElemStructureType = API_BasicStructure;
+            segment.buildingMaterial = buildingMaterial;
+            segment.profileAttr = APIInvalidAttributeIndex;
+        }
+    }
+
+    return ACAPI_Element_ChangeMemo (elementGuid, APIMemoMask_ColumnSegment, &memo);
+}
+
+static GSErrCode ApplyBeamSectionToMemo (API_Guid elementGuid, const GS::ObjectState& details)
+{
+    API_ElementMemo memo = {};
+    const GS::OnExit cleanup ([&memo] () {
+        ACAPI_DisposeElemMemoHdls (&memo);
+    });
+
+    GSErrCode err = ACAPI_Element_GetMemo (elementGuid, &memo, APIMemoMask_BeamSegment);
+    if (err != NoError) {
+        return err;
+    }
+    if (memo.beamSegments == nullptr) {
+        return APIERR_BADPARS;
+    }
+
+    double width = 0.0;
+    double height = 0.0;
+    const bool hasWidth = details.Get ("width", width);
+    const bool hasHeight = details.Get ("height", height);
+    bool isWidthAndHeightLinked = false;
+    const bool hasIsWidthAndHeightLinked = details.Get ("isWidthAndHeightLinked", isWidthAndHeightLinked);
+
+    API_AttributeIndex buildingMaterial = APIInvalidAttributeIndex;
+    API_AttributeIndex profile = APIInvalidAttributeIndex;
+    const GS::ObjectState* buildingMaterialId = details.Get ("buildingMaterialId");
+    const GS::ObjectState* profileId = details.Get ("profileId");
+    if (buildingMaterialId != nullptr && !ResolveAttributeIndex (*buildingMaterialId, API_BuildingMaterialID, buildingMaterial)) {
+        return APIERR_BADPARS;
+    }
+    if (profileId != nullptr && !ResolveAttributeIndex (*profileId, API_ProfileID, profile)) {
+        return APIERR_BADPARS;
+    }
+
+    const GSSize segmentCount = BMGetPtrSize (reinterpret_cast<GSPtr> (memo.beamSegments)) / sizeof (API_BeamSegmentType);
+    if (segmentCount == 0) {
+        return APIERR_BADPARS;
+    }
+
+    for (GSSize i = 0; i < segmentCount; ++i) {
+        API_AssemblySegmentData& segment = memo.beamSegments[i].assemblySegmentData;
+        if (hasWidth) {
+            segment.nominalWidth = width;
+        }
+        if (hasHeight) {
+            segment.nominalHeight = height;
+        }
+        if (hasIsWidthAndHeightLinked) {
+            segment.isWidthAndHeightLinked = isWidthAndHeightLinked;
+        }
+        if (profileId != nullptr) {
+            segment.modelElemStructureType = API_ProfileStructure;
+            segment.profileAttr = profile;
+            segment.buildingMaterial = APIInvalidAttributeIndex;
+        } else if (buildingMaterialId != nullptr) {
+            segment.modelElemStructureType = API_BasicStructure;
+            segment.buildingMaterial = buildingMaterial;
+            segment.profileAttr = APIInvalidAttributeIndex;
+        }
+    }
+
+    return ACAPI_Element_ChangeMemo (elementGuid, APIMemoMask_BeamSegment, &memo);
+}
+
 void SetOpeningSizeMask (API_Element& mask)
 {
     ACAPI_ELEMENT_MASK_SET (mask, API_WindowType, openingBase.width);
@@ -1699,6 +1980,26 @@ bool ApplySlabDetails (API_Element& element, API_Element& mask, const GS::Object
         ACAPI_ELEMENT_MASK_SET (mask, API_Elem_Head, floorInd);
         ACAPI_ELEMENT_MASK_SET (mask, API_SlabType, level);
         changed = true;
+    }
+
+    GS::UniString referencePlaneLocation;
+    if (details.Get ("referencePlaneLocation", referencePlaneLocation)) {
+        bool recognized = true;
+        if (referencePlaneLocation == "Top") {
+            element.slab.referencePlaneLocation = APISlabRefPlane_Top;
+        } else if (referencePlaneLocation == "CoreTop") {
+            element.slab.referencePlaneLocation = APISlabRefPlane_CoreTop;
+        } else if (referencePlaneLocation == "CoreBottom") {
+            element.slab.referencePlaneLocation = APISlabRefPlane_CoreBottom;
+        } else if (referencePlaneLocation == "Bottom") {
+            element.slab.referencePlaneLocation = APISlabRefPlane_Bottom;
+        } else {
+            recognized = false;
+        }
+        if (recognized) {
+            ACAPI_ELEMENT_MASK_SET (mask, API_SlabType, referencePlaneLocation);
+            changed = true;
+        }
     }
 
     return changed;
@@ -3570,7 +3871,12 @@ GS::Optional<GS::UniString> ModifyBeamsCommand::GetInputParametersSchema () cons
                         "offset": { "type": "number" },
                         "slantAngle": { "type": "number" },
                         "arcAngle": { "type": "number" },
-                        "verticalCurveHeight": { "type": "number" }
+                        "verticalCurveHeight": { "type": "number" },
+                        "width": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
+                        "height": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
+                        "isWidthAndHeightLinked": { "type": "boolean" },
+                        "buildingMaterialId": { "$ref": "#/AttributeId" },
+                        "profileId": { "$ref": "#/AttributeId" }
                     },
                     "additionalProperties": false,
                     "required": ["elementId"]
@@ -3611,14 +3917,44 @@ GS::ObjectState ModifyBeamsCommand::Execute (const GS::ObjectState& parameters, 
 
             API_Element mask = {};
             ACAPI_ELEMENT_MASK_CLEAR (mask);
+            auto sectionError = ValidateBeamSectionPayload (item);
+            if (sectionError.HasValue ()) {
+                results.Push (CreateFailedExecutionResult (APIERR_BADPARS, sectionError.Get ()));
+                continue;
+            }
+
+            const bool hasSectionFields = HasBeamSectionFields (item);
+            if (hasSectionFields) {
+                err = ValidateBeamSectionMemo (element.header.guid);
+                if (err != NoError) {
+                    results.Push (CreateFailedExecutionResult (err, "Beam cross section memo is not available for update."));
+                    continue;
+                }
+            }
+
             const bool changed = ApplyBeamDetails (element, mask, item);
-            if (!changed) {
+            if (!changed && !hasSectionFields) {
                 results.Push (CreateFailedExecutionResult (APIERR_BADPARS, "No beam fields to modify."));
                 continue;
             }
 
-            err = ACAPI_Element_Change (&element, &mask, nullptr, 0, true);
-            results.Push (err == NoError ? CreateSuccessfulExecutionResult () : CreateFailedExecutionResult (err, "Failed to modify beam."));
+            if (changed) {
+                err = ACAPI_Element_Change (&element, &mask, nullptr, 0, true);
+                if (err != NoError) {
+                    results.Push (CreateFailedExecutionResult (err, "Failed to modify beam."));
+                    continue;
+                }
+            }
+
+            if (hasSectionFields) {
+                err = ApplyBeamSectionToMemo (element.header.guid, item);
+                results.Push (err == NoError
+                    ? CreateSuccessfulExecutionResult ()
+                    : CreateFailedExecutionResult (err, "Failed to modify beam cross section."));
+                continue;
+            }
+
+            results.Push (CreateSuccessfulExecutionResult ());
         }
     });
 }
@@ -3646,6 +3982,10 @@ GS::Optional<GS::UniString> ModifySlabsCommand::GetInputParametersSchema () cons
                         "elementId": { "$ref": "#/ElementId" },
                         "zCoordinate": { "type": "number" },
                         "thickness": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
+                        "referencePlaneLocation": {
+                            "type": "string",
+                            "enum": ["Top", "CoreTop", "CoreBottom", "Bottom"]
+                        },
                         "structureType": {
                             "type": "string",
                             "enum": ["Basic", "Composite"]
@@ -4096,7 +4436,13 @@ GS::Optional<GS::UniString> ModifyColumnsCommand::GetInputParametersSchema () co
                         "zCoordinate": { "type": "number" },
                         "height": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
                         "bottomOffset": { "type": "number" },
-                        "axisRotationAngle": { "type": "number" }
+                        "axisRotationAngle": { "type": "number" },
+                        "width": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
+                        "depth": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true },
+                        "circleBased": { "type": "boolean" },
+                        "isWidthAndHeightLinked": { "type": "boolean" },
+                        "buildingMaterialId": { "$ref": "#/AttributeId" },
+                        "profileId": { "$ref": "#/AttributeId" }
                     },
                     "additionalProperties": false,
                     "required": ["elementId"]
@@ -4139,14 +4485,44 @@ GS::ObjectState ModifyColumnsCommand::Execute (const GS::ObjectState& parameters
 
             API_Element mask = {};
             ACAPI_ELEMENT_MASK_CLEAR (mask);
+            auto sectionError = ValidateColumnSectionPayload (item);
+            if (sectionError.HasValue ()) {
+                results.Push (CreateFailedExecutionResult (APIERR_BADPARS, sectionError.Get ()));
+                continue;
+            }
+
+            const bool hasSectionFields = HasColumnSectionFields (item);
+            if (hasSectionFields) {
+                err = ValidateColumnSectionMemo (element.header.guid);
+                if (err != NoError) {
+                    results.Push (CreateFailedExecutionResult (err, "Column cross section memo is not available for update."));
+                    continue;
+                }
+            }
+
             const bool changed = ApplyColumnDetails (element, mask, item, stories);
-            if (!changed) {
+            if (!changed && !hasSectionFields) {
                 results.Push (CreateFailedExecutionResult (APIERR_BADPARS, "No column fields to modify."));
                 continue;
             }
 
-            err = ACAPI_Element_Change (&element, &mask, nullptr, 0, true);
-            results.Push (err == NoError ? CreateSuccessfulExecutionResult () : CreateFailedExecutionResult (err, "Failed to modify column."));
+            if (changed) {
+                err = ACAPI_Element_Change (&element, &mask, nullptr, 0, true);
+                if (err != NoError) {
+                    results.Push (CreateFailedExecutionResult (err, "Failed to modify column."));
+                    continue;
+                }
+            }
+
+            if (hasSectionFields) {
+                err = ApplyColumnSectionToMemo (element.header.guid, item);
+                results.Push (err == NoError
+                    ? CreateSuccessfulExecutionResult ()
+                    : CreateFailedExecutionResult (err, "Failed to modify column cross section."));
+                continue;
+            }
+
+            results.Push (CreateSuccessfulExecutionResult ());
         }
     });
 }

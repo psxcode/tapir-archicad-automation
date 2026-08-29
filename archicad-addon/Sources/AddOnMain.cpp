@@ -22,6 +22,7 @@
 #include "ElementGDLParameterCommands.hpp"
 #include "ElementCreationCommands.hpp"
 #include "ExtendedElementCommands.hpp"
+#include "ElementMutationCommands.hpp"
 #include "ElementGroupingCommands.hpp"
 #include "AttributeCommands.hpp"
 #include "TeamworkCommands.hpp"
@@ -526,6 +527,10 @@ GSErrCode Initialize (void)
         err |= RegisterCommand<ModifyColumnsCommand> (
             elementCommands, "1.4.0",
             "Modifies Column elements based on the given parameters."
+        );
+        err |= RegisterCommand<MutateElementsCommand> (
+            elementCommands, "1.0.0",
+            "Executes a typed native create, update or delete operation for Wall, Slab, Column or Beam elements and returns native readback."
         );
         err |= RegisterCommand<ModifyWindowsCommand> (
             elementCommands, "1.4.0",
