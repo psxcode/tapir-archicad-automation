@@ -1487,7 +1487,6 @@ GS::Optional<GS::UniString> ApplyWallStructure (
             if (selection.profile != APIInvalidAttributeIndex) {
                 element.wall.profileAttr = selection.profile;
             }
-            element.wall.type = APIWtyp_Poly;
             break;
         case StructureSelectionKind::Unspecified:
             break;
