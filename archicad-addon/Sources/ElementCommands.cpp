@@ -611,34 +611,31 @@ static GSErrCode CollectCutFillPolygons (const API_PrimElement* primElem,
     }
 }
 
-static bool IsPureDraftingType (API_ElemTypeID typeID)
+static bool CanHaveFloorPlanCutFill (API_ElemTypeID typeID)
 {
     switch (typeID) {
-        case API_LineID:
-        case API_PolyLineID:
-        case API_ArcID:
-        case API_CircleID:
-        case API_SplineID:
-        case API_TextID:
-        case API_LabelID:
-        case API_HatchID:
-        case API_HotspotID:
-        case API_DrawingID:
-        case API_PictureID:
-        case API_DetailID:
-        case API_WorksheetID:
-        case API_GroupID:
-        case API_CameraID:
-        case API_CamSetID:
-        case API_CutPlaneID:
-        case API_ChangeMarkerID:
-        case API_SectElemID:
-        case API_ElevationID:
-        case API_InteriorElevationID:
-        case API_DimensionID:
-        case API_RadialDimensionID:
-        case API_LevelDimensionID:
-        case API_AngleDimensionID:
+        // Shape primitive floor-plan cut-fill decomposition is meaningful for
+        // construction elements whose symbol comes from a real cut through the
+        // element.  Keep GDL-driven and drafting elements out of this native
+        // path: arbitrary/unknown types have historically crashed here.
+        case API_WallID:
+        case API_ColumnID:
+        case API_ColumnSegmentID:
+        case API_BeamID:
+        case API_BeamSegmentID:
+        case API_SlabID:
+        case API_RoofID:
+        case API_ShellID:
+        case API_MeshID:
+        case API_MorphID:
+        case API_CurtainWallID:
+        case API_CurtainWallSegmentID:
+        case API_CurtainWallPanelID:
+        case API_CurtainWallFrameID:
+        case API_StairID:
+        case API_StairStructureID:
+        case API_RiserID:
+        case API_TreadID:
             return true;
         default:
             return false;
@@ -1523,7 +1520,7 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
         detailsOfElement.Add ("details", typeSpecificDetails);
         {
             PerfTrace::ScopeTimer timer (PerfTrace::Phase::ShapePrims);
-            if (!IsPureDraftingType (typeID))
+            if (CanHaveFloorPlanCutFill (typeID))
                 AddFloorPlanPolygonsIfAvailable (elem.header.guid, detailsOfElement);
         }
 
