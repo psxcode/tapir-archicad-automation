@@ -510,6 +510,44 @@ bool DoesWallExist (const API_Guid& wallGuid)
     return DoesElementExist (wallGuid, API_WallID);
 }
 
+// Archicad cannot place a Door or Window in a polygonal wall. Letting the call through
+// produces a successful-looking element at a fixed location, ignoring centerOffset.
+// Return the read status separately so a failed native read cannot be treated as a
+// non-polygonal wall and accidentally fall through to CreateExt.
+GSErrCode GetWallPolygonalState (const API_Guid& wallGuid, bool& isPolygonal)
+{
+    isPolygonal = false;
+    API_Element wall = {};
+#ifdef ServerMainVers_2600
+    wall.header.type = API_WallID;
+#else
+    wall.header.typeID = API_WallID;
+#endif
+    wall.header.guid = wallGuid;
+    const GSErrCode err = ACAPI_Element_Get (&wall);
+    if (err != NoError) {
+        return err;
+    }
+    isPolygonal = wall.wall.type == APIWtyp_Poly;
+    return NoError;
+}
+
+// CreateOpenings builds its base polygon from width and height. Reject missing or
+// non-positive dimensions before an empty/invalid polygon reaches Archicad. Window and
+// Door sizes remain optional because their tool defaults/favorites provide them.
+GS::Optional<GS::UniString> CheckOpeningSize (const GS::ObjectState& data)
+{
+    const auto width = GetOptionalDouble (data, "width");
+    const auto height = GetOptionalDouble (data, "height");
+    if (!width.HasValue () || !height.HasValue ()) {
+        return GS::UniString ("Both 'width' and 'height' are required to create an opening.");
+    }
+    if (!std::isfinite (width.Get ()) || !std::isfinite (height.Get ()) || width.Get () <= 0.0 || height.Get () <= 0.0) {
+        return GS::UniString ("'width' and 'height' must be finite and greater than zero.");
+    }
+    return {};
+}
+
 GSErrCode PrepareWindowOrDoorDefaults (API_ElemTypeID elemTypeId, API_Element& element, API_ElementMemo& memo, API_SubElement& marker)
 {
     element = {};
@@ -2776,6 +2814,17 @@ GS::ObjectState CreateWindowsCommand::Execute (const GS::ObjectState& parameters
                 elements.Push (CreateErrorResponse (APIERR_BADID, "Failed to load owner wall."));
                 continue;
             }
+            bool isPolygonalWall = false;
+            const GSErrCode wallReadErr = GetWallPolygonalState (wallGuid, isPolygonalWall);
+            if (wallReadErr != NoError) {
+                elements.Push (CreateErrorResponse (wallReadErr, "Failed to read owner wall before creating window."));
+                continue;
+            }
+            if (isPolygonalWall) {
+                elements.Push (CreateErrorResponse (APIERR_BADPARS,
+                    "The owner wall is polygonal, and Archicad cannot place a window in one."));
+                continue;
+            }
 
             API_Element element = {};
             API_ElementMemo memo = {};
@@ -2918,6 +2967,17 @@ GS::ObjectState CreateDoorsCommand::Execute (const GS::ObjectState& parameters, 
                 elements.Push (CreateErrorResponse (APIERR_BADID, "Failed to load owner wall."));
                 continue;
             }
+            bool isPolygonalWall = false;
+            const GSErrCode wallReadErr = GetWallPolygonalState (wallGuid, isPolygonalWall);
+            if (wallReadErr != NoError) {
+                elements.Push (CreateErrorResponse (wallReadErr, "Failed to read owner wall before creating door."));
+                continue;
+            }
+            if (isPolygonalWall) {
+                elements.Push (CreateErrorResponse (APIERR_BADPARS,
+                    "The owner wall is polygonal, and Archicad cannot place a door in one."));
+                continue;
+            }
 
             API_Element element = {};
             API_ElementMemo memo = {};
@@ -3010,7 +3070,7 @@ GS::Optional<GS::UniString> CreateOpeningsCommand::GetInputParametersSchema () c
                         "height": { "type": "number", "minimum": 0.0, "exclusiveMinimum": true }
                     },
                     "additionalProperties": false,
-                    "required": ["ownerElementId", "basePoint"]
+                    "required": ["ownerElementId", "basePoint", "width", "height"]
                 }
             }
         },
@@ -3045,6 +3105,11 @@ GS::ObjectState CreateOpeningsCommand::Execute (const GS::ObjectState& parameter
         for (const auto& data : openingsData) {
             if (data.Get ("basePoint") == nullptr || data.Get ("ownerElementId") == nullptr) {
                 elements.Push (CreateErrorResponse (APIERR_BADPARS, "Missing required 'basePoint' or 'ownerElementId' field."));
+                continue;
+            }
+            const auto sizeError = CheckOpeningSize (data);
+            if (sizeError.HasValue ()) {
+                elements.Push (CreateErrorResponse (APIERR_BADPARS, sizeError.Get ()));
                 continue;
             }
             const API_Coord3D basePoint = Get3DCoordinateFromObjectState (*data.Get ("basePoint"));
