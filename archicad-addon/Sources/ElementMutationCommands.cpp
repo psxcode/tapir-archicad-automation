@@ -729,10 +729,13 @@ GS::ObjectState ExecuteUpdate (
     GS::ProcessControl& processControl)
 {
     switch (typeID) {
-        case API_WallID:   return ModifyWallsCommand ().Execute (parameters, processControl);
-        case API_SlabID:   return ModifySlabsCommand ().Execute (parameters, processControl);
-        case API_ColumnID: return ModifyColumnsCommand ().Execute (parameters, processControl);
-        case API_BeamID:   return ModifyBeamsCommand ().Execute (parameters, processControl);
+        // MutateElements is the single project-owned batch boundary.  It opts
+        // into the atomic mode of the legacy typed modifiers so a runtime
+        // failure in any item causes Archicad to roll back the whole batch.
+        case API_WallID:   return ModifyWallsCommand (true).Execute (parameters, processControl);
+        case API_SlabID:   return ModifySlabsCommand (true).Execute (parameters, processControl);
+        case API_ColumnID: return ModifyColumnsCommand (true).Execute (parameters, processControl);
+        case API_BeamID:   return ModifyBeamsCommand (true).Execute (parameters, processControl);
         default:           return CreateErrorResponse (APIERR_BADID, "Unsupported element type for update.");
     }
 }
@@ -822,12 +825,25 @@ GS::ObjectState BuildElementReadback (
         static_cast<GSSize> (detailRows.GetSize ()) != static_cast<GSSize> (elementGuids.GetSize ())) {
         verified = false;
     } else {
+        GS::Array<API_Guid> returnedDetailGuids;
         for (const GS::ObjectState& detailRow : detailRows) {
+            const GS::ObjectState* detailElementID = detailRow.Get ("elementId");
             const GS::ObjectState* detail = detailRow.Get ("details");
-            if (detail == nullptr || detail->Get ("error") != nullptr) {
+            const API_Guid detailGuid = detailElementID == nullptr
+                ? APINULLGuid
+                : GetGuidFromObjectState (*detailElementID);
+            if (detailGuid == APINULLGuid
+                || !ContainsGuid (elementGuids, detailGuid)
+                || ContainsGuid (returnedDetailGuids, detailGuid)
+                || detail == nullptr
+                || detail->Get ("error") != nullptr) {
                 verified = false;
                 break;
             }
+            returnedDetailGuids.Push (detailGuid);
+        }
+        if (static_cast<GSSize> (returnedDetailGuids.GetSize ()) != static_cast<GSSize> (elementGuids.GetSize ())) {
+            verified = false;
         }
     }
     readback.Add ("nativeDetails", nativeDetails);
@@ -883,11 +899,19 @@ GS::ObjectState BuildDeleteReadback (
     for (const API_Guid& guid : elementGuids) {
         API_Elem_Head header = {};
         header.guid = guid;
-        const bool stillExists = ACAPI_Element_GetHeader (&header) == NoError;
-        const bool absent = !stillExists;
+        const GSErrCode headerError = ACAPI_Element_GetHeader (&header);
+        const bool stillExists = headerError == NoError;
+        // APIERR_BADID is the documented not-found result for a deleted
+        // element.  Any other error is an indeterminate readback failure,
+        // not proof that the element is absent.
+        const bool absent = headerError == APIERR_BADID;
         GS::ObjectState status;
         status.Add ("elementId", CreateGuidObjectState (guid));
         status.Add ("absent", absent);
+        if (headerError != NoError && headerError != APIERR_BADID) {
+            status.Add ("readbackErrorCode", headerError);
+            verified = false;
+        }
         if (absent) {
             ++absentCount;
         }
@@ -987,6 +1011,10 @@ GS::Optional<GS::UniString> ValidateEnvelopeItem (
 GS::Array<API_Guid> CollectCreatedGuids (const GS::ObjectState& mutationResult)
 {
     GS::Array<API_Guid> guids;
+    bool transactionRolledBack = false;
+    if (mutationResult.Get ("transactionRolledBack", transactionRolledBack) && transactionRolledBack) {
+        return guids;
+    }
     GS::Array<GS::ObjectState> elements;
     if (!mutationResult.Get ("elements", elements)) {
         return guids;
@@ -995,7 +1023,7 @@ GS::Array<API_Guid> CollectCreatedGuids (const GS::ObjectState& mutationResult)
         const GS::ObjectState* elementID = element.Get ("elementId");
         if (elementID != nullptr) {
             const API_Guid guid = GetGuidFromObjectState (*elementID);
-            if (guid != APINULLGuid) {
+            if (guid != APINULLGuid && !ContainsGuid (guids, guid)) {
                 guids.Push (guid);
             }
         }
@@ -1008,6 +1036,10 @@ GS::Array<API_Guid> CollectUpdatedGuids (
     const GS::Array<API_Guid>& requestedGuids)
 {
     GS::Array<API_Guid> guids;
+    bool transactionRolledBack = false;
+    if (mutationResult.Get ("transactionRolledBack", transactionRolledBack) && transactionRolledBack) {
+        return guids;
+    }
     GS::Array<GS::ObjectState> results;
     if (!mutationResult.Get ("executionResults", results)) {
         return guids;
@@ -1024,6 +1056,21 @@ GS::Array<API_Guid> CollectUpdatedGuids (
     return guids;
 }
 
+GS::Array<API_Guid> CollectDeletedGuids (
+    const GS::ObjectState& mutationResult,
+    const GS::Array<API_Guid>& requestedGuids)
+{
+    bool success = false;
+    if (mutationResult.Get ("success", success) && success) {
+        return requestedGuids;
+    }
+    // DeleteElements returns one aggregate result for the supplied GUID list.
+    // A failed aggregate must not be reported as if every requested element
+    // had been deleted; the readback then remains an explicit failed/partial
+    // postcondition instead of manufacturing positive evidence.
+    return {};
+}
+
 bool MutationResultIsComplete (
     const GS::UniString& operation,
     const GS::ObjectState& mutationResult,
@@ -1032,17 +1079,28 @@ bool MutationResultIsComplete (
     if (mutationResult.Get ("error") != nullptr) {
         return false;
     }
+    bool transactionRolledBack = false;
+    if (mutationResult.Get ("transactionRolledBack", transactionRolledBack) && transactionRolledBack) {
+        return false;
+    }
     if (operation == "create") {
         GS::Array<GS::ObjectState> elements;
         if (!mutationResult.Get ("elements", elements) || static_cast<GSSize> (elements.GetSize ()) != requestedCount) {
             return false;
         }
+        GS::Array<API_Guid> createdGuids;
         for (const GS::ObjectState& element : elements) {
-            if (element.Get ("elementId") == nullptr) {
+            const GS::ObjectState* elementID = element.Get ("elementId");
+            if (elementID == nullptr) {
                 return false;
             }
+            const API_Guid guid = GetGuidFromObjectState (*elementID);
+            if (guid == APINULLGuid || ContainsGuid (createdGuids, guid)) {
+                return false;
+            }
+            createdGuids.Push (guid);
         }
-        return true;
+        return static_cast<GSSize> (createdGuids.GetSize ()) == requestedCount;
     }
     if (operation == "update") {
         GS::Array<GS::ObjectState> results;
@@ -1253,7 +1311,7 @@ GS::ObjectState MutateElementsCommand::Execute (
     } else if (operation == "update") {
         changedGuids = CollectUpdatedGuids (mutationResult, requestedElementGuids);
     } else {
-        changedGuids = requestedElementGuids;
+        changedGuids = CollectDeletedGuids (mutationResult, requestedElementGuids);
     }
 
     const bool mutationComplete = MutationResultIsComplete (operation, mutationResult, items.GetSize ());
@@ -1262,15 +1320,19 @@ GS::ObjectState MutateElementsCommand::Execute (
     // readback of successful items only can make a failed scalar/memo update
     // look as if the element had never been part of the operation.
     GS::Array<API_Guid> readbackGuids = changedGuids;
-    if (operation == "update" && !mutationComplete) {
+    if ((operation == "update" || operation == "delete") && !mutationComplete) {
         readbackGuids = requestedElementGuids;
     }
 
-    bool readbackVerified = true;
+    // An empty readback cannot prove a non-empty request.  In particular, a
+    // failed create may yield zero changed GUIDs; reporting verified=true in
+    // that case would turn a missing postcondition into green evidence.
+    bool readbackVerified = items.IsEmpty () || !readbackGuids.IsEmpty ();
     GSSize appliedCount = static_cast<GSSize> (changedGuids.GetSize ());
     GS::ObjectState readback;
     if (operation == "delete") {
-        readback = BuildDeleteReadback (changedGuids, typeID, readbackVerified, appliedCount);
+        GSSize absentCount = 0;
+        readback = BuildDeleteReadback (readbackGuids, typeID, readbackVerified, absentCount);
     } else {
         readback = BuildElementReadback (readbackGuids, typeID, processControl, readbackVerified);
     }

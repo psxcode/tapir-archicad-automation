@@ -29,6 +29,12 @@ GS::Optional<GS::UniString> CreateElementsCommandBase::GetResponseSchema () cons
         "properties": {
             "elements": {
                 "$ref": "#/Elements"
+            },
+            "transactionRolledBack": {
+                "type": "boolean"
+            },
+            "transactionError": {
+                "type": "integer"
             }
         },
         "additionalProperties": false,
@@ -53,7 +59,7 @@ GS::ObjectState	CreateElementsCommandBase::Execute (const GS::ObjectState& param
     notification.notifID = APINotifyElement_BeginEvents;
     AddElementNotificationClientCommand::ElementEventHandlerProc (&notification);
 
-    ACAPI_CallUndoableCommand ("Create " + elemTypeName, [&] () -> GSErrCode {
+    const GSErrCode undoErr = ACAPI_CallUndoableCommand ("Create " + elemTypeName, [&] () -> GSErrCode {
         bool savedAutoTextFlag = false;
         const GSErrCode autoTextErr = ACAPI_AutoText_GetAutoTextFlag (&savedAutoTextFlag);
         if (autoTextErr != NoError) {
@@ -112,6 +118,15 @@ GS::ObjectState	CreateElementsCommandBase::Execute (const GS::ObjectState& param
     notification = {};
     notification.notifID = APINotifyElement_EndEvents;
     AddElementNotificationClientCommand::ElementEventHandlerProc (&notification);
+
+    if (undoErr != NoError) {
+        // A host-level undo/commit failure can happen after the callback has
+        // collected generated GUIDs.  Expose it to MutateElements so the
+        // envelope clears stale IDs and reports an incomplete/readback-failed
+        // create instead of manufacturing green evidence.
+        response.Add ("transactionRolledBack", true);
+        response.Add ("transactionError", undoErr);
+    }
 
     return response;
 }

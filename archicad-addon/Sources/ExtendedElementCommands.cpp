@@ -1116,7 +1116,7 @@ GS::ObjectState ExecuteCreateWithElements (const GS::String& commandName, Func&&
     notification.notifID = APINotifyElement_BeginEvents;
     AddElementNotificationClientCommand::ElementEventHandlerProc (&notification);
 
-    ACAPI_CallUndoableCommand (commandName, [&]() -> GSErrCode {
+    const GSErrCode undoErr = ACAPI_CallUndoableCommand (commandName, [&]() -> GSErrCode {
         createFunc (results);
         return NoError;
     });
@@ -1125,20 +1125,57 @@ GS::ObjectState ExecuteCreateWithElements (const GS::String& commandName, Func&&
     notification.notifID = APINotifyElement_EndEvents;
     AddElementNotificationClientCommand::ElementEventHandlerProc (&notification);
 
-    return CreateElementListResponse (results);
+    GS::ObjectState response = CreateElementListResponse (results);
+    if (undoErr != NoError) {
+        // A host-level undo/commit failure can occur after the callback has
+        // collected generated GUIDs.  Expose that fact so the mutation
+        // envelope cannot report a complete create based on stale GUIDs.
+        response.Add ("transactionRolledBack", true);
+        response.Add ("transactionError", undoErr);
+    }
+    return response;
 }
 
 template<typename Func>
-GS::ObjectState ExecuteModifyWithResults (const GS::String& commandName, Func&& modifyFunc)
+GS::ObjectState ExecuteModifyWithResults (const GS::String& commandName, Func&& modifyFunc, const bool atomic = false)
 {
     GS::Array<GS::ObjectState> results;
 
-    ACAPI_CallUndoableCommand (commandName, [&]() -> GSErrCode {
+    const GSErrCode undoErr = ACAPI_CallUndoableCommand (commandName, [&]() -> GSErrCode {
         modifyFunc (results);
+        if (atomic) {
+            for (const GS::ObjectState& result : results) {
+                bool success = false;
+                if (!result.Get ("success", success) || !success) {
+                    // Returning an error from the undoable callback asks
+                    // Archicad to discard the complete command scope.  This
+                    // is deliberately opt-in: legacy Modify* commands keep
+                    // their historical per-item result behavior, while the
+                    // project-owned MutateElements envelope gets all-or-none
+                    // batch semantics.
+                    return APIERR_COMMANDFAILED;
+                }
+            }
+        }
         return NoError;
     });
 
-    return CreateExecutionResultResponse (results);
+    if (atomic && undoErr != NoError) {
+        // Keep the per-item diagnostics, but make the all-or-none outcome
+        // explicit for the envelope.  The caller must not count a successful
+        // item from a rolled-back command as applied.
+        if (results.IsEmpty ()) {
+            results.Push (CreateFailedExecutionResult (undoErr, "Atomic mutation was rolled back by Archicad."));
+        }
+    }
+
+    GS::ObjectState response = CreateExecutionResultResponse (results);
+    if (atomic && undoErr != NoError) {
+        response.Add ("transactionRolledBack", true);
+        response.Add ("transactionError", undoErr);
+    }
+
+    return response;
 }
 
 }
@@ -2788,6 +2825,12 @@ GS::Optional<GS::UniString> CreateWindowsCommand::GetResponseSchema () const
         "properties": {
             "elements": {
                 "$ref": "#/Elements"
+            },
+            "transactionRolledBack": {
+                "type": "boolean"
+            },
+            "transactionError": {
+                "type": "integer"
             }
         },
         "additionalProperties": false,
@@ -2941,6 +2984,12 @@ GS::Optional<GS::UniString> CreateDoorsCommand::GetResponseSchema () const
         "properties": {
             "elements": {
                 "$ref": "#/Elements"
+            },
+            "transactionRolledBack": {
+                "type": "boolean"
+            },
+            "transactionError": {
+                "type": "integer"
             }
         },
         "additionalProperties": false,
@@ -3086,6 +3135,12 @@ GS::Optional<GS::UniString> CreateOpeningsCommand::GetResponseSchema () const
         "properties": {
             "elements": {
                 "$ref": "#/Elements"
+            },
+            "transactionRolledBack": {
+                "type": "boolean"
+            },
+            "transactionError": {
+                "type": "integer"
             }
         },
         "additionalProperties": false,
@@ -3210,6 +3265,12 @@ GS::Optional<GS::UniString> CreateMorphsCommand::GetResponseSchema () const
         "properties": {
             "elements": {
                 "$ref": "#/Elements"
+            },
+            "transactionRolledBack": {
+                "type": "boolean"
+            },
+            "transactionError": {
+                "type": "integer"
             }
         },
         "additionalProperties": false,
@@ -3499,6 +3560,12 @@ GS::Optional<GS::UniString> CreateAssociativeDimensionsCommand::GetResponseSchem
         "properties": {
             "elements": {
                 "$ref": "#/Elements"
+            },
+            "transactionRolledBack": {
+                "type": "boolean"
+            },
+            "transactionError": {
+                "type": "integer"
             }
         },
         "additionalProperties": false,
@@ -3654,6 +3721,12 @@ GS::Optional<GS::UniString> CreateAssociativeDimensionsOnSectionCommand::GetResp
         "properties": {
             "elements": {
                 "$ref": "#/Elements"
+            },
+            "transactionRolledBack": {
+                "type": "boolean"
+            },
+            "transactionError": {
+                "type": "integer"
             }
         },
         "additionalProperties": false,
@@ -3777,6 +3850,12 @@ GS::Optional<GS::UniString> CreateWallThicknessDimensionsCommand::GetResponseSch
         "properties": {
             "elements": {
                 "$ref": "#/Elements"
+            },
+            "transactionRolledBack": {
+                "type": "boolean"
+            },
+            "transactionError": {
+                "type": "integer"
             }
         },
         "additionalProperties": false,
@@ -3876,8 +3955,9 @@ GS::ObjectState CreateWallThicknessDimensionsCommand::Execute (const GS::ObjectS
     });
 }
 
-ModifyWallsCommand::ModifyWallsCommand () :
-    CommandBase (CommonSchema::Used)
+ModifyWallsCommand::ModifyWallsCommand (const bool atomicIn) :
+    CommandBase (CommonSchema::Used),
+    atomic (atomicIn)
 {
 }
 
@@ -3924,7 +4004,7 @@ GS::Optional<GS::UniString> ModifyWallsCommand::GetInputParametersSchema () cons
 
 GS::Optional<GS::UniString> ModifyWallsCommand::GetResponseSchema () const
 {
-    return R"({"type":"object","properties":{"executionResults":{"$ref":"#/ExecutionResults"}},"additionalProperties":false,"required":["executionResults"]})";
+    return R"({"type":"object","properties":{"executionResults":{"$ref":"#/ExecutionResults"},"transactionRolledBack":{"type":"boolean"},"transactionError":{"type":"integer"}},"additionalProperties":false,"required":["executionResults"]})";
 }
 
 GS::ObjectState ModifyWallsCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl&) const
@@ -3965,11 +4045,12 @@ GS::ObjectState ModifyWallsCommand::Execute (const GS::ObjectState& parameters, 
             err = ACAPI_Element_Change (&element, &mask, nullptr, 0, true);
             results.Push (err == NoError ? CreateSuccessfulExecutionResult () : CreateFailedExecutionResult (err, "Failed to modify wall."));
         }
-    });
+    }, atomic);
 }
 
-ModifyBeamsCommand::ModifyBeamsCommand () :
-    CommandBase (CommonSchema::Used)
+ModifyBeamsCommand::ModifyBeamsCommand (const bool atomicIn) :
+    CommandBase (CommonSchema::Used),
+    atomic (atomicIn)
 {
 }
 
@@ -4082,11 +4163,12 @@ GS::ObjectState ModifyBeamsCommand::Execute (const GS::ObjectState& parameters, 
 
             results.Push (CreateSuccessfulExecutionResult ());
         }
-    });
+    }, atomic);
 }
 
-ModifySlabsCommand::ModifySlabsCommand () :
-    CommandBase (CommonSchema::Used)
+ModifySlabsCommand::ModifySlabsCommand (const bool atomicIn) :
+    CommandBase (CommonSchema::Used),
+    atomic (atomicIn)
 {
 }
 
@@ -4244,7 +4326,7 @@ GS::ObjectState ModifySlabsCommand::Execute (const GS::ObjectState& parameters, 
             err = ACAPI_Element_Change (&element, &mask, nullptr, 0, true);
             results.Push (err == NoError ? CreateSuccessfulExecutionResult () : CreateFailedExecutionResult (err, "Failed to modify slab."));
         }
-    });
+    }, atomic);
 }
 
 ModifyRoofsCommand::ModifyRoofsCommand () :
@@ -4537,8 +4619,9 @@ GS::ObjectState GetDimensionDataCommand::Execute (const GS::ObjectState& paramet
     return response;
 }
 
-ModifyColumnsCommand::ModifyColumnsCommand () :
-    CommandBase (CommonSchema::Used)
+ModifyColumnsCommand::ModifyColumnsCommand (const bool atomicIn) :
+    CommandBase (CommonSchema::Used),
+    atomic (atomicIn)
 {
 }
 
@@ -4652,7 +4735,7 @@ GS::ObjectState ModifyColumnsCommand::Execute (const GS::ObjectState& parameters
 
             results.Push (CreateSuccessfulExecutionResult ());
         }
-    });
+    }, atomic);
 }
 
 ModifyWindowsCommand::ModifyWindowsCommand () :
@@ -4973,6 +5056,12 @@ GS::Optional<GS::UniString> CreateSectionsCommand::GetResponseSchema () const
         "properties": {
             "elements": {
                 "$ref": "#/Elements"
+            },
+            "transactionRolledBack": {
+                "type": "boolean"
+            },
+            "transactionError": {
+                "type": "integer"
             }
         },
         "additionalProperties": false,

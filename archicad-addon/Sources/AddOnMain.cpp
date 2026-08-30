@@ -222,6 +222,10 @@ GSErrCode Initialize (void)
             applicationCommands, "0.1.0",
             "Retrieves the version of the Tapir Additional JSON Commands Add-On."
         );
+        err |= RegisterCommand<GetNativeBuildInfoCommand> (
+            applicationCommands, "0.1.0",
+            "Returns the loaded APX build identity and filesystem locations."
+        );
         err |= RegisterCommand<GetArchicadLocationCommand> (
             applicationCommands, "0.1.0",
             "Retrieves the location of the currently running Archicad executable."

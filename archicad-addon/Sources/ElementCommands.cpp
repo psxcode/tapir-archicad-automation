@@ -4352,11 +4352,14 @@ GS::ObjectState DeleteElementsCommand::Execute (const GS::ObjectState& parameter
 
     GSErrCode err = NoError;
 
-    ACAPI_CallUndoableCommand ("DeleteElementsCommand", [&]() {
+    const GSErrCode undoErr = ACAPI_CallUndoableCommand ("DeleteElementsCommand", [&]() {
         err = ACAPI_Element_Delete (elements.Transform<API_Guid> (GetGuidFromElementsArrayItem));
 
         return err;
     });
+    if (undoErr != NoError) {
+        err = undoErr;
+    }
 
     return err == NoError
         ? CreateSuccessfulExecutionResult ()

@@ -123,41 +123,53 @@ public:
 class ModifyWallsCommand : public CommandBase
 {
 public:
-    ModifyWallsCommand ();
+    explicit ModifyWallsCommand (bool atomic = false);
     virtual GS::String GetName () const override;
     virtual GS::Optional<GS::UniString> GetInputParametersSchema () const override;
     virtual GS::Optional<GS::UniString> GetResponseSchema () const override;
     virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
+
+private:
+    bool atomic;
 };
 
 class ModifyBeamsCommand : public CommandBase
 {
 public:
-    ModifyBeamsCommand ();
+    explicit ModifyBeamsCommand (bool atomic = false);
     virtual GS::String GetName () const override;
     virtual GS::Optional<GS::UniString> GetInputParametersSchema () const override;
     virtual GS::Optional<GS::UniString> GetResponseSchema () const override;
     virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
+
+private:
+    bool atomic;
 };
 
 class ModifySlabsCommand : public CommandBase
 {
 public:
-    ModifySlabsCommand ();
+    explicit ModifySlabsCommand (bool atomic = false);
     virtual GS::String GetName () const override;
     virtual GS::Optional<GS::UniString> GetInputParametersSchema () const override;
     virtual GS::Optional<GS::UniString> GetResponseSchema () const override;
     virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
+
+private:
+    bool atomic;
 };
 
 class ModifyColumnsCommand : public CommandBase
 {
 public:
-    ModifyColumnsCommand ();
+    explicit ModifyColumnsCommand (bool atomic = false);
     virtual GS::String GetName () const override;
     virtual GS::Optional<GS::UniString> GetInputParametersSchema () const override;
     virtual GS::Optional<GS::UniString> GetResponseSchema () const override;
     virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
+
+private:
+    bool atomic;
 };
 
 class ModifyWindowsCommand : public CommandBase

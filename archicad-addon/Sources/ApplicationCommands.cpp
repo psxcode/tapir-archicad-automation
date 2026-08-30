@@ -38,6 +38,71 @@ GS::ObjectState GetAddOnVersionCommand::Execute (const GS::ObjectState& /*parame
     return GS::ObjectState ("version", ADDON_VERSION);
 }
 
+GetNativeBuildInfoCommand::GetNativeBuildInfoCommand () :
+    CommandBase (CommonSchema::NotUsed)
+{
+}
+
+GS::String GetNativeBuildInfoCommand::GetName () const
+{
+    return "GetNativeBuildInfo";
+}
+
+GS::Optional<GS::UniString> GetNativeBuildInfoCommand::GetResponseSchema () const
+{
+    return R"({
+        "type": "object",
+        "properties": {
+            "version": { "type": "string", "minLength": 1 },
+            "buildId": { "type": "string", "minLength": 1 },
+            "archicadMajor": { "type": "integer", "enum": [25, 28] },
+            "addonLocation": { "type": "string", "minLength": 1 },
+            "archicadLocation": { "type": "string", "minLength": 1 }
+        },
+        "additionalProperties": false,
+        "required": [
+            "version",
+            "buildId",
+            "archicadMajor",
+            "addonLocation",
+            "archicadLocation"
+        ]
+    })";
+}
+
+GS::ObjectState GetNativeBuildInfoCommand::Execute (const GS::ObjectState& /*parameters*/, GS::ProcessControl& /*processControl*/) const
+{
+    IO::Location addonLocation;
+    const GSErrCode addonErr = ACAPI_GetOwnLocation (&addonLocation);
+
+    IO::Location archicadLocation;
+    const GSErrCode applicationErr = IO::fileSystem.GetSpecialLocation (
+        IO::FileSystem::ApplicationFile,
+        &archicadLocation
+    );
+
+    if (addonErr != NoError || applicationErr != NoError) {
+        return CreateErrorResponse (
+            addonErr != NoError ? addonErr : applicationErr,
+            "Failed to resolve the loaded add-on or Archicad location."
+        );
+    }
+
+#if defined (ServerMainVers_2800)
+    constexpr Int32 archicadMajor = 28;
+#else
+    constexpr Int32 archicadMajor = 25;
+#endif
+
+    GS::ObjectState result;
+    result.Add ("version", GS::UniString (ADDON_VERSION));
+    result.Add ("buildId", GS::UniString (TAPIR_BUILD_ID));
+    result.Add ("archicadMajor", archicadMajor);
+    result.Add ("addonLocation", addonLocation.ToDisplayText ());
+    result.Add ("archicadLocation", archicadLocation.ToDisplayText ());
+    return result;
+}
+
 GetArchicadLocationCommand::GetArchicadLocationCommand () :
     CommandBase (CommonSchema::NotUsed)
 {

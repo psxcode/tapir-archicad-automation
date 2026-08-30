@@ -207,7 +207,12 @@ GSErrCode WriteInstanceInfo ()
     char pidBuf[24] = {0};
     std::snprintf (pidBuf, sizeof (pidBuf), "%lu", static_cast<unsigned long> (pid));
     const std::string filePath = dir + "\\" + pidBuf + ".json";
-    const std::string tmpPath = filePath + ".tmp";
+    // Include process/thread/tick identity so concurrent project/open events
+    // never share one predictable temporary file.  The final MoveFileEx is
+    // still the atomic publication boundary consumed by the registry reader.
+    const std::string tmpPath = filePath + "." + std::to_string (static_cast<unsigned long> (pid))
+        + "-" + std::to_string (static_cast<unsigned long> (GetCurrentThreadId ()))
+        + "-" + std::to_string (static_cast<unsigned long long> (GetTickCount64 ())) + ".tmp";
 
     const std::string json = BuildInstanceJson ();
 

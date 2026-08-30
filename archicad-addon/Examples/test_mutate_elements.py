@@ -3,8 +3,9 @@ Live regression test for the project-owned MutateElements envelope.
 
 The test talks to the foreground Archicad instance through aclib and must be
 run against an isolated disposable project.  Every created element is deleted
-in finally, with the legacy DeleteElements command as a last-resort cleanup
-path.
+in finally through the same bounded envelope.  A timeout/unknown response is
+never retried through a second command; the disposable process is the recovery
+boundary.
 """
 
 import math
@@ -13,10 +14,119 @@ import aclib
 
 
 created = []
+command_unknown = False
+
+
+def valid_guid(value):
+    return (isinstance(value, dict) and isinstance(value.get("guid"), str)
+            and bool(value.get("guid")))
+
+
+def valid_error(value):
+    return (isinstance(value, dict) and isinstance(value.get("code"), int)
+            and not isinstance(value.get("code"), bool)
+            and isinstance(value.get("message"), str))
+
+
+def validate_response(command, result):
+    # A syntactically valid but semantically incomplete addOnCommandResponse
+    # is still an unknown post-dispatch outcome.  Do not let the assertions
+    # below turn it into a normal test failure followed by cleanup writes.
+    if not isinstance(result, dict):
+        raise RuntimeError(f"malformed {command} response: {result!r}")
+    error = result.get("error")
+    if error is not None:
+        if not isinstance(error, dict) or not isinstance(error.get("code"), int) or not isinstance(error.get("message"), str):
+            raise RuntimeError(f"malformed {command} error response: {result!r}")
+        return result
+    required = {
+        "MutateElements": ("operation", "elementType", "requestedCount", "appliedCount", "mutationComplete", "readbackVerified", "partial", "mutationResult", "readback"),
+        "GetDetailsOfElements": ("detailsOfElements",),
+        "LockElements": ("success",),
+        "UnlockElements": ("success",),
+    }.get(command, ())
+    missing = [field for field in required if field not in result]
+    if missing:
+        raise RuntimeError(f"malformed {command} response; missing {missing!r}: {result!r}")
+    if command == "MutateElements":
+        if (result["operation"] not in ("create", "update", "delete")
+                or result["elementType"] not in ("Wall", "Slab", "Column", "Beam")
+                or not isinstance(result["requestedCount"], int) or isinstance(result["requestedCount"], bool)
+                or not isinstance(result["appliedCount"], int) or isinstance(result["appliedCount"], bool)
+                or result["requestedCount"] < 0 or result["appliedCount"] < 0
+                or not isinstance(result["mutationComplete"], bool) or not isinstance(result["readbackVerified"], bool)
+                or not isinstance(result["partial"], bool) or not isinstance(result["mutationResult"], dict)
+                or not isinstance(result["readback"], dict)):
+            raise RuntimeError(f"malformed MutateElements response: {result!r}")
+        operation = result["operation"]
+        mutation_result = result["mutationResult"]
+        readback = result["readback"]
+        if operation in ("create", "update"):
+            native_details = readback.get("nativeDetails")
+            detail_rows = native_details.get("detailsOfElements") if isinstance(native_details, dict) else None
+            element_rows = readback.get("elements")
+            if not isinstance(native_details, dict) or not isinstance(detail_rows, list) or not isinstance(element_rows, list):
+                raise RuntimeError(f"malformed MutateElements readback: {result!r}")
+            for row in detail_rows:
+                if (not isinstance(row, dict) or not valid_guid(row.get("elementId"))
+                        or not isinstance(row.get("details"), dict)):
+                    raise RuntimeError(f"malformed MutateElements detail readback: {result!r}")
+            for row in element_rows:
+                if (not isinstance(row, dict) or not valid_guid(row.get("elementId"))
+                        or not isinstance(row.get("exists"), bool)
+                        or not isinstance(row.get("elementTypeMatches"), bool)):
+                    raise RuntimeError(f"malformed MutateElements element readback: {result!r}")
+        else:
+            deleted_rows = readback.get("deleted")
+            if not isinstance(deleted_rows, list):
+                raise RuntimeError(f"malformed MutateElements delete readback: {result!r}")
+            for row in deleted_rows:
+                if (not isinstance(row, dict) or not valid_guid(row.get("elementId"))
+                        or not isinstance(row.get("absent"), bool)
+                        or ("readbackErrorCode" in row
+                            and (not isinstance(row["readbackErrorCode"], int)
+                                 or isinstance(row["readbackErrorCode"], bool)))):
+                    raise RuntimeError(f"malformed MutateElements delete row: {result!r}")
+        if operation == "create":
+            rows = mutation_result.get("elements")
+            if not isinstance(rows, list):
+                raise RuntimeError(f"malformed MutateElements create result: {result!r}")
+            for row in rows:
+                if (not isinstance(row, dict)
+                        or ("elementId" not in row and "error" not in row)
+                        or ("elementId" in row and not valid_guid(row["elementId"]))
+                        or ("error" in row and not valid_error(row["error"]))):
+                    raise RuntimeError(f"malformed MutateElements create item: {result!r}")
+        elif operation == "update":
+            rows = mutation_result.get("executionResults")
+            if not isinstance(rows, list):
+                raise RuntimeError(f"malformed MutateElements update result: {result!r}")
+            for row in rows:
+                if (not isinstance(row, dict) or not isinstance(row.get("success"), bool)
+                        or ("error" in row and not valid_error(row["error"]))):
+                    raise RuntimeError(f"malformed MutateElements update item: {result!r}")
+        elif not isinstance(mutation_result.get("success"), bool):
+            raise RuntimeError(f"malformed MutateElements delete result: {result!r}")
+    elif command in ("LockElements", "UnlockElements") and not isinstance(result["success"], bool):
+        raise RuntimeError(f"malformed {command} response: {result!r}")
+    elif command == "GetDetailsOfElements":
+        for row in result["detailsOfElements"]:
+            if (not isinstance(row, dict) or not valid_guid(row.get("elementId"))
+                    or not isinstance(row.get("details"), dict)):
+                raise RuntimeError(f"malformed GetDetailsOfElements response: {result!r}")
+    return result
 
 
 def run(command, parameters):
-    return aclib.RunTapirCommand(command, parameters, debug=False)
+    global command_unknown
+    try:
+        return validate_response(command, aclib.RunTapirCommand(command, parameters, debug=False))
+    except Exception:
+        # A transport exception after dispatch has an unknown write outcome.
+        # The disposable runner is the only recovery boundary; no subsequent
+        # cleanup command may be sent for any GUID in this process.
+        command_unknown = True
+        raise
 
 
 def require(condition, message):
@@ -163,12 +273,17 @@ def run_test():
                 for s in beam_sections), f"not every beam segment was updated: {beam_sections!r}")
 
     print("TEST -- delete returns explicit absence confirmation")
+    # Remove this item from the local cleanup queue before dispatching the
+    # delete.  If the POST times out or the connection drops after dispatch,
+    # its outcome is unknown and the disposable-process shutdown is the only
+    # recovery boundary; finally must never send a second delete for the same
+    # GUID (which could hit a reused/changed element).
+    created.remove(("Wall", wall_guid))
     deleted = delete("Wall", wall_guid)
     require(deleted and deleted.get("mutationComplete"), f"delete failed: {deleted!r}")
     require(deleted["readbackVerified"], f"delete readback was not verified: {deleted!r}")
     require(deleted["readback"]["deleted"] == [{"elementId": {"guid": wall_guid}, "absent": True}],
             f"delete did not confirm absence: {deleted!r}")
-    created.remove(("Wall", wall_guid))
 
 
 try:
@@ -177,17 +292,29 @@ try:
     print("PASS -- MutateElements native CRUD regression")
     print("=" * 60)
 finally:
-    # Keep cleanup explicit and best-effort.  If the new envelope itself is
-    # the thing under test and fails, the mature Tapir delete path still
-    # removes the disposable elements before the script exits.
+    # Keep cleanup explicit and best-effort.  Do not fall back to a second
+    # delete API after an unknown response: a timed-out POST may already have
+    # executed, and retrying could duplicate or corrupt the cleanup mutation.
+    if command_unknown:
+        print("cleanup skipped: a command outcome is unknown; disposable process shutdown is the recovery boundary")
+        created.clear()
     by_type = {}
     for element_type, guid in created:
         by_type.setdefault(element_type, []).append(guid)
+    cleanup_failure = None
     for element_type, guids in by_type.items():
-        result = run("MutateElements", {
-            "operation": "delete",
-            "elementType": element_type,
-            "items": [{"elementId": {"guid": guid}} for guid in guids],
-        })
-        if not result or not result.get("readbackVerified"):
-            run("DeleteElements", {"elements": [{"elementId": {"guid": guid}} for guid in guids]})
+        try:
+            cleanup_result = run("MutateElements", {
+                "operation": "delete",
+                "elementType": element_type,
+                "items": [{"elementId": {"guid": guid}} for guid in guids],
+            })
+            if not cleanup_result or cleanup_result.get("mutationComplete") is not True or cleanup_result.get("readbackVerified") is not True:
+                cleanup_failure = RuntimeError(f"cleanup mutation did not prove deletion for {element_type}: {cleanup_result!r}")
+                break
+        except Exception as cleanup_error:
+            cleanup_failure = cleanup_error
+            print(f"cleanup outcome unknown for {element_type}: {cleanup_error!r}")
+            break
+    if cleanup_failure is not None:
+        raise cleanup_failure

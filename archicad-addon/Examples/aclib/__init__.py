@@ -1,6 +1,7 @@
 import json
 import urllib.request
 import argparse
+import os
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--host', dest='host', type=str, default='http://127.0.0.1')
@@ -8,6 +9,7 @@ parser.add_argument('--port', dest='port', type=int, default=19723)
 args, unknownArgs = parser.parse_known_args()
 host = 'http://127.0.0.1' if 'host' not in args else args.host
 port = 19723 if 'port' not in args else args.port
+lease_secret = os.environ.get('TAPIR_LEASE_SECRET')
 
 def RunCommand (command, parameters = None, debug = False):
     if parameters is None:
@@ -21,6 +23,8 @@ def RunCommand (command, parameters = None, debug = False):
 
     connection_object = urllib.request.Request ('{}:{}'.format (host, port))
     connection_object.add_header ('Content-Type', 'application/json')
+    if lease_secret:
+        connection_object.add_header ('X-Tapir-Lease-Secret', lease_secret)
 
     request_data = {
         'command' : command,
