@@ -8,6 +8,7 @@
 #include <limits>
 #include <memory>
 #include <new>
+#include <vector>
 
 CreateElementsCommandBase::CreateElementsCommandBase (const GS::String& commandNameIn, API_ElemTypeID elemTypeIDIn, const GS::String& arrayFieldNameIn)
     : CommandBase (CommonSchema::Used)
@@ -54,6 +55,8 @@ GS::ObjectState	CreateElementsCommandBase::Execute (const GS::ObjectState& param
 
     const GS::UniString elemTypeName = GetElementTypeNonLocalizedName (elemTypeID);
     const Stories stories = GetStories ();
+    std::vector<API_Elem_Head> createdHeads;
+    createdHeads.reserve (dataArray.GetSize ());
 
     API_NotifyElementType notification = {};
     notification.notifID = APINotifyElement_BeginEvents;
@@ -104,10 +107,9 @@ GS::ObjectState	CreateElementsCommandBase::Execute (const GS::ObjectState& param
                 continue;
             }
 
-            notification = {};
-            notification.notifID = APINotifyElement_New;
-            notification.elemHead = element.header;
-            AddElementNotificationClientCommand::ElementEventHandlerProc (&notification);
+            // Hold New notifications until the undoable command has
+            // committed; a host-level rollback must not publish stale GUIDs.
+            createdHeads.push_back (element.header);
 
             elements (CreateElementIdObjectState (element.header.guid));
         }
@@ -118,6 +120,15 @@ GS::ObjectState	CreateElementsCommandBase::Execute (const GS::ObjectState& param
     notification = {};
     notification.notifID = APINotifyElement_EndEvents;
     AddElementNotificationClientCommand::ElementEventHandlerProc (&notification);
+
+    if (undoErr == NoError) {
+        for (const API_Elem_Head& createdHead : createdHeads) {
+            notification = {};
+            notification.notifID = APINotifyElement_New;
+            notification.elemHead = createdHead;
+            AddElementNotificationClientCommand::ElementEventHandlerProc (&notification);
+        }
+    }
 
     if (undoErr != NoError) {
         // A host-level undo/commit failure can happen after the callback has
@@ -244,6 +255,12 @@ GS::Optional<GS::ObjectState> CreateColumnsCommand::SetTypeSpecificParameters (A
     if ((hasWidth || hasDepth) && memo.columnSegments != nullptr) {
         GSSize nSegments = BMGetPtrSize (reinterpret_cast<GSPtr>(memo.columnSegments)) / sizeof (API_ColumnSegmentType);
         for (GSSize i = 0; i < nSegments; ++i) {
+            // Defaults may link both section dimensions.  Two explicit values are
+            // independent mutation inputs, so unlink them before assigning either
+            // value; otherwise the second assignment silently overwrites the first.
+            if (hasWidth && hasDepth) {
+                memo.columnSegments[i].assemblySegmentData.isWidthAndHeightLinked = false;
+            }
             if (hasWidth) {
                 memo.columnSegments[i].assemblySegmentData.nominalWidth = width;
             }
@@ -442,7 +459,14 @@ GS::Optional<GS::ObjectState> CreateSlabsCommand::SetTypeSpecificParameters (API
     const auto floorIndexAndOffset = ResolveFloorIndexAndOffset (parameters, "floorIndex", inputLevel, stories);
     element.header.floorInd = floorIndexAndOffset.first;
     element.slab.level = floorIndexAndOffset.second;
-    parameters.Get ("thickness", element.slab.thickness);
+    if (parameters.Get ("thickness", element.slab.thickness)) {
+        // Archicad defaults are project/version dependent.  AC28 may default
+        // to a Composite slab, whose thickness is attribute-controlled and
+        // silently ignores the scalar requested by MutateElements.  An
+        // explicit thickness therefore creates a Basic slab so the native
+        // create contract has the same meaning in AC25 and AC28.
+        element.slab.modelElemStructureType = API_BasicStructure;
+    }
 
     GS::UniString referencePlaneLocation;
     if (parameters.Get ("referencePlaneLocation", referencePlaneLocation)) {

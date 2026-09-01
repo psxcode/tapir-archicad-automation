@@ -409,6 +409,14 @@ static GSErrCode ApplyColumnSectionToMemo (API_Guid elementGuid, const GS::Objec
 
     for (GSSize i = 0; i < segmentCount; ++i) {
         API_AssemblySegmentData& segment = memo.columnSegments[i].assemblySegmentData;
+        if (hasIsWidthAndHeightLinked) {
+            segment.isWidthAndHeightLinked = isWidthAndHeightLinked;
+        } else if (hasWidth && hasDepth) {
+            // Treat two explicit dimensions as independent unless the caller asks
+            // for linked dimensions.  Archicad defaults can otherwise make the
+            // second assignment overwrite the first one.
+            segment.isWidthAndHeightLinked = false;
+        }
         if (hasWidth) {
             segment.nominalWidth = width;
         }
@@ -417,9 +425,6 @@ static GSErrCode ApplyColumnSectionToMemo (API_Guid elementGuid, const GS::Objec
         }
         if (hasCircleBased) {
             segment.circleBased = circleBased;
-        }
-        if (hasIsWidthAndHeightLinked) {
-            segment.isWidthAndHeightLinked = isWidthAndHeightLinked;
         }
         if (profileId != nullptr) {
             segment.modelElemStructureType = API_ProfileStructure;
@@ -476,14 +481,16 @@ static GSErrCode ApplyBeamSectionToMemo (API_Guid elementGuid, const GS::ObjectS
 
     for (GSSize i = 0; i < segmentCount; ++i) {
         API_AssemblySegmentData& segment = memo.beamSegments[i].assemblySegmentData;
+        if (hasIsWidthAndHeightLinked) {
+            segment.isWidthAndHeightLinked = isWidthAndHeightLinked;
+        } else if (hasWidth && hasHeight) {
+            segment.isWidthAndHeightLinked = false;
+        }
         if (hasWidth) {
             segment.nominalWidth = width;
         }
         if (hasHeight) {
             segment.nominalHeight = height;
-        }
-        if (hasIsWidthAndHeightLinked) {
-            segment.isWidthAndHeightLinked = isWidthAndHeightLinked;
         }
         if (profileId != nullptr) {
             segment.modelElemStructureType = API_ProfileStructure;
@@ -2604,6 +2611,9 @@ GS::Optional<GS::ObjectState> CreateBeamsCommand::SetTypeSpecificParameters (API
     if ((width.HasValue () || height.HasValue ()) && memo.beamSegments != nullptr) {
         GSSize nSegments = BMGetPtrSize (reinterpret_cast<GSPtr>(memo.beamSegments)) / sizeof (API_BeamSegmentType);
         for (GSSize i = 0; i < nSegments; ++i) {
+            if (width.HasValue () && height.HasValue ()) {
+                memo.beamSegments[i].assemblySegmentData.isWidthAndHeightLinked = false;
+            }
             if (width.HasValue ()) {
                 memo.beamSegments[i].assemblySegmentData.nominalWidth = width.Get ();
             }

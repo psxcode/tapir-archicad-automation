@@ -4,10 +4,13 @@
 #include "ElementCreationCommands.hpp"
 #include "ExtendedElementCommands.hpp"
 #include "MigrationHelper.hpp"
+#include "NativeRichTextMemo.hpp"
+#include "NotificationCommands.hpp"
 
 #include <cmath>
 #include <initializer_list>
 #include <limits>
+#include <vector>
 
 namespace {
 
@@ -459,7 +462,8 @@ GS::Optional<GS::UniString> ValidateAllowedPayloadFields (
         "height", "width", "depth", "thickness", "bottomOffset", "offset", "slantAngle", "arcAngle",
         "verticalCurveHeight", "axisRotationAngle", "profileAngle", "referenceLineLocation", "referencePlaneLocation",
         "structureType", "buildingMaterialId", "compositeId", "profileId", "anchorPoint", "coreAnchor",
-        "circleBased", "isWidthAndHeightLinked", "isSlanted", "polygonCoordinates", "polygonOutline", "polygonArcs", "holes"
+        "circleBased", "isWidthAndHeightLinked", "isSlanted", "polygonCoordinates", "polygonOutline", "polygonArcs", "holes",
+        "richText", "coordinate", "angle", "anchor", "pen"
     };
 
     const auto rejectUnsupportedFields = [&] (const std::initializer_list<const char*>& allowedFields) -> GS::Optional<GS::UniString> {
@@ -475,7 +479,11 @@ GS::Optional<GS::UniString> ValidateAllowedPayloadFields (
         return {};
     };
 
-    if (typeID == API_WallID) {
+    if (typeID == API_TextID) {
+        return rejectUnsupportedFields ({
+            "richText", "coordinate", "floorIndex", "angle", "anchor", "width", "height", "pen"
+        });
+    } else if (typeID == API_WallID) {
         if (isCreate) {
             return rejectUnsupportedFields ({
                 "begCoordinate", "endCoordinate", "floorIndex", "zCoordinate", "height", "thickness", "offset", "arcAngle",
@@ -522,6 +530,85 @@ GS::Optional<GS::UniString> ValidateAllowedPayloadFields (
     }
 }
 
+GS::Optional<GS::UniString> ValidateTextPayload (
+    const GS::ObjectState& payload,
+    const bool isCreate)
+{
+    if (!payload.Contains ("richText")) {
+        return MissingFieldError ("richText");
+    }
+
+    const GS::ObjectState* richText = payload.Get ("richText");
+    if (richText == nullptr) {
+        return "'richText' must be an object conforming to native-rich-text-v1.";
+    }
+
+    API_ElementMemo memo = {};
+    API_TextType textData = {};
+    GS::UniString richTextError;
+    const GSErrCode memoError = NativeRichTextMemo::BuildMemo (*richText, memo, textData, richTextError);
+    ACAPI_DisposeElemMemoHdls (&memo);
+    if (memoError != NoError) {
+        return richTextError.IsEmpty ()
+            ? GS::UniString::Printf ("The 'richText' payload is invalid (error %d).", memoError)
+            : richTextError;
+    }
+
+    if (isCreate && !payload.Contains ("coordinate")) {
+        return MissingFieldError ("coordinate");
+    }
+    if (payload.Contains ("coordinate")) {
+        const GS::ObjectState* coordinate = payload.Get ("coordinate");
+        double x = 0.0;
+        double y = 0.0;
+        double z = 0.0;
+        if (coordinate == nullptr || !coordinate->Get ("x", x) || !coordinate->Get ("y", y) ||
+            !std::isfinite (x) || !std::isfinite (y) ||
+            (coordinate->Contains ("z") && (!coordinate->Get ("z", z) || !std::isfinite (z)))) {
+            return "'coordinate' must contain finite x/y and optional z values.";
+        }
+    }
+
+    for (const char* fieldName : { "angle", "width", "height" }) {
+        auto error = ValidateFiniteNumberField (payload, fieldName);
+        if (error.HasValue ()) return error;
+    }
+    if (payload.Contains ("width")) {
+        double width = 0.0;
+        payload.Get ("width", width);
+        if (width < 0.0) return "'width' must not be negative.";
+    }
+    if (payload.Contains ("height")) {
+        double height = 0.0;
+        payload.Get ("height", height);
+        if (height < 0.0) return "'height' must not be negative.";
+    }
+    auto error = ValidateIntegerField (payload, "floorIndex");
+    if (error.HasValue ()) return error;
+    error = ValidateFloorIndexField (payload, "floorIndex");
+    if (error.HasValue ()) return error;
+    error = ValidateIntegerField (payload, "anchor");
+    if (error.HasValue ()) return error;
+    if (payload.Contains ("anchor")) {
+        Int32 anchor = 0;
+        payload.Get ("anchor", anchor);
+        if (anchor < static_cast<Int32> (APIAnc_LT) || anchor > static_cast<Int32> (APIAnc_RB)) {
+            return "'anchor' is outside the Archicad text anchor range.";
+        }
+    }
+    error = ValidateIntegerField (payload, "pen");
+    if (error.HasValue ()) return error;
+    if (payload.Contains ("pen")) {
+        Int32 pen = 0;
+        payload.Get ("pen", pen);
+        if (pen < static_cast<Int32> (std::numeric_limits<short>::min ()) ||
+            pen > static_cast<Int32> (std::numeric_limits<short>::max ())) {
+            return "'pen' is outside the Archicad pen-index range.";
+        }
+    }
+    return {};
+}
+
 GS::Optional<GS::UniString> ValidatePayload (
     const GS::ObjectState& payload,
     const API_ElemTypeID typeID,
@@ -529,6 +616,10 @@ GS::Optional<GS::UniString> ValidatePayload (
 {
     auto error = ValidateAllowedPayloadFields (payload, typeID, isCreate);
     if (error.HasValue ()) return error;
+
+    if (typeID == API_TextID) {
+        return ValidateTextPayload (payload, isCreate);
+    }
 
     const char* finiteFields[] = {
         "zCoordinate", "level", "bottomOffset", "offset", "slantAngle", "arcAngle",
@@ -747,6 +838,220 @@ GS::ObjectState ExecuteDelete (
     return DeleteElementsCommand ().Execute (BuildArrayParameters ("elements", items), processControl);
 }
 
+constexpr UInt64 TextRichMemoMask = APIMemoMask_TextContentUni | APIMemoMask_ParagraphUni;
+
+void ApplyTextPlacement (
+    API_Element& element,
+    API_Element& mask,
+    const GS::ObjectState& payload,
+    const bool deriveFloorFromCoordinate,
+    const Stories& stories)
+{
+    const GS::ObjectState* coordinate = payload.Get ("coordinate");
+    if (coordinate != nullptr) {
+        const API_Coord3D point = Get3DCoordinateFromObjectState (*coordinate);
+        element.text.loc.x = point.x;
+        element.text.loc.y = point.y;
+        ACAPI_ELEMENT_MASK_SET (mask, API_TextType, loc);
+        if (deriveFloorFromCoordinate && !payload.Contains ("floorIndex")) {
+            element.header.floorInd = GetFloorIndexAndOffset (point.z, stories).first;
+            ACAPI_ELEMENT_MASK_SET (mask, API_Elem_Head, floorInd);
+        }
+    }
+    Int32 floorIndex = 0;
+    if (payload.Get ("floorIndex", floorIndex)) {
+        element.header.floorInd = static_cast<short> (floorIndex);
+        ACAPI_ELEMENT_MASK_SET (mask, API_Elem_Head, floorInd);
+    }
+
+    double angle = 0.0;
+    if (payload.Get ("angle", angle)) {
+        element.text.angle = angle;
+        ACAPI_ELEMENT_MASK_SET (mask, API_TextType, angle);
+    }
+    Int32 anchor = 0;
+    if (payload.Get ("anchor", anchor)) {
+        element.text.anchor = static_cast<API_AnchorID> (anchor);
+        ACAPI_ELEMENT_MASK_SET (mask, API_TextType, anchor);
+    }
+    double width = 0.0;
+    if (payload.Get ("width", width)) {
+        element.text.width = width;
+        ACAPI_ELEMENT_MASK_SET (mask, API_TextType, width);
+    }
+    double height = 0.0;
+    if (payload.Get ("height", height)) {
+        element.text.height = height;
+        ACAPI_ELEMENT_MASK_SET (mask, API_TextType, height);
+    }
+    Int32 pen = 0;
+    if (payload.Get ("pen", pen)) {
+        element.text.pen = static_cast<short> (pen);
+        ACAPI_ELEMENT_MASK_SET (mask, API_TextType, pen);
+    }
+}
+
+GS::ObjectState ExecuteTextCreate (
+    const GS::Array<GS::ObjectState>& items,
+    GS::ProcessControl& /*processControl*/)
+{
+    GS::ObjectState response;
+    const auto& elements = response.AddList<GS::ObjectState> ("elements");
+    const Stories stories = GetStories ();
+    GSErrCode callbackError = NoError;
+    std::vector<API_Elem_Head> createdHeads;
+    createdHeads.reserve (items.GetSize ());
+
+    API_NotifyElementType notification = {};
+    notification.notifID = APINotifyElement_BeginEvents;
+    AddElementNotificationClientCommand::ElementEventHandlerProc (&notification);
+
+    const GSErrCode undoError = ACAPI_CallUndoableCommand ("Create Rich Text", [&] () -> GSErrCode {
+        bool savedAutoTextFlag = false;
+        const GSErrCode autoTextErr = ACAPI_AutoText_GetAutoTextFlag (&savedAutoTextFlag);
+        if (autoTextErr != NoError) {
+            elements (CreateErrorResponse (autoTextErr, "Failed to read the AutoText flag."));
+            callbackError = autoTextErr;
+            return callbackError;
+        }
+        const GS::OnExit autoTextGuard ([&savedAutoTextFlag] () {
+            ACAPI_AutoText_ChangeAutoTextFlag (&savedAutoTextFlag);
+        });
+        bool setAutoTextFlag = false;
+        const GSErrCode disableAutoTextErr = ACAPI_AutoText_ChangeAutoTextFlag (&setAutoTextFlag);
+        if (disableAutoTextErr != NoError) {
+            elements (CreateErrorResponse (disableAutoTextErr, "Failed to disable the AutoText flag."));
+            callbackError = disableAutoTextErr;
+            return callbackError;
+        }
+
+        for (GSSize index = 0; index < static_cast<GSSize> (items.GetSize ()); ++index) {
+            const GS::ObjectState& payload = items[index];
+            if (callbackError != NoError) {
+                elements (CreateErrorResponse (callbackError, "Text item was not attempted because the batch was rolled back."));
+                continue;
+            }
+
+            API_Element element = {};
+            API_ElementMemo memo = {};
+            const GS::OnExit memoGuard ([&memo] () { ACAPI_DisposeElemMemoHdls (&memo); });
+#ifdef ServerMainVers_2600
+            element.header.type = API_TextID;
+#else
+            element.header.typeID = API_TextID;
+#endif
+            GSErrCode error = ACAPI_Element_GetDefaults (&element, nullptr);
+            if (error == NoError) {
+                const GS::ObjectState* richText = payload.Get ("richText");
+                GS::UniString richTextError;
+                error = richText == nullptr
+                    ? APIERR_BADPARS
+                    : NativeRichTextMemo::BuildMemo (*richText, memo, element.text, richTextError);
+                if (error != NoError) {
+                    elements (CreateErrorResponse (error, richTextError.IsEmpty ()
+                        ? "Failed to build Rich Text memo."
+                        : richTextError));
+                } else {
+                    API_Element ignoredMask = {};
+                    ApplyTextPlacement (element, ignoredMask, payload, true, stories);
+                    error = ACAPI_Element_Create (&element, &memo);
+                    if (error == NoError) {
+                        // Do not enqueue a New event until the host undo
+                        // command has committed.  A callback error rolls the
+                        // batch back, and queued notifications must not leak
+                        // GUIDs for elements that never survived the batch.
+                        createdHeads.push_back (element.header);
+                        elements (CreateElementIdObjectState (element.header.guid));
+                    } else {
+                        elements (CreateErrorResponse (error, "Failed to create Rich Text element."));
+                    }
+                }
+            } else {
+                elements (CreateErrorResponse (error, "Failed to get defaults for Rich Text element."));
+            }
+            if (error != NoError) callbackError = error;
+        }
+        return callbackError;
+    });
+
+    notification = {};
+    notification.notifID = APINotifyElement_EndEvents;
+    AddElementNotificationClientCommand::ElementEventHandlerProc (&notification);
+
+    if (undoError == NoError && callbackError == NoError) {
+        for (const API_Elem_Head& createdHead : createdHeads) {
+            notification = {};
+            notification.notifID = APINotifyElement_New;
+            notification.elemHead = createdHead;
+            AddElementNotificationClientCommand::ElementEventHandlerProc (&notification);
+        }
+    }
+
+    if (undoError != NoError) {
+        response.Add ("transactionRolledBack", true);
+        response.Add ("transactionError", undoError);
+    }
+    return response;
+}
+
+GS::ObjectState ExecuteTextUpdate (
+    const GS::Array<GS::ObjectState>& items,
+    GS::ProcessControl& /*processControl*/)
+{
+    GS::ObjectState response;
+    const auto& results = response.AddList<GS::ObjectState> ("executionResults");
+    const Stories stories = GetStories ();
+    GSErrCode callbackError = NoError;
+
+    const GSErrCode undoError = ACAPI_CallUndoableCommand ("Update Rich Text", [&] () -> GSErrCode {
+        for (GSSize index = 0; index < static_cast<GSSize> (items.GetSize ()); ++index) {
+            const GS::ObjectState& item = items[index];
+            if (callbackError != NoError) {
+                results (CreateFailedExecutionResult (callbackError, "Text item was not attempted because the batch was rolled back."));
+                continue;
+            }
+
+            const GS::ObjectState* elementID = item.Get ("elementId");
+            const API_Guid guid = elementID == nullptr ? APINULLGuid : GetGuidFromObjectState (*elementID);
+            API_Element element = {};
+            API_Element mask = {};
+            API_ElementMemo memo = {};
+            const GS::OnExit memoGuard ([&memo] () { ACAPI_DisposeElemMemoHdls (&memo); });
+            element.header.guid = guid;
+            GSErrCode error = guid == APINULLGuid ? APIERR_BADPARS : ACAPI_Element_Get (&element);
+            if (error == NoError) {
+                const GS::ObjectState* richText = item.Get ("richText");
+                GS::UniString richTextError;
+                error = richText == nullptr
+                    ? APIERR_BADPARS
+                    : NativeRichTextMemo::BuildMemo (*richText, memo, element.text, richTextError);
+                if (error != NoError) {
+                    results (CreateFailedExecutionResult (error, richTextError.IsEmpty ()
+                        ? "Failed to build Rich Text memo."
+                        : richTextError));
+                } else {
+                    ApplyTextPlacement (element, mask, item, false, stories);
+                    error = ACAPI_Element_Change (&element, &mask, &memo, TextRichMemoMask, true);
+                    if (error == NoError)
+                        results (CreateSuccessfulExecutionResult ());
+                    else
+                        results (CreateFailedExecutionResult (error, "Failed to update Rich Text element."));
+                }
+            } else {
+                results (CreateFailedExecutionResult (error, "Failed to load Rich Text element."));
+            }
+            if (error != NoError) callbackError = error;
+        }
+        return callbackError;
+    });
+
+    if (undoError != NoError) {
+        response.Add ("transactionRolledBack", true);
+        response.Add ("transactionError", undoError);
+    }
+    return response;
+}
+
 void AddSectionValue (GS::ObjectState& target, const API_AssemblySegmentData& segment)
 {
     target.Add ("nominalWidth", segment.nominalWidth);
@@ -839,6 +1144,18 @@ GS::ObjectState BuildElementReadback (
                 || detail->Get ("error") != nullptr) {
                 verified = false;
                 break;
+            }
+            if (typeID == API_TextID) {
+                GS::UniString richTextStatus;
+                const GS::ObjectState* richText = detail->Get ("richText");
+                if (richText == nullptr || !detail->Get ("richTextStatus", richTextStatus)
+                    || richTextStatus != "available") {
+                    // A structural detail row is not sufficient evidence for
+                    // Text mutations: the Unicode paragraph/run memo must be
+                    // present and explicitly marked available.
+                    verified = false;
+                    break;
+                }
             }
             returnedDetailGuids.Push (detailGuid);
         }
@@ -1144,7 +1461,7 @@ GS::Optional<GS::UniString> MutateElementsCommand::GetInputParametersSchema () c
             },
             "elementType": {
                 "type": "string",
-                "enum": ["Wall", "Slab", "Column", "Beam"]
+                "enum": ["Wall", "Slab", "Column", "Beam", "Text"]
             },
             "items": {
                 "type": "array",
@@ -1201,6 +1518,90 @@ GS::Optional<GS::UniString> MutateElementsCommand::GetInputParametersSchema () c
                                     "items": { "$ref": "#/PolyArc" }
                                 },
                                 "holes": { "$ref": "#/Holes2D" }
+                                ,"richText": {
+                                    "type": "object",
+                                    "description": "Versioned native Unicode Rich Text memo with paragraph and run style data.",
+                                    "properties": {
+                                        "schemaVersion": { "enum": ["native-rich-text-v1"] },
+                                        "encoding": { "enum": ["unicode"] },
+                                        "offsets": {
+                                            "type": "object",
+                                            "properties": {
+                                                "unit": { "enum": ["archicad-unicode-character"] },
+                                                "paragraph": { "enum": ["content"] },
+                                                "run": { "enum": ["paragraph"] },
+                                                "eol": { "enum": ["paragraph"] }
+                                            },
+                                            "additionalProperties": false,
+                                            "required": ["unit", "paragraph", "run", "eol"]
+                                        },
+                                        "content": { "type": "string", "maxLength": 1000000 },
+                                        "paragraphs": {
+                                            "type": "array",
+                                            "minItems": 1,
+                                            "maxItems": 4096,
+                                            "items": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "from": { "type": "integer", "minimum": 0 },
+                                                    "range": { "type": "integer", "minimum": 0 },
+                                                    "justification": { "type": "integer" },
+                                                    "firstIndentMm": { "type": "number" },
+                                                    "indentMm": { "type": "number" },
+                                                    "rightIndentMm": { "type": "number" },
+                                                    "spacing": { "type": "number" },
+                                                    "tabs": {
+                                                        "type": "array",
+                                                        "maxItems": 256,
+                                                        "items": {
+                                                            "type": "object",
+                                                            "properties": {
+                                                                "type": { "type": "integer", "minimum": 0 },
+                                                                "positionMm": { "type": "number" }
+                                                            },
+                                                            "additionalProperties": false,
+                                                            "required": ["type", "positionMm"]
+                                                        }
+                                                    },
+                                                    "runs": {
+                                                        "type": "array",
+                                                        "minItems": 1,
+                                                        "maxItems": 4096,
+                                                        "items": {
+                                                            "type": "object",
+                                                            "properties": {
+                                                                "from": { "type": "integer", "minimum": 0 },
+                                                                "range": { "type": "integer", "minimum": 0 },
+                                                                "pen": { "type": "integer" },
+                                                                "fontIndex": { "type": "integer" },
+                                                                "sizeMm": { "type": "number" },
+                                                                "faceBits": { "type": "integer", "minimum": 0 },
+                                                                "effectBits": { "type": "integer", "minimum": 0 }
+                                                            },
+                                                            "additionalProperties": false,
+                                                            "required": ["from", "range", "pen", "fontIndex", "sizeMm", "faceBits", "effectBits"]
+                                                        }
+                                                    },
+                                                    "eolPositions": {
+                                                        "type": "array",
+                                                        "maxItems": 4096,
+                                                        "items": { "type": "integer", "minimum": 0 }
+                                                    },
+                                                    "widthMm": { "type": "number", "description": "Output-only paragraph measurement; ignored on write." },
+                                                    "heightMm": { "type": "number", "description": "Output-only paragraph measurement; ignored on write." }
+                                                },
+                                                "additionalProperties": false,
+                                                "required": ["from", "range", "justification", "firstIndentMm", "indentMm", "rightIndentMm", "spacing", "tabs", "runs", "eolPositions"]
+                                            }
+                                        }
+                                    },
+                                    "additionalProperties": false,
+                                    "required": ["schemaVersion", "encoding", "offsets", "content", "paragraphs"]
+                                },
+                                "coordinate": { "$ref": "#/Coordinate3D" },
+                                "angle": { "type": "number" },
+                                "anchor": { "type": "integer", "minimum": 0, "maximum": 8 },
+                                "pen": { "type": "integer" }
                             },
                             "additionalProperties": false
                         }
@@ -1233,7 +1634,7 @@ GS::Optional<GS::UniString> MutateElementsCommand::GetRawResponseSchema () const
         "type": "object",
         "properties": {
             "operation": { "type": "string", "enum": ["create", "update", "delete"] },
-            "elementType": { "type": "string", "enum": ["Wall", "Slab", "Column", "Beam"] },
+            "elementType": { "type": "string", "enum": ["Wall", "Slab", "Column", "Beam", "Text"] },
             "requestedCount": { "type": "integer", "minimum": 0 },
             "appliedCount": { "type": "integer", "minimum": 0 },
             "mutationComplete": { "type": "boolean" },
@@ -1264,9 +1665,10 @@ GS::ObjectState MutateElementsCommand::Execute (
         return CreateErrorResponse (APIERR_BADPARS, "Missing required 'elementType' field.");
     }
     const API_ElemTypeID typeID = GetElementTypeFromNonLocalizedName (elementTypeName);
-    const ElementTypeSpec* typeSpec = GetElementTypeSpec (typeID);
-    if (typeSpec == nullptr) {
-        return CreateErrorResponse (APIERR_BADPARS, "'elementType' must be Wall, Slab, Column or Beam.");
+    const bool isText = typeID == API_TextID;
+    const ElementTypeSpec* typeSpec = isText ? nullptr : GetElementTypeSpec (typeID);
+    if (!isText && typeSpec == nullptr) {
+        return CreateErrorResponse (APIERR_BADPARS, "'elementType' must be Wall, Slab, Column, Beam or Text.");
     }
 
     GS::Array<GS::ObjectState> items;
@@ -1290,14 +1692,18 @@ GS::ObjectState MutateElementsCommand::Execute (
     }
 
     GS::ObjectState mutationParameters;
-    if (operation == "create") {
+    if (!isText && operation == "create") {
         mutationParameters = BuildArrayParameters (typeSpec->createArrayName, normalizedItems);
-    } else if (operation == "update") {
+    } else if (!isText && operation == "update") {
         mutationParameters = BuildArrayParameters (typeSpec->updateArrayName, normalizedItems);
     }
 
     GS::ObjectState mutationResult;
-    if (operation == "create") {
+    if (isText && operation == "create") {
+        mutationResult = ExecuteTextCreate (normalizedItems, processControl);
+    } else if (isText && operation == "update") {
+        mutationResult = ExecuteTextUpdate (normalizedItems, processControl);
+    } else if (operation == "create") {
         mutationResult = ExecuteCreate (typeID, mutationParameters, processControl);
     } else if (operation == "update") {
         mutationResult = ExecuteUpdate (typeID, mutationParameters, processControl);
@@ -1333,6 +1739,11 @@ GS::ObjectState MutateElementsCommand::Execute (
     if (operation == "delete") {
         GSSize absentCount = 0;
         readback = BuildDeleteReadback (readbackGuids, typeID, readbackVerified, absentCount);
+        // DeleteElements exposes one aggregate host result, so a failed
+        // aggregate cannot identify applied items on its own.  The immediate
+        // per-GUID readback is the authoritative evidence: count only GUIDs
+        // whose absence was explicitly confirmed with APIERR_BADID.
+        appliedCount = absentCount;
     } else {
         readback = BuildElementReadback (readbackGuids, typeID, processControl, readbackVerified);
     }

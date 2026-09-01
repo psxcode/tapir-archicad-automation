@@ -10,6 +10,7 @@
 #include "MemoryOChannel32.hpp"
 #include "Base64Converter.hpp"
 #include "NativeOwnership.hpp"
+#include "NativeRichTextMemo.hpp"
 #ifdef ServerMainVers_2800
 #include "ACAPI/ZoneBoundaryQuery.hpp"
 #endif
@@ -23,8 +24,6 @@
 #include <new>
 
 namespace {
-
-constexpr GSSize MaxNativeTextContentBytes = 8 * 1024 * 1024;
 
 static bool IsFiniteBounds (const API_Box3D& bounds)
 {
@@ -40,28 +39,14 @@ static bool IsFiniteBounds (const API_Box& bounds)
 
 static bool AddBoundedTextContent (GS::ObjectState& target, const API_ElementMemo& memo, GSErrCode memoError)
 {
-#ifdef ServerMainVers_2800
-    if (memoError == NoError && memo.textContent != nullptr &&
-        memo.textContent->GetLength () <= static_cast<USize> (MaxNativeTextContentBytes / sizeof (GS::uchar_t))) {
-        target.Add ("content", *memo.textContent);
-        return true;
-    }
-#else
-    if (memoError == NoError && memo.textContent != nullptr && *memo.textContent != nullptr) {
-        const GSSize textBytes = BMhGetSize (reinterpret_cast<GSHandle> (memo.textContent));
-        if (textBytes > 0 && textBytes <= MaxNativeTextContentBytes) {
-            const char* text = *memo.textContent;
-            GSSize textLength = 0;
-            while (textLength < textBytes && text[textLength] != '\0')
-                ++textLength;
-            if (textLength < textBytes) {
-                target.Add ("content", GS::UniString (reinterpret_cast<const GS::uchar_t*> (text)));
-                return true;
-            }
-        }
-    }
-#endif
-    return false;
+    if (memoError != NoError)
+        return false;
+    GS::UniString content;
+    GS::UniString errorMessage;
+    if (!NativeRichTextMemo::ReadUnicodeContent (memo, content, errorMessage))
+        return false;
+    target.Add ("content", content);
+    return true;
 }
 
 }
@@ -1502,14 +1487,36 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                 GSErrCode textMemoErr;
                 {
                     PerfTrace::ScopeTimer timer (PerfTrace::Phase::TypeMemo);
-                    // TextContent is the ANSI/UTF-8 memo. Request the Unicode
-                    // variant because the AC28 API exposes textContent as a
-                    // GS::UniString*; reading the ANSI buffer as that object
-                    // turns UTF-8 bytes into CJK-like UTF-16 mojibake.
-                    textMemoErr = ACAPI_Element_GetMemo (elem.header.guid, &memo, APIMemoMask_TextContentUni);
+                    // Request both Unicode content and Unicode paragraph memo.
+                    // The Rich Text bridge keeps offsets in Archicad's
+                    // character coordinate space; language and presentation
+                    // policy belongs to the TypeScript semantic layer.
+                    textMemoErr = ACAPI_Element_GetMemo (
+                        elem.header.guid,
+                        &memo,
+                        APIMemoMask_TextContentUni | APIMemoMask_ParagraphUni);
+                    if (textMemoErr != NoError) {
+                        // Some legacy/plain Text elements expose the Unicode
+                        // content but reject the paragraph mask.  Retry the
+                        // content mask alone so a paragraph capability gap
+                        // does not erase otherwise readable text.
+                        ACAPI_DisposeElemMemoHdls (&memo);
+                        memo = {};
+                        textMemoErr = ACAPI_Element_GetMemo (
+                            elem.header.guid,
+                            &memo,
+                            APIMemoMask_TextContentUni);
+                    }
                 }
-                if (!AddBoundedTextContent (typeSpecificDetails, memo, textMemoErr))
-                    typeSpecificDetails.Add ("contentStatus", "unavailable");
+                GS::UniString richTextError;
+                if (!NativeRichTextMemo::AddRichText (typeSpecificDetails, memo, textMemoErr, &elem.text, richTextError)) {
+                    // Preserve the old plain-content status for clients that
+                    // can still display a degraded read, but never claim that
+                    // Rich Text evidence is complete.
+                    if (!AddBoundedTextContent (typeSpecificDetails, memo, textMemoErr))
+                        typeSpecificDetails.Add ("contentStatus", "unavailable");
+                    typeSpecificDetails.Add ("richTextStatus", "unavailable");
+                }
             } break;
 
             default:

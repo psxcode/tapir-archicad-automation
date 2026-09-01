@@ -534,7 +534,7 @@ GSErrCode Initialize (void)
         );
         err |= RegisterCommand<MutateElementsCommand> (
             elementCommands, "1.0.0",
-            "Executes a typed native create, update or delete operation for Wall, Slab, Column or Beam elements and returns native readback."
+            "Executes a typed native create, update or delete operation for Wall, Slab, Column, Beam or Text elements and returns native readback."
         );
         err |= RegisterCommand<ModifyWindowsCommand> (
             elementCommands, "1.4.0",
