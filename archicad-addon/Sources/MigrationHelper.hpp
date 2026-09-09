@@ -53,6 +53,7 @@
 
 #define ACAPI_Element_CalcBounds(par1,par2) ACAPI_Database (APIDb_CalcBoundsID, par1, par2)
 #define ACAPI_View_GetZoom(par1, par2) ACAPI_Database (APIDb_GetZoomID, par1, par2)
+#define TAPIR_Drawing_GetDrawingScale(par1) ACAPI_Database (APIDb_GetDrawingScaleID, par1)
 
 // AC25 exposes the 2D zoom setter through the legacy database dispatcher,
 // while AC27+ provides the typed ACAPI_View_SetZoom function. Keep the
@@ -115,6 +116,20 @@ inline GSErrCode ACAPI_Navigator_ChangeLayoutSets (const API_LayoutInfo* layoutI
 #define ACAPI_Grouping_GetGroupedElems      ACAPI_ElementGroup_GetGroupedElems
 #define ACAPI_Grouping_GetAllGroupedElems   ACAPI_ElementGroup_GetAllGroupedElems
 #define ACAPI_Grouping_Tool                 ACAPI_Element_Tool
+
+inline GSErrCode TAPIR_View_IsSuspendGroupOn (bool* suspendGroups)
+{
+    return ACAPI_Environment (APIEnv_IsSuspendGroupOnID, suspendGroups);
+}
+
+inline GSErrCode TAPIR_Grouping_ChangeSuspendGroup (const bool suspendGroups)
+{
+    bool current = false;
+    const GSErrCode stateError = TAPIR_View_IsSuspendGroupOn (&current);
+    if (stateError != NoError || current == suspendGroups)
+        return stateError;
+    return ACAPI_Grouping_Tool ({}, APITool_SuspendGroups, nullptr);
+}
 
 #define ACAPI_ProjectSetting_GetPreferences(par1, par2) ACAPI_Environment (APIEnv_GetPreferencesID, par1, (void*)par2)
 #define ACAPI_View_Rebuild(par1) ACAPI_Automate (APIDo_RebuildID, (void*) par1)
@@ -328,6 +343,11 @@ inline GSErrCode ACAPI_Database_GetCurrentDatabase (API_DatabaseInfo* par1)
     return ACAPI_Database (APIDb_GetCurrentDatabaseID, (void*) par1);
 }
 
+inline GSErrCode ACAPI_Database_GetContainingDatabase (const API_Guid* element, API_DatabaseInfo* databaseInfo)
+{
+    return ACAPI_Database (APIDb_GetContainingDatabaseID, const_cast<API_Guid*> (element), databaseInfo);
+}
+
 inline GSErrCode ACAPI_Window_GetDatabaseInfo (API_DatabaseInfo* par1)
 {
     return ACAPI_Database (APIDb_GetDatabaseInfoID, (void*) par1, nullptr);
@@ -376,6 +396,21 @@ inline GSErrCode ACAPI_Navigator_GetLayoutBook (API_LayoutBook* book)
 #endif
 
 #ifdef ServerMainVers_2700
+inline GSErrCode TAPIR_View_IsSuspendGroupOn (bool* suspendGroups)
+{
+    return ACAPI_View_IsSuspendGroupOn (suspendGroups);
+}
+
+inline GSErrCode TAPIR_Grouping_ChangeSuspendGroup (const bool suspendGroups)
+{
+    return ACAPI_Grouping_ChangeSuspendGroup (suspendGroups);
+}
+
+inline GSErrCode TAPIR_Drawing_GetDrawingScale (double* scale)
+{
+    return ACAPI_Drawing_GetDrawingScale (scale);
+}
+
 inline GSErrCode TAPIR_View_SetZoom (API_Box* zoomBox)
 {
     return ACAPI_View_SetZoom (zoomBox, nullptr);

@@ -5,6 +5,8 @@
 #include "NotificationCommands.hpp"
 #include "NativeOwnership.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <limits>
 #include <memory>
 #include <new>
@@ -57,6 +59,12 @@ GS::ObjectState	CreateElementsCommandBase::Execute (const GS::ObjectState& param
     const Stories stories = GetStories ();
     std::vector<API_Elem_Head> createdHeads;
     createdHeads.reserve (dataArray.GetSize ());
+    // Native CRUD relies on a single undoable command for every batch.  Keep
+    // the legacy element commands' historical per-item behavior unchanged,
+    // but opt the typed drafting primitives into the same all-or-none path.
+    const bool atomicBatch = elemTypeID == API_WallID || elemTypeID == API_ColumnID ||
+        elemTypeID == API_LineID || elemTypeID == API_ArcID || elemTypeID == API_HatchID;
+    GSErrCode callbackError = NoError;
 
     API_NotifyElementType notification = {};
     notification.notifID = APINotifyElement_BeginEvents;
@@ -67,7 +75,11 @@ GS::ObjectState	CreateElementsCommandBase::Execute (const GS::ObjectState& param
         const GSErrCode autoTextErr = ACAPI_AutoText_GetAutoTextFlag (&savedAutoTextFlag);
         if (autoTextErr != NoError) {
             elements (CreateErrorResponse (autoTextErr, "Failed to read the AutoText flag."));
-            return NoError;
+            callbackError = autoTextErr;
+            // Wall/Column batches are all-or-none.  Returning success here
+            // would let the undoable command commit an empty/partial batch
+            // despite the recorded error, bypassing the atomic rollback path.
+            return atomicBatch ? callbackError : NoError;
         }
         const GS::OnExit autoTextGuard ([&savedAutoTextFlag] () {
             ACAPI_AutoText_ChangeAutoTextFlag (&savedAutoTextFlag);
@@ -76,7 +88,8 @@ GS::ObjectState	CreateElementsCommandBase::Execute (const GS::ObjectState& param
         const GSErrCode disableAutoTextErr = ACAPI_AutoText_ChangeAutoTextFlag (&setAutoTextFlag);
         if (disableAutoTextErr != NoError) {
             elements (CreateErrorResponse (disableAutoTextErr, "Failed to disable the AutoText flag."));
-            return NoError;
+            callbackError = disableAutoTextErr;
+            return atomicBatch ? callbackError : NoError;
         }
 
         for (const GS::ObjectState& data : dataArray) {
@@ -92,18 +105,21 @@ GS::ObjectState	CreateElementsCommandBase::Execute (const GS::ObjectState& param
             GSErrCode err = ACAPI_Element_GetDefaults (&element, &memo);
             if (err != NoError) {
                 elements (CreateErrorResponse (err, "Failed to get defaults for new " + elemTypeName));
+                if (atomicBatch) callbackError = err;
                 continue;
             }
 
             auto os = SetTypeSpecificParameters (element, memo, stories, data);
             if (os.HasValue ()) {
                 elements (*os);
+                if (atomicBatch) callbackError = APIERR_BADPARS;
                 continue;
             }
 
             err = ACAPI_Element_Create (&element, &memo);
             if (err != NoError) {
                 elements (CreateErrorResponse (err, "Failed to create new " + elemTypeName));
+                if (atomicBatch) callbackError = err;
                 continue;
             }
 
@@ -114,7 +130,7 @@ GS::ObjectState	CreateElementsCommandBase::Execute (const GS::ObjectState& param
             elements (CreateElementIdObjectState (element.header.guid));
         }
 
-        return NoError;
+        return atomicBatch ? callbackError : NoError;
     });
 
     notification = {};
@@ -827,6 +843,344 @@ GS::Optional<GS::ObjectState> CreatePolylinesCommand::SetTypeSpecificParameters 
     if (memoErr != NoError)
         return CreateErrorResponse (memoErr, "Failed to allocate polyline memo data.");
 
+    return {};
+}
+
+namespace {
+
+bool ReadFiniteCoordinate2D (const GS::ObjectState& parameters, const char* fieldName, API_Coord& coordinate)
+{
+    const GS::ObjectState* value = parameters.Get (fieldName);
+    if (value == nullptr)
+        return false;
+    double x = 0.0;
+    double y = 0.0;
+    if (!value->Get ("x", x) || !value->Get ("y", y) || !std::isfinite (x) || !std::isfinite (y))
+        return false;
+    coordinate.x = x;
+    coordinate.y = y;
+    return true;
+}
+
+void ApplyDraftingLineSettings (const GS::ObjectState& parameters, API_ExtendedPenType& pen, API_AttributeIndex& lineType, bool& roomSeparator)
+{
+    short penIndex = 0;
+    if (parameters.Get ("linePenIndex", penIndex) && penIndex > 0) {
+        pen.penIndex = penIndex;
+        pen.colorOverridePenIndex = 0;
+    }
+    Int32 lineTypeIndex = 0;
+    if (parameters.Get ("lineTypeIndex", lineTypeIndex) && lineTypeIndex > 0)
+        lineType = ACAPI_CreateAttributeIndex (lineTypeIndex);
+    parameters.Get ("roomSeparator", roomSeparator);
+}
+
+GS::Optional<GS::UniString> DraftingLineSchema (const char* arrayName, const char* firstField, const char* secondField, const char* secondDescription)
+{
+    return GS::UniString::Printf (R"({
+    "type": "object",
+    "properties": {
+        "%s": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "floorInd": { "type": "integer" },
+                    "floorIndex": { "type": "integer", "description": "Canonical native-crud story index alias." },
+                    "layerIndex": { "type": "integer" },
+                    "%s": { "$ref": "#/Coordinate2D" },
+                    "%s": { "$ref": "#/Coordinate2D", "description": "%s" },
+                    "linePenIndex": { "type": "integer" },
+                    "lineTypeIndex": { "type": "integer" },
+                    "roomSeparator": { "type": "boolean" }
+                },
+                "additionalProperties": false,
+                "required": ["%s", "%s"]
+            }
+        }
+    },
+    "additionalProperties": false,
+    "required": ["%s"]
+})", arrayName, firstField, secondField, secondDescription, firstField, secondField, arrayName);
+}
+
+}
+
+CreateLineElementsCommand::CreateLineElementsCommand () :
+    CreateElementsCommandBase ("CreateLineElements", API_LineID, "linesData")
+{
+}
+
+GS::Optional<GS::UniString> CreateLineElementsCommand::GetInputParametersSchema () const
+{
+    return DraftingLineSchema ("linesData", "begCoordinate", "endCoordinate", "Second endpoint of the line.");
+}
+
+GS::Optional<GS::ObjectState> CreateLineElementsCommand::SetTypeSpecificParameters (API_Element& element, API_ElementMemo&, const Stories&, const GS::ObjectState& parameters) const
+{
+    API_Coord begin = {};
+    API_Coord end = {};
+    if (!ReadFiniteCoordinate2D (parameters, "begCoordinate", begin) ||
+        !ReadFiniteCoordinate2D (parameters, "endCoordinate", end))
+        return CreateErrorResponse (APIERR_BADPARS, "Line endpoints must contain finite x and y coordinates.");
+    if (begin.x == end.x && begin.y == end.y)
+        return CreateErrorResponse (APIERR_BADPARS, "Line endpoints must not be identical.");
+
+    if (!parameters.Get ("floorInd", element.header.floorInd))
+        parameters.Get ("floorIndex", element.header.floorInd);
+    Int32 layerIndex = 0;
+    if (parameters.Get ("layerIndex", layerIndex) && layerIndex > 0)
+        element.header.layer = ACAPI_CreateAttributeIndex (layerIndex);
+    element.line.begC = begin;
+    element.line.endC = end;
+    ApplyDraftingLineSettings (parameters, element.line.linePen, element.line.ltypeInd, element.line.roomSeparator);
+    return {};
+}
+
+CreateArcsCommand::CreateArcsCommand () :
+    CreateElementsCommandBase ("CreateArcs", API_ArcID, "arcsData")
+{
+}
+
+GS::Optional<GS::UniString> CreateArcsCommand::GetInputParametersSchema () const
+{
+    return R"({
+    "type": "object",
+    "properties": {
+        "arcsData": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "floorInd": { "type": "integer" },
+                    "floorIndex": { "type": "integer", "description": "Canonical native-crud story index alias." },
+                    "layerIndex": { "type": "integer" },
+                    "origin": { "$ref": "#/Coordinate2D" },
+                    "radius": { "type": "number", "exclusiveMinimum": true },
+                    "axisAngle": { "type": "number" },
+                    "ratio": { "type": "number", "exclusiveMinimum": true },
+                    "begAngle": { "type": "number" },
+                    "endAngle": { "type": "number" },
+                    "reflected": { "type": "boolean" },
+                    "linePenIndex": { "type": "integer" },
+                    "lineTypeIndex": { "type": "integer" },
+                    "roomSeparator": { "type": "boolean" }
+                },
+                "additionalProperties": false,
+                "required": ["origin", "radius", "begAngle", "endAngle"]
+            }
+        }
+    },
+    "additionalProperties": false,
+    "required": ["arcsData"]
+})";
+}
+
+GS::Optional<GS::ObjectState> CreateArcsCommand::SetTypeSpecificParameters (API_Element& element, API_ElementMemo&, const Stories&, const GS::ObjectState& parameters) const
+{
+    API_Coord origin = {};
+    if (!ReadFiniteCoordinate2D (parameters, "origin", origin))
+        return CreateErrorResponse (APIERR_BADPARS, "Arc origin must contain finite x and y coordinates.");
+
+    double radius = 0.0;
+    double beginAngle = 0.0;
+    double endAngle = 0.0;
+    if (!parameters.Get ("radius", radius) || !std::isfinite (radius) || radius <= 0.0 ||
+        !parameters.Get ("begAngle", beginAngle) || !std::isfinite (beginAngle) ||
+        !parameters.Get ("endAngle", endAngle) || !std::isfinite (endAngle))
+        return CreateErrorResponse (APIERR_BADPARS, "Arc radius and angles must be finite; radius must be positive.");
+
+    if (!parameters.Get ("floorInd", element.header.floorInd))
+        parameters.Get ("floorIndex", element.header.floorInd);
+    Int32 layerIndex = 0;
+    if (parameters.Get ("layerIndex", layerIndex) && layerIndex > 0)
+        element.header.layer = ACAPI_CreateAttributeIndex (layerIndex);
+    element.arc.origC = origin;
+    element.arc.r = radius;
+    element.arc.angle = 0.0;
+    element.arc.ratio = 1.0;
+    parameters.Get ("axisAngle", element.arc.angle);
+    parameters.Get ("ratio", element.arc.ratio);
+    if (!std::isfinite (element.arc.angle) || !std::isfinite (element.arc.ratio) || element.arc.ratio <= 0.0)
+        return CreateErrorResponse (APIERR_BADPARS, "Arc axisAngle and ratio must be finite; ratio must be positive.");
+    element.arc.begAng = beginAngle;
+    element.arc.endAng = endAngle;
+    parameters.Get ("reflected", element.arc.reflected);
+    ApplyDraftingLineSettings (parameters, element.arc.linePen, element.arc.ltypeInd, element.arc.roomSeparator);
+    return {};
+}
+
+CreateHatchesCommand::CreateHatchesCommand () :
+    CreateElementsCommandBase ("CreateHatches", API_HatchID, "hatchesData")
+{
+}
+
+GS::Optional<GS::UniString> CreateHatchesCommand::GetInputParametersSchema () const
+{
+    return R"({
+    "type": "object",
+    "properties": {
+        "hatchesData": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "floorInd": { "type": "integer" },
+                    "layerIndex": { "type": "integer" },
+                    "coordinates": { "type": "array", "items": { "$ref": "#/Coordinate2D" }, "minItems": 3 },
+                    "arcs": { "type": "array", "items": { "$ref": "#/PolyArc" } },
+                    "holes": { "$ref": "#/Holes2D" },
+                    "contourPenIndex": { "type": "integer" },
+                    "fillPenIndex": { "type": "integer" },
+                    "fillBackgroundPenIndex": { "type": "integer" },
+                    "fillAttributeIndex": { "type": "integer" },
+                    "buildingMaterialIndex": { "type": "integer" },
+                    "roomSpecial": { "type": "integer" },
+                    "showArea": { "type": "boolean" }
+                },
+                "additionalProperties": false,
+                "required": ["coordinates"]
+            }
+        }
+    },
+    "additionalProperties": false,
+    "required": ["hatchesData"]
+})";
+}
+
+static GSErrCode BuildHatchMemo (const GS::Array<GS::ObjectState>& outline,
+                                 const GS::Array<GS::ObjectState>& outlineArcs,
+                                 const GS::Array<GS::ObjectState>& holes,
+                                 API_Element& element,
+                                 API_ElementMemo& memo)
+{
+    if (outline.GetSize () < 3 || static_cast<GSSize> (outline.GetSize ()) > static_cast<GSSize> (std::numeric_limits<Int32>::max () - 1))
+        return APIERR_BADPARS;
+
+    std::vector<GS::Array<GS::ObjectState>> holeCoordinates;
+    std::vector<GS::Array<GS::ObjectState>> holeArcs;
+    GSSize totalUnique = static_cast<GSSize> (outline.GetSize ());
+    GSSize totalArcs = static_cast<GSSize> (outlineArcs.GetSize ());
+    for (const GS::ObjectState& hole : holes) {
+        GS::Array<GS::ObjectState> coordinates;
+        GS::Array<GS::ObjectState> arcs;
+        if (!GetHoleGeometry (hole, coordinates, arcs) || coordinates.GetSize () < 3)
+            return APIERR_BADPARS;
+        const GSSize coordinateCount = static_cast<GSSize> (coordinates.GetSize ());
+        const GSSize arcCount = static_cast<GSSize> (arcs.GetSize ());
+        if (coordinateCount > static_cast<GSSize> (std::numeric_limits<Int32>::max ()) - totalUnique ||
+            totalUnique + coordinateCount + 1 > static_cast<GSSize> (std::numeric_limits<Int32>::max ()) ||
+            arcCount > static_cast<GSSize> (std::numeric_limits<Int32>::max ()) - totalArcs)
+            return APIERR_BADPARS;
+        totalUnique += static_cast<GSSize> (coordinates.GetSize ());
+        totalArcs += static_cast<GSSize> (arcs.GetSize ());
+        holeCoordinates.push_back (coordinates);
+        holeArcs.push_back (arcs);
+    }
+
+    const GSSize holeCount = static_cast<GSSize> (holeCoordinates.size ());
+    const GSSize totalCoords = totalUnique + 1 + holeCount;
+    const GSSize subPolyCount = 1 + holeCount;
+    if (totalCoords > static_cast<GSSize> (std::numeric_limits<Int32>::max ()) ||
+        subPolyCount > static_cast<GSSize> (std::numeric_limits<Int32>::max ()) ||
+        totalCoords + 1 > std::numeric_limits<GSSize>::max () / sizeof (API_Coord) ||
+        subPolyCount + 1 > std::numeric_limits<GSSize>::max () / sizeof (Int32) ||
+        totalCoords + 1 > std::numeric_limits<GSSize>::max () / sizeof (UInt32) ||
+        totalArcs > std::numeric_limits<GSSize>::max () / sizeof (API_PolyArc))
+        return APIERR_BADPARS;
+
+    memo.coords = reinterpret_cast<API_Coord**> (BMAllocateHandle ((totalCoords + 1) * sizeof (API_Coord), ALLOCATE_CLEAR, 0));
+    memo.pends = reinterpret_cast<Int32**> (BMAllocateHandle ((subPolyCount + 1) * sizeof (Int32), ALLOCATE_CLEAR, 0));
+    if (totalArcs > 0)
+        memo.parcs = reinterpret_cast<API_PolyArc**> (BMAllocateHandle (totalArcs * sizeof (API_PolyArc), ALLOCATE_CLEAR, 0));
+    memo.vertexIDs = reinterpret_cast<UInt32**> (BMAllocateHandle ((totalCoords + 1) * sizeof (UInt32), ALLOCATE_CLEAR, 0));
+    if (memo.coords == nullptr || *memo.coords == nullptr || memo.pends == nullptr || *memo.pends == nullptr ||
+        memo.vertexIDs == nullptr || *memo.vertexIDs == nullptr ||
+        (totalArcs > 0 && (memo.parcs == nullptr || *memo.parcs == nullptr)))
+        return APIERR_MEMFULL;
+
+    (*memo.coords)[0] = { 0.0, 0.0 };
+    (*memo.vertexIDs)[0] = static_cast<UInt32> (std::max<GSSize> (1, outline.GetSize ()));
+    (*memo.pends)[0] = 0;
+    Int32 coordinateIndex = 0;
+    Int32 arcIndex = 0;
+    Int32 subPolyIndex = 1;
+    auto writeContour = [&] (const GS::Array<GS::ObjectState>& coordinates, const GS::Array<GS::ObjectState>& arcs) -> GSErrCode {
+        const Int32 firstIndex = coordinateIndex + 1;
+        for (const GS::ObjectState& coordinate : coordinates) {
+            API_Coord value = {};
+            double x = 0.0;
+            double y = 0.0;
+            if (!coordinate.Get ("x", x) || !coordinate.Get ("y", y) || !std::isfinite (x) || !std::isfinite (y))
+                return APIERR_BADPARS;
+            value.x = x;
+            value.y = y;
+            (*memo.coords)[++coordinateIndex] = value;
+            (*memo.vertexIDs)[coordinateIndex] = static_cast<UInt32> (coordinateIndex - firstIndex + 1);
+        }
+        ++coordinateIndex;
+        (*memo.coords)[coordinateIndex] = (*memo.coords)[firstIndex];
+        (*memo.vertexIDs)[coordinateIndex] = (*memo.vertexIDs)[firstIndex];
+        (*memo.pends)[subPolyIndex++] = coordinateIndex;
+        const GS::Array<API_PolyArc> polyArcs = GetPolyArcs (arcs, firstIndex);
+        if (arcIndex + static_cast<Int32> (polyArcs.GetSize ()) > static_cast<Int32> (totalArcs))
+            return APIERR_BADPARS;
+        for (const API_PolyArc& arc : polyArcs)
+            (*memo.parcs)[arcIndex++] = arc;
+        return NoError;
+    };
+
+    GSErrCode error = writeContour (outline, outlineArcs);
+    if (error != NoError)
+        return error;
+    for (GSSize i = 0; i < holeCoordinates.size (); ++i) {
+        error = writeContour (holeCoordinates[i], holeArcs[i]);
+        if (error != NoError)
+            return error;
+    }
+    element.hatch.poly.nCoords = static_cast<Int32> (coordinateIndex);
+    element.hatch.poly.nSubPolys = static_cast<Int32> (subPolyCount);
+    element.hatch.poly.nArcs = arcIndex;
+    return NoError;
+}
+
+GS::Optional<GS::ObjectState> CreateHatchesCommand::SetTypeSpecificParameters (API_Element& element, API_ElementMemo& memo, const Stories&, const GS::ObjectState& parameters) const
+{
+    parameters.Get ("floorInd", element.header.floorInd);
+    Int32 layerIndex = 0;
+    if (parameters.Get ("layerIndex", layerIndex) && layerIndex > 0)
+        element.header.layer = ACAPI_CreateAttributeIndex (layerIndex);
+
+    GS::Array<GS::ObjectState> coordinates;
+    GS::Array<GS::ObjectState> arcs;
+    GS::Array<GS::ObjectState> holes;
+    parameters.Get ("coordinates", coordinates);
+    parameters.Get ("arcs", arcs);
+    parameters.Get ("holes", holes);
+    const GSErrCode geometryError = BuildHatchMemo (coordinates, arcs, holes, element, memo);
+    if (geometryError != NoError)
+        return CreateErrorResponse (geometryError, "Invalid hatch polygon geometry.");
+
+    short pen = 0;
+    if (parameters.Get ("contourPenIndex", pen) && pen > 0) {
+        element.hatch.contPen.penIndex = pen;
+        element.hatch.contPen.colorOverridePenIndex = 0;
+    }
+    if (parameters.Get ("fillPenIndex", pen) && pen > 0) {
+        element.hatch.fillPen.penIndex = pen;
+        element.hatch.fillPen.colorOverridePenIndex = 0;
+    }
+    parameters.Get ("fillBackgroundPenIndex", element.hatch.fillBGPen);
+    Int32 fillIndex = 0;
+    if (parameters.Get ("fillAttributeIndex", fillIndex) && fillIndex > 0)
+        element.hatch.fillInd = ACAPI_CreateAttributeIndex (fillIndex);
+    Int32 buildingMaterialIndex = 0;
+    if (parameters.Get ("buildingMaterialIndex", buildingMaterialIndex) && buildingMaterialIndex > 0)
+        element.hatch.buildingMaterial = ACAPI_CreateAttributeIndex (buildingMaterialIndex);
+    Int32 roomSpecial = 0;
+    if (parameters.Get ("roomSpecial", roomSpecial))
+        element.hatch.roomSpecial = static_cast<char> (roomSpecial);
+    parameters.Get ("showArea", element.hatch.showArea);
     return {};
 }
 

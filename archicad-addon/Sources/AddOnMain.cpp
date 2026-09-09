@@ -23,6 +23,7 @@
 #include "ElementCreationCommands.hpp"
 #include "ExtendedElementCommands.hpp"
 #include "ElementMutationCommands.hpp"
+#include "NativeCrudCommands.hpp"
 #include "ElementGroupingCommands.hpp"
 #include "AttributeCommands.hpp"
 #include "TeamworkCommands.hpp"
@@ -496,6 +497,18 @@ GSErrCode Initialize (void)
             elementCommands, "1.1.5",
             "Creates Polyline elements based on the given parameters."
         );
+        err |= RegisterCommand<CreateLineElementsCommand> (
+            elementCommands, "1.0.0",
+            "Creates Line elements based on bounded drafting geometry."
+        );
+        err |= RegisterCommand<CreateArcsCommand> (
+            elementCommands, "1.0.0",
+            "Creates Arc elements based on bounded drafting geometry."
+        );
+        err |= RegisterCommand<CreateHatchesCommand> (
+            elementCommands, "1.0.0",
+            "Creates Hatch elements based on bounded drafting geometry."
+        );
         err |= RegisterCommand<CreateObjectsCommand> (
             elementCommands, "1.0.3",
             "Creates Object elements based on the given parameters."
@@ -535,6 +548,30 @@ GSErrCode Initialize (void)
         err |= RegisterCommand<MutateElementsCommand> (
             elementCommands, "1.0.0",
             "Executes a typed native create, update or delete operation for Wall, Slab, Column, Beam or Text elements and returns native readback."
+        );
+        err |= RegisterCommand<GetNativeCrudCapabilitiesCommand> (
+            elementCommands, "1.0.0",
+            "Returns the versioned, developer-only native CRUD capability matrix."
+        );
+        err |= RegisterCommand<GetNativeElementSnapshotsCommand> (
+            elementCommands, "1.0.0",
+            "Returns exact canonical native snapshots for a bounded list of GUIDs."
+        );
+        err |= RegisterCommand<DiscoverNativeElementsCommand> (
+            elementCommands, "1.0.0",
+            "Discovers native elements only inside an explicit bounded document, story or rectangle scope."
+        );
+        err |= RegisterCommand<GetNativeMutationHistoryCommand> (
+            elementCommands, "1.0.0",
+            "Returns the explicit per-file native receipt-history boundary."
+        );
+        err |= RegisterCommand<MutateNativeElementsCommand> (
+            elementCommands, "1.0.0",
+            "Executes one typed native forward mutation and returns a factual receipt."
+        );
+        err |= RegisterCommand<NormalizeTextClusterCommand> (
+            elementCommands, "1.0.0",
+            "Atomically replaces one simulated multiline Text cluster with one wrapped Text element."
         );
         err |= RegisterCommand<ModifyWindowsCommand> (
             elementCommands, "1.4.0",

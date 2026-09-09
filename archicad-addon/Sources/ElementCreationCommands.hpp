@@ -49,6 +49,34 @@ public:
     virtual GS::Optional<GS::ObjectState> SetTypeSpecificParameters (API_Element& element, API_ElementMemo& memo, const Stories& stories, const GS::ObjectState& parameters) const override;
 };
 
+// Pure drafting primitives used by the native CRUD escape hatch.  These are
+// deliberately separate from CreatePolylinesCommand and CreateLinesCommand
+// (the latter is the attribute command) so the element type and wire command
+// names cannot be confused at registration time.
+class CreateLineElementsCommand : public CreateElementsCommandBase
+{
+public:
+    CreateLineElementsCommand ();
+    virtual GS::Optional<GS::UniString> GetInputParametersSchema () const override;
+    virtual GS::Optional<GS::ObjectState> SetTypeSpecificParameters (API_Element& element, API_ElementMemo& memo, const Stories& stories, const GS::ObjectState& parameters) const override;
+};
+
+class CreateArcsCommand : public CreateElementsCommandBase
+{
+public:
+    CreateArcsCommand ();
+    virtual GS::Optional<GS::UniString> GetInputParametersSchema () const override;
+    virtual GS::Optional<GS::ObjectState> SetTypeSpecificParameters (API_Element& element, API_ElementMemo& memo, const Stories& stories, const GS::ObjectState& parameters) const override;
+};
+
+class CreateHatchesCommand : public CreateElementsCommandBase
+{
+public:
+    CreateHatchesCommand ();
+    virtual GS::Optional<GS::UniString> GetInputParametersSchema () const override;
+    virtual GS::Optional<GS::ObjectState> SetTypeSpecificParameters (API_Element& element, API_ElementMemo& memo, const Stories& stories, const GS::ObjectState& parameters) const override;
+};
+
 class CreateObjectsCommand : public CreateElementsCommandBase
 {
 public:

@@ -28,12 +28,16 @@ const ElementTypeSpec* GetElementTypeSpec (const API_ElemTypeID typeID)
     static const ElementTypeSpec slab   { API_SlabID,   "slabsData",   "slabsWithDetails" };
     static const ElementTypeSpec column { API_ColumnID, "columnsData", "columnsWithDetails" };
     static const ElementTypeSpec beam   { API_BeamID,   "beamsData",   "beamsWithDetails" };
+    static const ElementTypeSpec line   { API_LineID,   "linesData",   "linesWithDetails" };
+    static const ElementTypeSpec arc    { API_ArcID,    "arcsData",    "arcsWithDetails" };
 
     switch (typeID) {
         case API_WallID:   return &wall;
         case API_SlabID:   return &slab;
         case API_ColumnID: return &column;
         case API_BeamID:   return &beam;
+        case API_LineID:   return &line;
+        case API_ArcID:    return &arc;
         default:           return nullptr;
     }
 }
@@ -463,7 +467,8 @@ GS::Optional<GS::UniString> ValidateAllowedPayloadFields (
         "verticalCurveHeight", "axisRotationAngle", "profileAngle", "referenceLineLocation", "referencePlaneLocation",
         "structureType", "buildingMaterialId", "compositeId", "profileId", "anchorPoint", "coreAnchor",
         "circleBased", "isWidthAndHeightLinked", "isSlanted", "polygonCoordinates", "polygonOutline", "polygonArcs", "holes",
-        "richText", "coordinate", "angle", "anchor", "pen"
+        "richText", "coordinate", "angle", "anchor", "pen", "nonBreaking", "linePen", "linePenIndex", "lineTypeIndex",
+        "roomSeparator", "axisAngle", "ratio", "begAngle", "beginAngle", "endAngle", "reflected"
     };
 
     const auto rejectUnsupportedFields = [&] (const std::initializer_list<const char*>& allowedFields) -> GS::Optional<GS::UniString> {
@@ -481,7 +486,7 @@ GS::Optional<GS::UniString> ValidateAllowedPayloadFields (
 
     if (typeID == API_TextID) {
         return rejectUnsupportedFields ({
-            "richText", "coordinate", "floorIndex", "angle", "anchor", "width", "height", "pen"
+            "richText", "coordinate", "floorIndex", "angle", "anchor", "width", "height", "pen", "fixedSize", "nonBreaking"
         });
     } else if (typeID == API_WallID) {
         if (isCreate) {
@@ -525,6 +530,15 @@ GS::Optional<GS::UniString> ValidateAllowedPayloadFields (
                 "begCoordinate", "endCoordinate", "level", "offset", "slantAngle", "isSlanted", "profileAngle", "arcAngle", "verticalCurveHeight",
                 "width", "height", "isWidthAndHeightLinked", "buildingMaterialId", "profileId"
         });
+    } else if (typeID == API_LineID) {
+        return rejectUnsupportedFields ({
+            "begCoordinate", "endCoordinate", "floorIndex", "linePen", "linePenIndex", "lineTypeIndex", "roomSeparator"
+        });
+    } else if (typeID == API_ArcID) {
+        return rejectUnsupportedFields ({
+            "origin", "radius", "axisAngle", "ratio", "begAngle", "beginAngle", "endAngle", "reflected", "floorIndex",
+            "linePen", "linePenIndex", "lineTypeIndex", "roomSeparator"
+        });
     } else {
         return "Unsupported element type.";
     }
@@ -534,24 +548,26 @@ GS::Optional<GS::UniString> ValidateTextPayload (
     const GS::ObjectState& payload,
     const bool isCreate)
 {
-    if (!payload.Contains ("richText")) {
+    if (isCreate && !payload.Contains ("richText")) {
         return MissingFieldError ("richText");
     }
 
     const GS::ObjectState* richText = payload.Get ("richText");
-    if (richText == nullptr) {
+    if (payload.Contains ("richText") && richText == nullptr) {
         return "'richText' must be an object conforming to native-rich-text-v1.";
     }
 
-    API_ElementMemo memo = {};
-    API_TextType textData = {};
-    GS::UniString richTextError;
-    const GSErrCode memoError = NativeRichTextMemo::BuildMemo (*richText, memo, textData, richTextError);
-    ACAPI_DisposeElemMemoHdls (&memo);
-    if (memoError != NoError) {
-        return richTextError.IsEmpty ()
-            ? GS::UniString::Printf ("The 'richText' payload is invalid (error %d).", memoError)
-            : richTextError;
+    if (richText != nullptr) {
+        API_ElementMemo memo = {};
+        API_TextType textData = {};
+        GS::UniString richTextError;
+        const GSErrCode memoError = NativeRichTextMemo::BuildMemo (*richText, memo, textData, richTextError);
+        ACAPI_DisposeElemMemoHdls (&memo);
+        if (memoError != NoError) {
+            return richTextError.IsEmpty ()
+                ? GS::UniString::Printf ("The 'richText' payload is invalid (error %d).", memoError)
+                : richTextError;
+        }
     }
 
     if (isCreate && !payload.Contains ("coordinate")) {
@@ -606,6 +622,8 @@ GS::Optional<GS::UniString> ValidateTextPayload (
             return "'pen' is outside the Archicad pen-index range.";
         }
     }
+    error = ValidateBooleanField (payload, "nonBreaking");
+    if (error.HasValue ()) return error;
     return {};
 }
 
@@ -754,6 +772,52 @@ GS::Optional<GS::UniString> ValidatePayload (
         if (payload.Contains ("coordinates") || payload.Contains ("origin") || payload.Contains ("polygonCoordinates")) {
             return "The Beam payload contains geometry fields for another element type.";
         }
+    } else if (typeID == API_LineID) {
+        error = ValidateCoordinateField (payload, "begCoordinate", isCreate, false);
+        if (error.HasValue ()) return error;
+        error = ValidateCoordinateField (payload, "endCoordinate", isCreate, false);
+        if (error.HasValue ()) return error;
+        if (payload.Contains ("begCoordinate") && payload.Contains ("endCoordinate")) {
+            const API_Coord begin = Get2DCoordinateFromObjectState (*payload.Get ("begCoordinate"));
+            const API_Coord end = Get2DCoordinateFromObjectState (*payload.Get ("endCoordinate"));
+            if (IsSame2DCoordinate (begin, end))
+                return "Line begin and end coordinates must not be identical.";
+        }
+        for (const char* fieldName : { "linePen", "linePenIndex", "lineTypeIndex" }) {
+            error = ValidateIntegerField (payload, fieldName);
+            if (error.HasValue ()) return error;
+        }
+        error = ValidateBooleanField (payload, "roomSeparator");
+        if (error.HasValue ()) return error;
+    } else if (typeID == API_ArcID) {
+        error = ValidateCoordinateField (payload, "origin", isCreate, false);
+        if (error.HasValue ()) return error;
+        for (const char* fieldName : { "radius", "axisAngle", "ratio", "begAngle", "beginAngle", "endAngle" }) {
+            error = ValidateFiniteNumberField (payload, fieldName);
+            if (error.HasValue ()) return error;
+        }
+        if (payload.Contains ("radius")) {
+            double radius = 0.0;
+            payload.Get ("radius", radius);
+            if (radius <= 0.0) return "'radius' must be positive.";
+        }
+        if (payload.Contains ("ratio")) {
+            double ratio = 0.0;
+            payload.Get ("ratio", ratio);
+            if (ratio <= 0.0) return "'ratio' must be positive.";
+        }
+        if (isCreate && (!payload.Contains ("radius") ||
+                         (!payload.Contains ("begAngle") && !payload.Contains ("beginAngle")) ||
+                         !payload.Contains ("endAngle")))
+            return "Arc creation requires 'radius', 'begAngle' and 'endAngle'.";
+        for (const char* fieldName : { "linePen", "linePenIndex", "lineTypeIndex" }) {
+            error = ValidateIntegerField (payload, fieldName);
+            if (error.HasValue ()) return error;
+        }
+        error = ValidateBooleanField (payload, "reflected");
+        if (error.HasValue ()) return error;
+        error = ValidateBooleanField (payload, "roomSeparator");
+        if (error.HasValue ()) return error;
     }
 
     if (typeID == API_ColumnID) {
@@ -810,8 +874,162 @@ GS::ObjectState ExecuteCreate (
         case API_SlabID:   return CreateSlabsCommand ().Execute (parameters, processControl);
         case API_ColumnID: return CreateColumnsCommand ().Execute (parameters, processControl);
         case API_BeamID:   return CreateBeamsCommand ().Execute (parameters, processControl);
+        case API_LineID:   return CreateLineElementsCommand ().Execute (parameters, processControl);
+        case API_ArcID:    return CreateArcsCommand ().Execute (parameters, processControl);
         default:           return CreateErrorResponse (APIERR_BADID, "Unsupported element type for create.");
     }
+}
+
+GS::ObjectState ExecuteDraftingUpdate (
+    const API_ElemTypeID typeID,
+    const GS::Array<GS::ObjectState>& items)
+{
+    GS::ObjectState response;
+    const auto& results = response.AddList<GS::ObjectState> ("executionResults");
+    GSErrCode callbackError = NoError;
+
+    const GSErrCode undoError = ACAPI_CallUndoableCommand (typeID == API_LineID ? "Update Native Lines" : "Update Native Arcs", [&]() -> GSErrCode {
+        for (const GS::ObjectState& item : items) {
+            const GS::ObjectState* elementId = item.Get ("elementId");
+            const GS::ObjectState* payload = item.Get ("payload");
+            // Native CRUD's adapter carries a nested payload, while the
+            // legacy MutateElements normalizer flattens update fields beside
+            // elementId.  Accept both shapes without widening the wire
+            // contract or accidentally treating the envelope as a payload
+            // when a nested object is present.
+            if (payload == nullptr)
+                payload = &item;
+            const API_Guid guid = elementId == nullptr ? APINULLGuid : GetGuidFromObjectState (*elementId);
+            API_Element element = {};
+            element.header.guid = guid;
+            GSErrCode error = guid == APINULLGuid ? APIERR_BADPARS : ACAPI_Element_Get (&element);
+            if (error == NoError && GetElemTypeId (element.header) != typeID)
+                error = APIERR_BADID;
+            API_Element mask = {};
+            ACAPI_ELEMENT_MASK_CLEAR (mask);
+            bool changed = false;
+            if (error == NoError && payload == nullptr)
+                error = APIERR_BADPARS;
+
+            if (error == NoError && typeID == API_LineID) {
+                Int32 floorIndex = 0;
+                if (payload->Get ("floorIndex", floorIndex) || payload->Get ("floorInd", floorIndex)) {
+                    element.header.floorInd = static_cast<short> (floorIndex);
+                    ACAPI_ELEMENT_MASK_SET (mask, API_Elem_Head, floorInd);
+                    changed = true;
+                }
+                const GS::ObjectState* begin = payload->Get ("begCoordinate");
+                const GS::ObjectState* end = payload->Get ("endCoordinate");
+                if (begin != nullptr) {
+                    element.line.begC = Get2DCoordinateFromObjectState (*begin);
+                    ACAPI_ELEMENT_MASK_SET (mask, API_LineType, begC);
+                    changed = true;
+                }
+                if (end != nullptr) {
+                    element.line.endC = Get2DCoordinateFromObjectState (*end);
+                    ACAPI_ELEMENT_MASK_SET (mask, API_LineType, endC);
+                    changed = true;
+                }
+                Int32 pen = 0;
+                if (payload->Get ("linePen", pen) || payload->Get ("linePenIndex", pen)) {
+                    element.line.linePen.penIndex = static_cast<short> (pen);
+                    element.line.linePen.colorOverridePenIndex = 0;
+                    ACAPI_ELEMENT_MASK_SET (mask, API_LineType, linePen);
+                    changed = true;
+                }
+                Int32 lineType = 0;
+                if (payload->Get ("lineTypeIndex", lineType)) {
+                    element.line.ltypeInd = ACAPI_CreateAttributeIndex (lineType);
+                    ACAPI_ELEMENT_MASK_SET (mask, API_LineType, ltypeInd);
+                    changed = true;
+                }
+                if (payload->Get ("roomSeparator", element.line.roomSeparator)) {
+                    ACAPI_ELEMENT_MASK_SET (mask, API_LineType, roomSeparator);
+                    changed = true;
+                }
+            } else if (error == NoError && typeID == API_ArcID) {
+                Int32 floorIndex = 0;
+                if (payload->Get ("floorIndex", floorIndex) || payload->Get ("floorInd", floorIndex)) {
+                    element.header.floorInd = static_cast<short> (floorIndex);
+                    ACAPI_ELEMENT_MASK_SET (mask, API_Elem_Head, floorInd);
+                    changed = true;
+                }
+                const GS::ObjectState* origin = payload->Get ("origin");
+                if (origin != nullptr) {
+                    element.arc.origC = Get2DCoordinateFromObjectState (*origin);
+                    ACAPI_ELEMENT_MASK_SET (mask, API_ArcType, origC);
+                    changed = true;
+                }
+                if (payload->Get ("radius", element.arc.r)) {
+                    ACAPI_ELEMENT_MASK_SET (mask, API_ArcType, r);
+                    changed = true;
+                }
+                if (payload->Get ("axisAngle", element.arc.angle)) {
+                    ACAPI_ELEMENT_MASK_SET (mask, API_ArcType, angle);
+                    changed = true;
+                }
+                if (payload->Get ("ratio", element.arc.ratio)) {
+                    ACAPI_ELEMENT_MASK_SET (mask, API_ArcType, ratio);
+                    changed = true;
+                }
+                if (payload->Get ("beginAngle", element.arc.begAng) || payload->Get ("begAngle", element.arc.begAng)) {
+                    ACAPI_ELEMENT_MASK_SET (mask, API_ArcType, begAng);
+                    changed = true;
+                }
+                if (payload->Get ("endAngle", element.arc.endAng)) {
+                    ACAPI_ELEMENT_MASK_SET (mask, API_ArcType, endAng);
+                    changed = true;
+                }
+                if (payload->Get ("reflected", element.arc.reflected)) {
+                    ACAPI_ELEMENT_MASK_SET (mask, API_ArcType, reflected);
+                    changed = true;
+                }
+                Int32 pen = 0;
+                if (payload->Get ("linePen", pen) || payload->Get ("linePenIndex", pen)) {
+                    element.arc.linePen.penIndex = static_cast<short> (pen);
+                    element.arc.linePen.colorOverridePenIndex = 0;
+                    ACAPI_ELEMENT_MASK_SET (mask, API_ArcType, linePen);
+                    changed = true;
+                }
+                Int32 lineType = 0;
+                if (payload->Get ("lineTypeIndex", lineType)) {
+                    element.arc.ltypeInd = ACAPI_CreateAttributeIndex (lineType);
+                    ACAPI_ELEMENT_MASK_SET (mask, API_ArcType, ltypeInd);
+                    changed = true;
+                }
+                if (payload->Get ("roomSeparator", element.arc.roomSeparator)) {
+                    ACAPI_ELEMENT_MASK_SET (mask, API_ArcType, roomSeparator);
+                    changed = true;
+                }
+            }
+
+            // A sparse endpoint patch must be checked against the untouched
+            // endpoint as well.  ValidatePayload can only compare two fields
+            // that are present in the request; without this post-merge check
+            // `{begin: ...}` could turn a valid line into a zero-length line.
+            if (error == NoError && typeID == API_LineID &&
+                IsSame2DCoordinate (element.line.begC, element.line.endC))
+                error = APIERR_BADPARS;
+
+            if (error == NoError && !changed)
+                error = APIERR_BADPARS;
+            if (error == NoError)
+                error = ACAPI_Element_Change (&element, &mask, nullptr, 0, true);
+            if (error != NoError) {
+                callbackError = error;
+                results (CreateFailedExecutionResult (error, "Failed to update drafting element."));
+                return error;
+            }
+            results (CreateSuccessfulExecutionResult ());
+        }
+        return callbackError;
+    });
+
+    if (undoError != NoError) {
+        response.Add ("transactionRolledBack", true);
+        response.Add ("transactionError", undoError);
+    }
+    return response;
 }
 
 GS::ObjectState ExecuteUpdate (
@@ -827,6 +1045,14 @@ GS::ObjectState ExecuteUpdate (
         case API_SlabID:   return ModifySlabsCommand (true).Execute (parameters, processControl);
         case API_ColumnID: return ModifyColumnsCommand (true).Execute (parameters, processControl);
         case API_BeamID:   return ModifyBeamsCommand (true).Execute (parameters, processControl);
+        case API_LineID:
+        case API_ArcID: {
+            const char* fieldName = typeID == API_LineID ? "linesWithDetails" : "arcsWithDetails";
+            GS::Array<GS::ObjectState> items;
+            if (!parameters.Get (fieldName, items))
+                return CreateErrorResponse (APIERR_BADPARS, "Drafting update items are missing.");
+            return ExecuteDraftingUpdate (typeID, items);
+        }
         default:           return CreateErrorResponse (APIERR_BADID, "Unsupported element type for update.");
     }
 }
@@ -888,6 +1114,16 @@ void ApplyTextPlacement (
     if (payload.Get ("pen", pen)) {
         element.text.pen = static_cast<short> (pen);
         ACAPI_ELEMENT_MASK_SET (mask, API_TextType, pen);
+    }
+    bool fixedSize = false;
+    if (payload.Get ("fixedSize", fixedSize)) {
+        element.text.fixedSize = fixedSize;
+        ACAPI_ELEMENT_MASK_SET (mask, API_TextType, fixedSize);
+    }
+    bool nonBreaking = false;
+    if (payload.Get ("nonBreaking", nonBreaking)) {
+        element.text.nonBreaking = nonBreaking;
+        ACAPI_ELEMENT_MASK_SET (mask, API_TextType, nonBreaking);
     }
 }
 
@@ -1022,20 +1258,25 @@ GS::ObjectState ExecuteTextUpdate (
             if (error == NoError) {
                 const GS::ObjectState* richText = item.Get ("richText");
                 GS::UniString richTextError;
-                error = richText == nullptr
-                    ? APIERR_BADPARS
-                    : NativeRichTextMemo::BuildMemo (*richText, memo, element.text, richTextError);
-                if (error != NoError) {
-                    results (CreateFailedExecutionResult (error, richTextError.IsEmpty ()
-                        ? "Failed to build Rich Text memo."
-                        : richTextError));
-                } else {
+                if (richText != nullptr) {
+                    error = NativeRichTextMemo::BuildMemo (*richText, memo, element.text, richTextError);
+                    if (error != NoError) {
+                        results (CreateFailedExecutionResult (error, richTextError.IsEmpty ()
+                            ? "Failed to build Rich Text memo."
+                            : richTextError));
+                    }
+                }
+                if (error == NoError) {
                     ApplyTextPlacement (element, mask, item, false, stories);
-                    error = ACAPI_Element_Change (&element, &mask, &memo, TextRichMemoMask, true);
+                    if (richText != nullptr) {
+                        error = ACAPI_Element_Change (&element, &mask, &memo, TextRichMemoMask, true);
+                    } else {
+                        error = ACAPI_Element_Change (&element, &mask, nullptr, 0, true);
+                    }
                     if (error == NoError)
                         results (CreateSuccessfulExecutionResult ());
                     else
-                        results (CreateFailedExecutionResult (error, "Failed to update Rich Text element."));
+                        results (CreateFailedExecutionResult (error, "Failed to update Text element."));
                 }
             } else {
                 results (CreateFailedExecutionResult (error, "Failed to load Rich Text element."));
@@ -1461,7 +1702,7 @@ GS::Optional<GS::UniString> MutateElementsCommand::GetInputParametersSchema () c
             },
             "elementType": {
                 "type": "string",
-                "enum": ["Wall", "Slab", "Column", "Beam", "Text"]
+                "enum": ["Wall", "Slab", "Column", "Beam", "Text", "Line", "Arc"]
             },
             "items": {
                 "type": "array",
@@ -1601,7 +1842,20 @@ GS::Optional<GS::UniString> MutateElementsCommand::GetInputParametersSchema () c
                                 "coordinate": { "$ref": "#/Coordinate3D" },
                                 "angle": { "type": "number" },
                                 "anchor": { "type": "integer", "minimum": 0, "maximum": 8 },
-                                "pen": { "type": "integer" }
+                                "fixedSize": { "type": "boolean" },
+                                "nonBreaking": { "type": "boolean" },
+                                "pen": { "type": "integer" },
+                                "linePen": { "type": "integer" },
+                                "linePenIndex": { "type": "integer" },
+                                "lineTypeIndex": { "type": "integer" },
+                                "roomSeparator": { "type": "boolean" },
+                                "radius": { "type": "number", "exclusiveMinimum": true },
+                                "axisAngle": { "type": "number" },
+                                "ratio": { "type": "number", "exclusiveMinimum": true },
+                                "begAngle": { "type": "number" },
+                                "beginAngle": { "type": "number" },
+                                "endAngle": { "type": "number" },
+                                "reflected": { "type": "boolean" }
                             },
                             "additionalProperties": false
                         }
@@ -1634,7 +1888,7 @@ GS::Optional<GS::UniString> MutateElementsCommand::GetRawResponseSchema () const
         "type": "object",
         "properties": {
             "operation": { "type": "string", "enum": ["create", "update", "delete"] },
-            "elementType": { "type": "string", "enum": ["Wall", "Slab", "Column", "Beam", "Text"] },
+            "elementType": { "type": "string", "enum": ["Wall", "Slab", "Column", "Beam", "Text", "Line", "Arc"] },
             "requestedCount": { "type": "integer", "minimum": 0 },
             "appliedCount": { "type": "integer", "minimum": 0 },
             "mutationComplete": { "type": "boolean" },
@@ -1668,7 +1922,7 @@ GS::ObjectState MutateElementsCommand::Execute (
     const bool isText = typeID == API_TextID;
     const ElementTypeSpec* typeSpec = isText ? nullptr : GetElementTypeSpec (typeID);
     if (!isText && typeSpec == nullptr) {
-        return CreateErrorResponse (APIERR_BADPARS, "'elementType' must be Wall, Slab, Column, Beam or Text.");
+        return CreateErrorResponse (APIERR_BADPARS, "'elementType' must be Wall, Slab, Column, Beam, Text, Line or Arc.");
     }
 
     GS::Array<GS::ObjectState> items;
@@ -1691,6 +1945,29 @@ GS::ObjectState MutateElementsCommand::Execute (
         }
     }
 
+    // Archicad rejects exact changes to members of a group while Suspend
+    // Groups is off.  Mutations are already serialized on Archicad's main
+    // thread, so temporarily suspend groups for this synchronous command and
+    // restore the operator's prior UI mode on every exit path.  This changes
+    // neither group membership nor the undo payload.
+    bool groupModeNeedsRestore = false;
+    if (operation != "create") {
+        bool groupsWereSuspended = false;
+        GSErrCode groupModeError = TAPIR_View_IsSuspendGroupOn (&groupsWereSuspended);
+        if (groupModeError != NoError)
+            return CreateErrorResponse (groupModeError, "Failed to read the Suspend Groups mode.");
+        groupModeNeedsRestore = !groupsWereSuspended;
+        if (groupModeNeedsRestore) {
+            groupModeError = TAPIR_Grouping_ChangeSuspendGroup (true);
+            if (groupModeError != NoError)
+                return CreateErrorResponse (groupModeError, "Failed to suspend groups for exact element mutation.");
+        }
+    }
+    const GS::OnExit groupModeGuard ([&groupModeNeedsRestore] () {
+        if (groupModeNeedsRestore)
+            TAPIR_Grouping_ChangeSuspendGroup (false);
+    });
+
     GS::ObjectState mutationParameters;
     if (!isText && operation == "create") {
         mutationParameters = BuildArrayParameters (typeSpec->createArrayName, normalizedItems);
@@ -1710,6 +1987,19 @@ GS::ObjectState MutateElementsCommand::Execute (
     } else {
         mutationResult = ExecuteDelete (normalizedItems, processControl);
     }
+
+    // Restore the operator's UI mode before producing the response so a
+    // failure is factual and observable.  The OnExit guard remains armed as
+    // one final best-effort retry, but the element mutation is never retried.
+    GSErrCode groupModeRestoreError = NoError;
+    if (groupModeNeedsRestore) {
+        groupModeRestoreError = TAPIR_Grouping_ChangeSuspendGroup (false);
+        if (groupModeRestoreError == NoError)
+            groupModeNeedsRestore = false;
+    }
+    mutationResult.Add ("groupModeRestored", groupModeRestoreError == NoError);
+    if (groupModeRestoreError != NoError)
+        mutationResult.Add ("groupModeRestoreError", groupModeRestoreError);
 
     GS::Array<API_Guid> changedGuids;
     if (operation == "create") {

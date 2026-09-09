@@ -665,6 +665,12 @@ static GSErrCode GetTransformationFromCurrentDatabase (ListProxyType& transforma
     double tranAngle = 0;
     Geometry::TranAngle (trafo, &tranAngle);
 
+    double drawingScale = 0.0;
+    err = TAPIR_Drawing_GetDrawingScale (&drawingScale);
+    if (err != NoError || !std::isfinite (drawingScale) || drawingScale <= 0.0) {
+        return err != NoError ? err : APIERR_BADPARS;
+    }
+
     transformationsListProxy (
         GS::ObjectState (
             "zoom", GS::ObjectState (
@@ -672,7 +678,8 @@ static GSErrCode GetTransformationFromCurrentDatabase (ListProxyType& transforma
                 "yMin", zoomBox.yMin,
                 "xMax", zoomBox.xMax,
                 "yMax", zoomBox.yMax),
-            "rotation", tranAngle));
+            "rotation", tranAngle,
+            "drawingScale", drawingScale));
 
     return err;
 }

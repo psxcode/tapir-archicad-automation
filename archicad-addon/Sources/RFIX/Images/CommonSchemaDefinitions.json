@@ -3638,12 +3638,17 @@
             "rotation": {
                 "type": "number",
                 "description": "The orientation in radian."
+            },
+            "drawingScale": {
+                "type": "number",
+                "description": "The current database drawing scale (100 means 1:100; layouts use 1)."
             }
         },
         "additionalProperties": false,
         "required": [
             "zoom",
-            "rotation"
+            "rotation",
+            "drawingScale"
         ]
     },
     "ViewTransformationsOrError": {
@@ -4276,20 +4281,22 @@
         "properties": {
             "anchorCoordinate": { "$ref": "#/Coordinate2D" },
             "angle": { "type": "number" },
-            "width": { "type": "number" },
-            "height": { "type": "number" },
+            "width": { "type": "number", "description": "Native API_TextType paper width in millimetres." },
+            "height": { "type": "number", "description": "Native API_TextType paper height in millimetres." },
             "size": { "type": "number" },
             "fontIndex": { "type": "integer" },
             "anchor": { "type": "integer" },
             "justification": { "type": "integer" },
             "fixedAngle": { "type": "boolean" },
             "fixedSize": { "type": "boolean" },
+            "nonBreaking": { "type": "boolean" },
+            "drawingScale": { "type": "number", "description": "Scoped database drawing scale used to convert Text width/height from native paper millimetres to model metres for both fixedSize modes; fixedSize remains native scale-behavior metadata." },
             "lineCount": { "type": "integer" },
             "pen": { "type": "integer" },
             "content": { "type": "string" }
         },
         "additionalProperties": false,
-        "required": ["anchorCoordinate", "angle", "width", "height", "size", "fontIndex", "anchor", "justification", "fixedAngle", "fixedSize", "lineCount", "pen"]
+        "required": ["anchorCoordinate", "angle", "width", "height", "size", "fontIndex", "anchor", "justification", "fixedAngle", "fixedSize", "nonBreaking", "lineCount", "pen"]
     },
     "PolylineDetails": {
         "type": "object",

@@ -145,12 +145,24 @@ GSErrCode ParseParagraph (
         return Fail (errorMessage, "Rich Text EOL positions are missing or too numerous.");
     }
     Int32 previousEol = -1;
-    for (const Int32 position : eolPositions) {
-        if (position < 0 || position <= previousEol || paragraph.range == 0 || position >= paragraph.range) {
-            return Fail (errorMessage, "Rich Text EOL positions are not ordered or are outside the paragraph.");
+    if (paragraph.range == 0) {
+        // Archicad read-back uses [0] as the visual-line sentinel for an
+        // empty paragraph.  It is the only non-empty EOL shape valid at zero
+        // range; accepting arbitrary values here would diverge from the
+        // TypeScript contract and could pass invalid offsets to DevKit.
+        if (eolPositions.GetSize () == 1 && eolPositions[0] == 0) {
+            paragraph.eolPositions.push_back (0);
+        } else if (!eolPositions.IsEmpty ()) {
+            return Fail (errorMessage, "Rich Text empty paragraph EOL positions must be empty or the [0] sentinel.");
         }
-        previousEol = position;
-        paragraph.eolPositions.push_back (position);
+    } else {
+        for (const Int32 position : eolPositions) {
+            if (position < 0 || position <= previousEol || position >= paragraph.range) {
+                return Fail (errorMessage, "Rich Text EOL positions are not ordered or are outside the paragraph.");
+            }
+            previousEol = position;
+            paragraph.eolPositions.push_back (position);
+        }
     }
 
     // Runs never contain line-end characters.  API_ParagraphType ranges also
@@ -440,11 +452,18 @@ GSErrCode BuildMemo (
     textData.charCode = CC_UniCode;
 #endif
     // The eolPos array owns explicit line boundaries.  Match the DevKit
-    // multistyle example and leave wrapping enabled for lines not listed by
-    // the caller.
-    textData.nonBreaking = false;
+    // multistyle example when the caller supplied at least one position.
+    // Semantic Markdown normally supplies no positions: in that case the
+    // host owns automatic wrapping instead of replaying stale layout output.
     textData.multiStyle = true;
-    textData.useEolPos = true;
+    bool hasExplicitEolPositions = false;
+    for (const ParagraphSpec& paragraph : paragraphs) {
+        if (!paragraph.eolPositions.empty ()) {
+            hasExplicitEolPositions = true;
+            break;
+        }
+    }
+    textData.useEolPos = hasExplicitEolPositions;
     GSSize lineCount = 0;
     for (const ParagraphSpec& paragraph : paragraphs) {
         const GSSize eolCount = static_cast<GSSize> (paragraph.eolPositions.size ());

@@ -49,6 +49,29 @@ static bool AddBoundedTextContent (GS::ObjectState& target, const API_ElementMem
     return true;
 }
 
+static void ApplyLineFamilyDetails (const GS::ObjectState& details,
+                                    API_ExtendedPenType& pen,
+                                    API_AttributeIndex& lineType,
+                                    bool& roomSeparator,
+                                    bool& penChanged,
+                                    bool& lineTypeChanged,
+                                    bool& roomSeparatorChanged)
+{
+    Int32 linePen = 0;
+    if (details.Get ("linePen", linePen) || details.Get ("linePenIndex", linePen)) {
+        pen.penIndex = static_cast<short> (linePen);
+        pen.colorOverridePenIndex = 0;
+        penChanged = true;
+    }
+    Int32 lineTypeIndex = 0;
+    if (details.Get ("lineTypeIndex", lineTypeIndex)) {
+        lineType = ACAPI_CreateAttributeIndex (lineTypeIndex);
+        lineTypeChanged = true;
+    }
+    if (details.Get ("roomSeparator", roomSeparator))
+        roomSeparatorChanged = true;
+}
+
 }
 
 static API_ElemFilterFlags ConvertFilterStringToFlag (const GS::UniString& filter)
@@ -1471,16 +1494,27 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                 typeSpecificDetails.Add ("size", elem.text.size);
                 typeSpecificDetails.Add ("fontIndex", static_cast<Int32> (elem.text.font));
                 typeSpecificDetails.Add ("pen", static_cast<Int32> (elem.text.pen));
-                if (!draftingProfile) {
-                    typeSpecificDetails.Add ("anchorCoordinate", Create2DCoordinateObjectState (elem.text.loc));
-                    typeSpecificDetails.Add ("width", elem.text.width);
-                    typeSpecificDetails.Add ("height", elem.text.height);
-                    typeSpecificDetails.Add ("anchor", static_cast<Int32> (elem.text.anchor));
-                    typeSpecificDetails.Add ("justification", static_cast<Int32> (elem.text.just));
-                    typeSpecificDetails.Add ("fixedAngle", elem.text.fixedAngle);
-                    typeSpecificDetails.Add ("fixedSize", elem.text.fixedSize);
-                    typeSpecificDetails.Add ("lineCount", elem.text.nLine);
+                // API_TextType width/height are declared paper dimensions in
+                // millimetres. Keep them present for drafting captures too;
+                // the semantic layer converts them using the scoped drawing
+                // scale and fixedSize context.
+                typeSpecificDetails.Add ("width", elem.text.width);
+                typeSpecificDetails.Add ("height", elem.text.height);
+                typeSpecificDetails.Add ("fixedSize", elem.text.fixedSize);
+                typeSpecificDetails.Add ("nonBreaking", elem.text.nonBreaking);
+                double textDrawingScale = 0.0;
+                if (TAPIR_Drawing_GetDrawingScale (&textDrawingScale) == NoError
+                    && std::isfinite (textDrawingScale) && textDrawingScale > 0.0) {
+                    typeSpecificDetails.Add ("drawingScale", textDrawingScale);
                 }
+                // Declared placement is useful even for bounded drafting
+                // detail profiles: rendered bounds alone cannot represent a
+                // centered/wide native envelope or its overflow basis.
+                typeSpecificDetails.Add ("anchorCoordinate", Create2DCoordinateObjectState (elem.text.loc));
+                typeSpecificDetails.Add ("anchor", static_cast<Int32> (elem.text.anchor));
+                typeSpecificDetails.Add ("justification", static_cast<Int32> (elem.text.just));
+                typeSpecificDetails.Add ("fixedAngle", elem.text.fixedAngle);
+                typeSpecificDetails.Add ("lineCount", elem.text.nLine);
 
                 API_ElementMemo memo = {};
                 const GS::OnExit guard ([&memo] () { ACAPI_DisposeElemMemoHdls (&memo); });
@@ -1912,6 +1946,56 @@ GS::ObjectState SetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                         if (typeSpecificDetails->Get ("fixedStampAngle", elem.zone.fixedAngle)) {
                             ACAPI_ELEMENT_MASK_SET (mask, API_ZoneType, fixedAngle);
                         }
+                    } break;
+                    case API_LineID: {
+                        const GS::ObjectState* begin = typeSpecificDetails->Get ("begCoordinate");
+                        if (begin != nullptr) {
+                            elem.line.begC = Get2DCoordinateFromObjectState (*begin);
+                            ACAPI_ELEMENT_MASK_SET (mask, API_LineType, begC);
+                        }
+                        const GS::ObjectState* end = typeSpecificDetails->Get ("endCoordinate");
+                        if (end != nullptr) {
+                            elem.line.endC = Get2DCoordinateFromObjectState (*end);
+                            ACAPI_ELEMENT_MASK_SET (mask, API_LineType, endC);
+                        }
+                        bool penChanged = false;
+                        bool lineTypeChanged = false;
+                        bool roomSeparatorChanged = false;
+                        ApplyLineFamilyDetails (*typeSpecificDetails, elem.line.linePen, elem.line.ltypeInd,
+                                                elem.line.roomSeparator, penChanged, lineTypeChanged, roomSeparatorChanged);
+                        if (penChanged) ACAPI_ELEMENT_MASK_SET (mask, API_LineType, linePen);
+                        if (lineTypeChanged) ACAPI_ELEMENT_MASK_SET (mask, API_LineType, ltypeInd);
+                        if (roomSeparatorChanged) ACAPI_ELEMENT_MASK_SET (mask, API_LineType, roomSeparator);
+                    } break;
+                    case API_ArcID:
+                    case API_CircleID: {
+                        const GS::ObjectState* origin = typeSpecificDetails->Get ("origin");
+                        if (origin != nullptr) {
+                            elem.arc.origC = Get2DCoordinateFromObjectState (*origin);
+                            ACAPI_ELEMENT_MASK_SET (mask, API_ArcType, origC);
+                        }
+                        if (typeSpecificDetails->Get ("radius", elem.arc.r))
+                            ACAPI_ELEMENT_MASK_SET (mask, API_ArcType, r);
+                        if (typeSpecificDetails->Get ("axisAngle", elem.arc.angle))
+                            ACAPI_ELEMENT_MASK_SET (mask, API_ArcType, angle);
+                        if (typeSpecificDetails->Get ("ratio", elem.arc.ratio))
+                            ACAPI_ELEMENT_MASK_SET (mask, API_ArcType, ratio);
+                        if (GetElemTypeId (elem.header) == API_ArcID) {
+                            if (typeSpecificDetails->Get ("beginAngle", elem.arc.begAng))
+                                ACAPI_ELEMENT_MASK_SET (mask, API_ArcType, begAng);
+                            if (typeSpecificDetails->Get ("endAngle", elem.arc.endAng))
+                                ACAPI_ELEMENT_MASK_SET (mask, API_ArcType, endAng);
+                        }
+                        if (typeSpecificDetails->Get ("reflected", elem.arc.reflected))
+                            ACAPI_ELEMENT_MASK_SET (mask, API_ArcType, reflected);
+                        bool penChanged = false;
+                        bool lineTypeChanged = false;
+                        bool roomSeparatorChanged = false;
+                        ApplyLineFamilyDetails (*typeSpecificDetails, elem.arc.linePen, elem.arc.ltypeInd,
+                                                elem.arc.roomSeparator, penChanged, lineTypeChanged, roomSeparatorChanged);
+                        if (penChanged) ACAPI_ELEMENT_MASK_SET (mask, API_ArcType, linePen);
+                        if (lineTypeChanged) ACAPI_ELEMENT_MASK_SET (mask, API_ArcType, ltypeInd);
+                        if (roomSeparatorChanged) ACAPI_ELEMENT_MASK_SET (mask, API_ArcType, roomSeparator);
                     } break;
                     case API_DrawingID: {
                         GS::Array<GS::ObjectState> clipCoords;
