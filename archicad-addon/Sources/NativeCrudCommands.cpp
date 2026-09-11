@@ -925,6 +925,7 @@ GS::ObjectState BuildReceipt (
     const bool dispatchComplete,
     const GS::ObjectState* semanticMetadata,
     const GS::UniString& operatorNote,
+    const GS::ObjectState* mutationDiagnostics = nullptr,
     const char* statusOverride = nullptr,
     const API_Guid* normalizeSurvivor = nullptr)
 {
@@ -992,12 +993,21 @@ GS::ObjectState BuildReceipt (
         if (beforeState != nullptr || afterState != nullptr) changed (ChangedField (beforeState, afterState));
         elements (element);
     }
-    receipt.Add ("transaction", GS::ObjectState (
+    GS::ObjectState transaction (
         "atomic", true,
         "undoable", true,
         "dispatchComplete", dispatchComplete,
         "evidenceComplete", complete,
-        "outcome", status));
+        "outcome", status);
+    if (mutationDiagnostics != nullptr) {
+        bool groupModeRestored = false;
+        if (mutationDiagnostics->Get ("groupModeRestored", groupModeRestored))
+            transaction.Add ("groupModeRestored", groupModeRestored);
+        Int32 groupModeRestoreError = 0;
+        if (mutationDiagnostics->Get ("groupModeRestoreError", groupModeRestoreError))
+            transaction.Add ("groupModeRestoreError", groupModeRestoreError);
+    }
+    receipt.Add ("transaction", transaction);
     return receipt;
 }
 
@@ -1195,6 +1205,12 @@ GS::ObjectState DispatchMutation (
         Int32 transactionError = 0;
         if (nativeEnvelope.Get ("transactionError", transactionError))
             normalized.Add ("transactionError", transactionError);
+        bool groupModeRestored = false;
+        if (typedResult->Get ("groupModeRestored", groupModeRestored))
+            normalized.Add ("groupModeRestored", groupModeRestored);
+        Int32 groupModeRestoreError = 0;
+        if (typedResult->Get ("groupModeRestoreError", groupModeRestoreError))
+            normalized.Add ("groupModeRestoreError", groupModeRestoreError);
         return normalized;
     }
     return CreateErrorResponse (APIERR_BADPARS, "This element type has read snapshots but no validated native memo writer in this APX build.");
@@ -1656,14 +1672,20 @@ GS::ObjectState MutateNativeElementsCommand::Execute (const GS::ObjectState& par
     }
     const bool complete = dispatchComplete && afterComplete;
     const GS::ObjectState* semanticMetadata = parameters.Get ("semanticMetadata");
-    GS::ObjectState receipt = BuildReceipt (scope, operationId, operation, typeName, description, origin, requestHash, before, after, operation == "create" ? afterIds : requestedIds, complete, dispatchComplete, semanticMetadata, operatorNote);
+    GS::ObjectState receipt = BuildReceipt (scope, operationId, operation, typeName, description, origin, requestHash, before, after, operation == "create" ? afterIds : requestedIds, complete, dispatchComplete, semanticMetadata, operatorNote, &mutationResult);
+    GS::ObjectState response;
+    bool groupModeRestored = false;
+    if (mutationResult.Get ("groupModeRestored", groupModeRestored))
+        response.Add ("groupModeRestored", groupModeRestored);
+    Int32 groupModeRestoreError = 0;
+    if (mutationResult.Get ("groupModeRestoreError", groupModeRestoreError))
+        response.Add ("groupModeRestoreError", groupModeRestoreError);
     // BuildReceipt deliberately has no durable side effect.  Give the APX
     // response a process-local sequence for diagnostics and remember the
     // factual receipt before returning it so MCP can reconcile a lost HTTP
     // response without dispatching the Archicad command a second time.
     receipt.Add ("nativeSequence", NextCachedReceiptSequence ());
     RememberCachedReceipt (receipt);
-    GS::ObjectState response;
     response.Add ("contractVersion", ContractVersion);
     response.Add ("status", "success");
     response.Add ("receipt", receipt);
@@ -1931,7 +1953,7 @@ GS::ObjectState NormalizeTextClusterCommand::Execute (const GS::ObjectState& par
     GS::ObjectState receipt = BuildReceipt (
         scope, operationId, operation, elementType, description, origin, requestHash,
         before, after, ids, complete, dispatchComplete, parameters.Get ("semanticMetadata"),
-        operatorNote, nullptr, &survivorGuid);
+        operatorNote, nullptr, nullptr, &survivorGuid);
     receipt.Add ("nativeSequence", NextCachedReceiptSequence ());
     RememberCachedReceipt (receipt);
     GS::ObjectState response;

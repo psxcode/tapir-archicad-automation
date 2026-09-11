@@ -1127,6 +1127,107 @@ void ApplyTextPlacement (
     }
 }
 
+// A sparse native-crud Text UPDATE containing only `angle` can use the
+// DevKit's edit operation instead of rebuilding the Text element.  The
+// native-crud adapter deliberately flattens the nested `patch`/`payload`
+// envelope before calling MutateElements, so this predicate receives the
+// already-normalized item (`elementId` plus typed fields).
+bool IsAngleOnlyTextItem (const GS::ObjectState& item)
+{
+    if (!item.Contains ("angle"))
+        return false;
+
+    for (const char* fieldName : {
+        "richText", "coordinate", "floorIndex", "anchor", "width", "height",
+        "pen", "fixedSize", "nonBreaking"
+    }) {
+        if (item.Contains (fieldName))
+            return false;
+    }
+    return true;
+}
+
+GSErrCode ValidateTextRotationTarget (const API_Element& freshElement, const double requestedAngle)
+{
+    if (!std::isfinite (requestedAngle) || !std::isfinite (freshElement.text.angle))
+        return APIERR_BADPARS;
+
+    if (freshElement.text.fixedAngle)
+        return APIERR_BADPARS;
+
+    // A Text owned by another element (for example a Label) is not an
+    // independent placement target.  Rotating it could create collateral
+    // changes in its owner, so this bounded lane rejects it explicitly.
+    if (freshElement.text.owner != APINULLGuid)
+        return APIERR_BADPARS;
+
+    API_Guid groupGuid = APINULLGuid;
+    // GetGroup is an authoritative native collateral check.  An unavailable
+    // grouping fact is not permission to guess that the target is independent.
+    const GSErrCode groupError = ACAPI_Grouping_GetGroup (freshElement.header.guid, &groupGuid);
+    if (groupError != NoError)
+        return groupError;
+    if (groupGuid != APINULLGuid)
+        return APIERR_BADPARS;
+
+    return NoError;
+}
+
+GSErrCode ValidateAngleOnlyTextItem (const GS::ObjectState& item)
+{
+    const GS::ObjectState* elementID = item.Get ("elementId");
+    const API_Guid guid = elementID == nullptr ? APINULLGuid : GetGuidFromObjectState (*elementID);
+    if (guid == APINULLGuid)
+        return APIERR_BADPARS;
+
+    double requestedAngle = 0.0;
+    if (!item.Get ("angle", requestedAngle))
+        return APIERR_BADPARS;
+
+    API_Element freshElement = {};
+    freshElement.header.guid = guid;
+    GSErrCode error = ACAPI_Element_Get (&freshElement);
+    if (error == NoError && GetElemTypeId (freshElement.header) != API_TextID)
+        error = APIERR_BADID;
+    if (error == NoError)
+        error = ValidateTextRotationTarget (freshElement, requestedAngle);
+    return error;
+}
+
+// Rotate one ungrouped, unlinked Text around its freshly-read anchor.  This
+// is intentionally a private native helper rather than the public
+// RotateElements command: the native-crud receipt must reflect the exact
+// single-item edit and an ACAPI failure must propagate to the undoable lane.
+GSErrCode RotateTextByDelta (const API_Element& freshElement, const double requestedAngle)
+{
+    const GSErrCode validationError = ValidateTextRotationTarget (freshElement, requestedAngle);
+    if (validationError != NoError)
+        return validationError;
+
+    const double delta = requestedAngle - freshElement.text.angle;
+    if (!std::isfinite (delta))
+        return APIERR_BADPARS;
+
+    // APIEdit_Rotate consumes a begin/end ray and an origin.  The text's own
+    // freshly-read anchor is the origin, so the edit changes only its angle;
+    // it does not ask ACAPI_Element_Change to reserialize memo or dimensions.
+    const API_Coord origin = freshElement.text.loc;
+    const API_Coord3D beginPoint { origin.x + 1.0, origin.y, 0.0 };
+    const API_Coord3D endPoint {
+        origin.x + std::cos (delta),
+        origin.y + std::sin (delta),
+        0.0
+    };
+    GS::Array<API_Neig> elementsToEdit = { API_Neig (freshElement.header.guid) };
+    API_EditPars editPars = {};
+    editPars.typeID = APIEdit_Rotate;
+    editPars.begC = beginPoint;
+    editPars.endC = endPoint;
+    editPars.origC = origin;
+    editPars.withDelete = true;
+    return ACAPI_Element_Edit (&elementsToEdit, editPars);
+}
+
 GS::ObjectState ExecuteTextCreate (
     const GS::Array<GS::ObjectState>& items,
     GS::ProcessControl& /*processControl*/)
@@ -1239,7 +1340,38 @@ GS::ObjectState ExecuteTextUpdate (
     const Stories stories = GetStories ();
     GSErrCode callbackError = NoError;
 
-    const GSErrCode undoError = ACAPI_CallUndoableCommand ("Update Rich Text", [&] () -> GSErrCode {
+    // Keep the special lane deliberately narrower than the generic Text
+    // update: one item, one mapped `angle` field, and no memo/style/geometry
+    // fields.  Mixed batches and content/presentation updates retain the
+    // existing ACAPI_Element_Change path.
+    const bool angleOnlySingleText = items.GetSize () == 1
+        && IsAngleOnlyTextItem (items[0]);
+
+    const GSErrCode undoError = ACAPI_CallUndoableCommand (
+        angleOnlySingleText ? "Rotate Rich Text" : "Update Rich Text",
+        [&] () -> GSErrCode {
+        if (angleOnlySingleText) {
+            const GS::ObjectState& item = items[0];
+            const GS::ObjectState* elementID = item.Get ("elementId");
+            const API_Guid guid = elementID == nullptr ? APINULLGuid : GetGuidFromObjectState (*elementID);
+            API_Element element = {};
+            element.header.guid = guid;
+            GSErrCode error = guid == APINULLGuid ? APIERR_BADPARS : ACAPI_Element_Get (&element);
+            if (error == NoError && GetElemTypeId (element.header) != API_TextID)
+                error = APIERR_BADID;
+            double requestedAngle = 0.0;
+            if (error == NoError && !item.Get ("angle", requestedAngle))
+                error = APIERR_BADPARS;
+            if (error == NoError)
+                error = RotateTextByDelta (element, requestedAngle);
+            if (error == NoError)
+                results (CreateSuccessfulExecutionResult ());
+            else
+                results (CreateFailedExecutionResult (error, "Failed to rotate Text element through the native edit lane."));
+            callbackError = error;
+            return callbackError;
+        }
+
         for (GSSize index = 0; index < static_cast<GSSize> (items.GetSize ()); ++index) {
             const GS::ObjectState& item = items[index];
             if (callbackError != NoError) {
@@ -1641,6 +1773,14 @@ bool MutationResultIsComplete (
     if (mutationResult.Get ("transactionRolledBack", transactionRolledBack) && transactionRolledBack) {
         return false;
     }
+    if (mutationResult.Contains ("groupModeRestored")) {
+        bool groupModeRestored = false;
+        if (!mutationResult.Get ("groupModeRestored", groupModeRestored) || !groupModeRestored)
+            return false;
+    }
+    if (mutationResult.Contains ("groupModeRestoreError")) {
+        return false;
+    }
     if (operation == "create") {
         GS::Array<GS::ObjectState> elements;
         if (!mutationResult.Get ("elements", elements) || static_cast<GSSize> (elements.GetSize ()) != requestedCount) {
@@ -1943,6 +2083,17 @@ GS::ObjectState MutateElementsCommand::Execute (
             // cannot result in a native mutation.
             return CreateErrorResponse (APIERR_BADPARS, error.Get ());
         }
+    }
+
+    // Validate the exact angle-only target before touching the operator's
+    // Suspend Groups mode.  The edit lane repeats this check after entering
+    // the undoable command because the native element must still be fresh at
+    // the actual edit boundary.
+    if (isText && operation == "update" && normalizedItems.GetSize () == 1
+        && IsAngleOnlyTextItem (normalizedItems[0])) {
+        const GSErrCode rotationPreflightError = ValidateAngleOnlyTextItem (normalizedItems[0]);
+        if (rotationPreflightError != NoError)
+            return CreateErrorResponse (rotationPreflightError, "Text angle-only update target is fixed, linked, grouped, or unavailable.");
     }
 
     // Archicad rejects exact changes to members of a group while Suspend
