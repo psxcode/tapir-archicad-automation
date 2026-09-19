@@ -833,6 +833,19 @@ var gCommands = [{
         "properties": {
             "elements": {
                 "$ref": "#/Elements"
+            },
+            "detailProfile": {
+                "type": "string",
+                "enum": ["full", "drafting"]
+            },
+            "includeFoundPolygon": {
+                "type": "boolean",
+                "description": "Read the AC25-tested Zone found-polygon memo as separate output-only evidence. Defaults to false.",
+                "default": false
+            },
+            "pageSize": {
+                "type": "integer",
+                "minimum": 1
             }
         },
         "additionalProperties": false,

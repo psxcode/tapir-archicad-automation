@@ -183,17 +183,14 @@ GS::ObjectState CreatePolyArcObjectState (const API_PolyArc& a)
     return GS::ObjectState ("begIndex", a.begIndex - 1, "endIndex", a.endIndex - 1, "arcAngle", a.arcAngle);
 }
 
-std::vector<PolygonData> GetPolygonsFromMemoCoords (const API_Guid& elemGuid, bool includeZCoords)
+static std::vector<PolygonData> GetPolygonsFromMemoHandles (API_Coord** coordsHandle, Int32** pendsHandle, API_PolyArc** parcsHandle, double** zCoordsHandle, bool includeZCoords)
 {
     try {
-    API_ElementMemo memo = {};
-    const GS::OnExit guard ([&memo] () { ACAPI_DisposeElemMemoHdls (&memo); });
-    const UInt64 mask = includeZCoords ? APIMemoMask_Polygon | APIMemoMask_MeshPolyZ : APIMemoMask_Polygon;
-    if (ACAPI_Element_GetMemo (elemGuid, &memo, mask) != NoError || memo.coords == nullptr || *memo.coords == nullptr) {
+    if (coordsHandle == nullptr || *coordsHandle == nullptr) {
         return {};
     }
 
-    const GSSize coordsBytes = BMhGetSize (reinterpret_cast<GSHandle> (memo.coords));
+    const GSSize coordsBytes = BMhGetSize (reinterpret_cast<GSHandle> (coordsHandle));
     constexpr GSSize maxMemoCoordinates = 1'000'000;
     constexpr GSSize maxMemoPolygons = 100'000;
     constexpr GSSize maxMemoArcs = 1'000'000;
@@ -206,10 +203,10 @@ std::vector<PolygonData> GetPolygonsFromMemoCoords (const API_Guid& elemGuid, bo
         return {};
 
     GSSize nPolys = 1;
-    if (memo.pends != nullptr) {
-        if (*memo.pends == nullptr)
+    if (pendsHandle != nullptr) {
+        if (*pendsHandle == nullptr)
             return {};
-        const GSSize pendsBytes = BMhGetSize (reinterpret_cast<GSHandle> (memo.pends));
+        const GSSize pendsBytes = BMhGetSize (reinterpret_cast<GSHandle> (pendsHandle));
         if (pendsBytes < static_cast<GSSize> (sizeof (Int32)) ||
             pendsBytes % static_cast<GSSize> (sizeof (Int32)) != 0 ||
             pendsBytes > (maxMemoPolygons + 1) * static_cast<GSSize> (sizeof (Int32)))
@@ -220,9 +217,9 @@ std::vector<PolygonData> GetPolygonsFromMemoCoords (const API_Guid& elemGuid, bo
     }
 
     if (includeZCoords) {
-        if (memo.meshPolyZ == nullptr || *memo.meshPolyZ == nullptr)
+        if (zCoordsHandle == nullptr || *zCoordsHandle == nullptr)
             return {};
-        const GSSize zBytes = BMhGetSize (reinterpret_cast<GSHandle> (memo.meshPolyZ));
+        const GSSize zBytes = BMhGetSize (reinterpret_cast<GSHandle> (zCoordsHandle));
         if (coordCount > std::numeric_limits<GSSize>::max () / static_cast<GSSize> (sizeof (double)) ||
             zBytes < coordCount * static_cast<GSSize> (sizeof (double)) ||
             zBytes % static_cast<GSSize> (sizeof (double)) != 0)
@@ -234,16 +231,16 @@ std::vector<PolygonData> GetPolygonsFromMemoCoords (const API_Guid& elemGuid, bo
     std::vector<PolygonData> polygons (nPolys);
     Int32 startIndex = 1;
     for (GSIndex iPoly = 0; iPoly < nPolys; ++iPoly) {
-        Int32 endIndex = memo.pends == nullptr
+        Int32 endIndex = pendsHandle == nullptr
             ? static_cast<Int32> (coordCount - 1)
-            : (*memo.pends)[iPoly + 1];
+            : (*pendsHandle)[iPoly + 1];
         if (endIndex < startIndex || endIndex >= static_cast<Int32> (coordCount))
             return {};
         startEndIndices.emplace_back (startIndex, endIndex);
         std::vector<API_Coord>& coords = polygons[iPoly].coords;
         coords.reserve (endIndex - startIndex + 1);
         for (GSIndex iCoord = startIndex; iCoord <= endIndex; ++iCoord) {
-            const API_Coord coordinate = (*memo.coords)[iCoord];
+            const API_Coord coordinate = (*coordsHandle)[iCoord];
             if (!std::isfinite (coordinate.x) || !std::isfinite (coordinate.y))
                 return {};
             coords.push_back (coordinate);
@@ -252,7 +249,7 @@ std::vector<PolygonData> GetPolygonsFromMemoCoords (const API_Guid& elemGuid, bo
             std::vector<double>& zCoords = polygons[iPoly].zCoords;
             zCoords.reserve (endIndex - startIndex + 1);
             for (GSIndex iCoord = startIndex; iCoord <= endIndex; ++iCoord) {
-                const double z = (*memo.meshPolyZ)[iCoord];
+                const double z = (*zCoordsHandle)[iCoord];
                 if (!std::isfinite (z))
                     return {};
                 zCoords.push_back (z);
@@ -261,18 +258,18 @@ std::vector<PolygonData> GetPolygonsFromMemoCoords (const API_Guid& elemGuid, bo
         startIndex = endIndex + 1;
     }
 
-    if (memo.parcs == nullptr)
+    if (parcsHandle == nullptr)
         return polygons;
-    if (*memo.parcs == nullptr)
+    if (*parcsHandle == nullptr)
         return {};
-    const GSSize parcsBytes = BMhGetSize (reinterpret_cast<GSHandle> (memo.parcs));
+    const GSSize parcsBytes = BMhGetSize (reinterpret_cast<GSHandle> (parcsHandle));
     if (parcsBytes < 0 || parcsBytes % static_cast<GSSize> (sizeof (API_PolyArc)) != 0)
         return {};
     const GSSize nArcs = parcsBytes / sizeof (API_PolyArc);
     if (nArcs > maxMemoArcs)
         return {};
     for (GSIndex iArc = 0; iArc < nArcs; ++iArc) {
-        API_PolyArc arc = (*memo.parcs)[iArc];
+        API_PolyArc arc = (*parcsHandle)[iArc];
         if (arc.begIndex < 1 || arc.endIndex < arc.begIndex ||
             arc.endIndex >= static_cast<Int32> (coordCount) || !std::isfinite (arc.arcAngle))
             return {};
@@ -294,6 +291,16 @@ std::vector<PolygonData> GetPolygonsFromMemoCoords (const API_Guid& elemGuid, bo
     } catch (const std::bad_alloc&) {
         return {};
     }
+}
+
+std::vector<PolygonData> GetPolygonsFromMemoCoords (const API_Guid& elemGuid, bool includeZCoords)
+{
+    API_ElementMemo memo = {};
+    const GS::OnExit guard ([&memo] () { ACAPI_DisposeElemMemoHdls (&memo); });
+    const UInt64 mask = includeZCoords ? APIMemoMask_Polygon | APIMemoMask_MeshPolyZ : APIMemoMask_Polygon;
+    if (ACAPI_Element_GetMemo (elemGuid, &memo, mask) != NoError)
+        return {};
+    return GetPolygonsFromMemoHandles (memo.coords, memo.pends, memo.parcs, memo.meshPolyZ, includeZCoords);
 }
 
 void AddPolygonFromMemoCoords (const API_Guid& elemGuid, GS::ObjectState& os, const GS::String& coordsFieldName, const GS::Optional<GS::String>& arcsFieldName)
@@ -377,6 +384,62 @@ void AddPolygonWithHolesFromMemoCoords (const API_Guid& elemGuid, GS::ObjectStat
 
         holes (hole);
     }
+}
+
+bool AddAdditionalPolygonWithHolesFromMemoCoords (const API_Guid& elemGuid, GS::ObjectState& os, const GS::String& coordsFieldName, const GS::Optional<GS::String>& arcsFieldName, const GS::String& holesArrayFieldName, const GS::String& holeCoordsFieldName, const GS::Optional<GS::String>& holeArcsFieldName)
+{
+    API_ElementMemo memo = {};
+    const GS::OnExit guard ([&memo] () { ACAPI_DisposeElemMemoHdls (&memo); });
+
+    // For Zones this memo is the native found polygon.  AC25 documents it as
+    // output-only and explicitly permits a null handle when no polygon was
+    // found; neither condition is a reason to synthesize ordinary geometry.
+    if (ACAPI_Element_GetMemo (elemGuid, &memo, APIMemoMask_AdditionalPolygon) != NoError
+        || memo.additionalPolyCoords == nullptr || *memo.additionalPolyCoords == nullptr
+        || memo.additionalPolyPends == nullptr || *memo.additionalPolyPends == nullptr) {
+        return false;
+    }
+
+    const std::vector<PolygonData> polygons = GetPolygonsFromMemoHandles (
+        memo.additionalPolyCoords,
+        memo.additionalPolyPends,
+        memo.additionalPolyParcs,
+        nullptr,
+        false);
+    // A malformed additional memo must not leak a partial ring.  Keep the
+    // unavailable result explicit at the caller instead.
+    if (polygons.empty () || polygons[0].coords.size () < 3)
+        return false;
+    for (const PolygonData& polygon : polygons) {
+        if (polygon.coords.size () < 3)
+            return false;
+    }
+
+    const auto& coords = os.AddList<GS::ObjectState> (coordsFieldName);
+    const auto& holes = os.AddList<GS::ObjectState> (holesArrayFieldName);
+    for (const API_Coord& coord : polygons[0].coords)
+        coords (Create2DCoordinateObjectState (coord));
+
+    if (arcsFieldName.HasValue () && !polygons[0].arcs.empty ()) {
+        const auto& arcs = os.AddList<GS::ObjectState> (*arcsFieldName);
+        for (const API_PolyArc& arc : polygons[0].arcs)
+            arcs (CreatePolyArcObjectState (arc));
+    }
+
+    for (size_t i = 1; i < polygons.size (); ++i) {
+        GS::ObjectState hole;
+        const auto& holeCoords = hole.AddList<GS::ObjectState> (holeCoordsFieldName);
+        for (const API_Coord& coord : polygons[i].coords)
+            holeCoords (Create2DCoordinateObjectState (coord));
+
+        if (holeArcsFieldName.HasValue () && !polygons[i].arcs.empty ()) {
+            const auto& holeArcs = hole.AddList<GS::ObjectState> (*holeArcsFieldName);
+            for (const API_PolyArc& arc : polygons[i].arcs)
+                holeArcs (CreatePolyArcObjectState (arc));
+        }
+        holes (hole);
+    }
+    return true;
 }
 
 bool GetHoleGeometry (const GS::ObjectState& holeOs, GS::Array<GS::ObjectState>& outCoords, GS::Array<GS::ObjectState>& outArcs)

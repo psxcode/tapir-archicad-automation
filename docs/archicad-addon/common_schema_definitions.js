@@ -2643,6 +2643,14 @@ var gSchemaDefinitions = {
         "type": "object",
         "description": "A 2D hole in an element defined by closed polylines",
         "properties": {
+            "polygonCoordinates": {
+                "type": "array",
+                "description": "Legacy alias for the 2D coordinates of the edge of the hole.",
+                "items": {
+                    "$ref": "#/Coordinate2D"
+                },
+                "minItems": 3
+            },
             "polygonOutline": {
                 "type": "array",
                 "description": "The 2D coordinates of the edge of the hole.",
@@ -2660,8 +2668,17 @@ var gSchemaDefinitions = {
             }
         },
         "additionalProperties": false,
-        "required": [
-            "polygonCoordinates"
+        "oneOf": [
+            {
+                "required": [
+                    "polygonCoordinates"
+                ]
+            },
+            {
+                "required": [
+                    "polygonOutline"
+                ]
+            }
         ]
     },
     "Holes2D": {
@@ -3111,6 +3128,10 @@ var gSchemaDefinitions = {
                 "$ref": "#/AttributeId",
                 "description": "The identifier of the zone category attribute."
             },
+            "referencePosition": {
+                "$ref": "#/Coordinate2D",
+                "description": "Native Zone reference position (`refPos`) used by Archicad to find an automatic Zone boundary. Output-only; it is separate from the Zone stamp position."
+            },
             "stampPosition": {
                 "$ref": "#/Coordinate2D",
                 "description": "Position of the origin of the zone stamp."
@@ -3126,6 +3147,33 @@ var gSchemaDefinitions = {
             "isManual": {
                 "type": "boolean",
                 "description": "Is the coordinates of the zone manually placed?"
+            },
+            "foundPolygonStatus": {
+                "type": "string",
+                "enum": [
+                    "available",
+                    "unavailable"
+                ],
+                "description": "Status of the optional AC25 native found-polygon read. unavailable means the native memo was absent, invalid, or could not be read."
+            },
+            "foundPolygonOutline": {
+                "type": "array",
+                "description": "Optional AC25 native found-polygon outline. This is output-only evidence and is omitted when foundPolygonStatus is unavailable.",
+                "items": {
+                    "$ref": "#/Coordinate2D"
+                },
+                "minItems": 3
+            },
+            "foundPolygonArcs": {
+                "type": "array",
+                "description": "Arcs for the optional AC25 native found-polygon outline.",
+                "items": {
+                    "$ref": "#/PolyArc"
+                }
+            },
+            "foundPolygonHoles": {
+                "$ref": "#/Holes2D",
+                "description": "Holes in the optional AC25 native found polygon."
             },
             "polygonOutline": {
                 "type": "array",

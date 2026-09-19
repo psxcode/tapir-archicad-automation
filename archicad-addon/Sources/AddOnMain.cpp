@@ -573,6 +573,10 @@ GSErrCode Initialize (void)
             elementCommands, "1.0.0",
             "Atomically replaces one simulated multiline Text cluster with one wrapped Text element."
         );
+        err |= RegisterCommand<UpdateAutomaticZoneGeometryCommand> (
+            elementCommands, "1.0.0",
+            "Developer-only, one-zone automatic geometry refresh/recreate transaction; not exposed through Production MCP."
+        );
         err |= RegisterCommand<ModifyWindowsCommand> (
             elementCommands, "1.4.0",
             "Modifies Window elements based on the given parameters."

@@ -72,3 +72,19 @@ public:
     virtual GS::Optional<GS::UniString> GetRawResponseSchema () const override;
     virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
 };
+
+// Developer-only automatic Zone refresh abstraction.  AC28's
+// ZoneBoundaryQuery::Modifier::Update is diagnostic/calculated-boundary
+// evidence, so the portable native implementation currently uses one
+// undoable create-then-delete transaction.  The command owns the fallback so
+// TypeScript never dispatches CreateZones and DeleteElements independently.
+class UpdateAutomaticZoneGeometryCommand : public CommandBase
+{
+public:
+    UpdateAutomaticZoneGeometryCommand ();
+    virtual GS::String GetName () const override;
+    virtual GS::Optional<GS::UniString> GetInputParametersSchema () const override;
+    virtual GS::Optional<GS::UniString> GetResponseSchema () const override;
+    virtual GS::Optional<GS::UniString> GetRawResponseSchema () const override;
+    virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
+};

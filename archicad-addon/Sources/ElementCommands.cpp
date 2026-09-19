@@ -22,8 +22,183 @@
 #include <cstring>
 #include <limits>
 #include <new>
+#include <vector>
 
 namespace {
+
+constexpr double ZonePolygonEpsilon = 1.0e-9;
+
+bool ReadFiniteZoneCoordinate (const GS::ObjectState& value, API_Coord& coordinate)
+{
+    double x = 0.0;
+    double y = 0.0;
+    if (!value.Get ("x", x) || !value.Get ("y", y) || !std::isfinite (x) || !std::isfinite (y))
+        return false;
+    coordinate.x = x;
+    coordinate.y = y;
+    return true;
+}
+
+double ZonePolygonCross (const API_Coord& a, const API_Coord& b, const API_Coord& c)
+{
+    return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);
+}
+
+bool IsZonePointOnSegment (const API_Coord& point, const API_Coord& begin, const API_Coord& end)
+{
+    if (std::abs (ZonePolygonCross (begin, end, point)) > ZonePolygonEpsilon)
+        return false;
+    return point.x >= std::min (begin.x, end.x) - ZonePolygonEpsilon
+        && point.x <= std::max (begin.x, end.x) + ZonePolygonEpsilon
+        && point.y >= std::min (begin.y, end.y) - ZonePolygonEpsilon
+        && point.y <= std::max (begin.y, end.y) + ZonePolygonEpsilon;
+}
+
+bool AreZoneSegmentsIntersecting (const API_Coord& a, const API_Coord& b, const API_Coord& c, const API_Coord& d)
+{
+    const double abC = ZonePolygonCross (a, b, c);
+    const double abD = ZonePolygonCross (a, b, d);
+    const double cdA = ZonePolygonCross (c, d, a);
+    const double cdB = ZonePolygonCross (c, d, b);
+    const bool abOpposite = (abC > ZonePolygonEpsilon && abD < -ZonePolygonEpsilon)
+        || (abC < -ZonePolygonEpsilon && abD > ZonePolygonEpsilon);
+    const bool cdOpposite = (cdA > ZonePolygonEpsilon && cdB < -ZonePolygonEpsilon)
+        || (cdA < -ZonePolygonEpsilon && cdB > ZonePolygonEpsilon);
+    if (abOpposite && cdOpposite)
+        return true;
+    return (std::abs (abC) <= ZonePolygonEpsilon && IsZonePointOnSegment (c, a, b))
+        || (std::abs (abD) <= ZonePolygonEpsilon && IsZonePointOnSegment (d, a, b))
+        || (std::abs (cdA) <= ZonePolygonEpsilon && IsZonePointOnSegment (a, c, d))
+        || (std::abs (cdB) <= ZonePolygonEpsilon && IsZonePointOnSegment (b, c, d));
+}
+
+bool IsSimpleZonePolygon (const std::vector<API_Coord>& coordinates)
+{
+    const GSSize count = static_cast<GSSize> (coordinates.size ());
+    if (count < 3)
+        return false;
+    for (GSSize first = 0; first < count; ++first) {
+        const GSSize nextFirst = (first + 1) % count;
+        for (GSSize second = first + 1; second < count; ++second) {
+            const GSSize nextSecond = (second + 1) % count;
+            // Adjacent edges share an endpoint by definition.  The first and
+            // last edges are adjacent as well and must not be treated as a
+            // self-intersection.
+            if (first == second || nextFirst == second || nextSecond == first)
+                continue;
+            if (AreZoneSegmentsIntersecting (coordinates[first], coordinates[nextFirst], coordinates[second], coordinates[nextSecond]))
+                return false;
+        }
+    }
+    return true;
+}
+
+double SignedZonePolygonArea (const std::vector<API_Coord>& coordinates)
+{
+    if (coordinates.size () < 3)
+        return 0.0;
+    const GSSize count = (coordinates.size () > 1 && IsSame2DCoordinate (coordinates.front (), coordinates.back ()))
+        ? static_cast<GSSize> (coordinates.size () - 1)
+        : static_cast<GSSize> (coordinates.size ());
+    double twiceArea = 0.0;
+    for (GSSize index = 0; index < count; ++index) {
+        const GSSize next = (index + 1) % count;
+        twiceArea += coordinates[index].x * coordinates[next].y - coordinates[next].x * coordinates[index].y;
+    }
+    return twiceArea;
+}
+
+GS::Optional<GS::UniString> BuildZonePolygonMemo (
+    API_Element& element,
+    API_ElementMemo& memo,
+    const GS::ObjectState& geometry,
+    const bool allowAutomaticZoneProbe = false)
+{
+    if (!element.zone.manual && !allowAutomaticZoneProbe)
+        return "Zone polygon memo updates require an existing manual Zone; automatic Zones are rejected.";
+    if (element.zone.poly.nSubPolys != 1 || element.zone.poly.nArcs != 0)
+        return "Zone polygon memo updates support one ordinary outer polygon without holes or arcs.";
+
+    GS::Array<GS::ObjectState> coordinateStates;
+    if (!geometry.Get ("polygonCoordinates", coordinateStates))
+        return "Zone polygon memo geometry requires polygonCoordinates.";
+    GS::Array<GS::ObjectState> arcs;
+    if (geometry.Contains ("polygonArcs") && !geometry.Get ("polygonArcs", arcs))
+        return "Zone polygon memo polygonArcs must be an array.";
+    GS::Array<GS::ObjectState> holes;
+    if (geometry.Contains ("holes") && !geometry.Get ("holes", holes))
+        return "Zone polygon memo holes must be an array.";
+    if (!arcs.IsEmpty ())
+        return "Zone polygon memo updates reject polygon arcs.";
+    if (!holes.IsEmpty ())
+        return "Zone polygon memo updates reject holes.";
+
+    if (coordinateStates.GetSize () > 1 && IsSame2DCoordinate (coordinateStates.GetFirst (), coordinateStates.GetLast ()))
+        coordinateStates.Pop ();
+    if (coordinateStates.GetSize () < 3)
+        return "Zone polygon memo requires at least three distinct outer coordinates.";
+
+    std::vector<API_Coord> coordinates;
+    coordinates.reserve (coordinateStates.GetSize ());
+    for (const GS::ObjectState& state : coordinateStates) {
+        API_Coord coordinate = {};
+        if (!ReadFiniteZoneCoordinate (state, coordinate))
+            return "Zone polygon memo coordinates must contain finite x and y values.";
+        for (const API_Coord& previous : coordinates) {
+            if (IsSame2DCoordinate (previous, coordinate))
+                return "Zone polygon memo coordinates must be unique.";
+        }
+        coordinates.push_back (coordinate);
+    }
+
+    if (!IsSimpleZonePolygon (coordinates))
+        return "Zone polygon memo coordinates must keep a simple outer polygon topology.";
+    const double newArea = SignedZonePolygonArea (coordinates);
+    if (std::abs (newArea) <= ZonePolygonEpsilon)
+        return "Zone polygon memo coordinates must enclose a non-zero area.";
+
+    // Re-read the current memo independently of the API_Element header.  The
+    // candidate writer may move vertices, but it cannot add/remove contours,
+    // change the vertex count, or reverse the existing winding.
+    const std::vector<PolygonData> currentPolygons = GetPolygonsFromMemoCoords (element.header.guid);
+    if (currentPolygons.size () != 1 || !currentPolygons.front ().arcs.empty ())
+        return "The existing Zone polygon memo is unavailable or has unsupported topology.";
+    const std::vector<API_Coord>& currentCoordinates = currentPolygons.front ().coords;
+    const GSSize currentUniqueCount = currentCoordinates.size () > 1
+        && IsSame2DCoordinate (currentCoordinates.front (), currentCoordinates.back ())
+        ? static_cast<GSSize> (currentCoordinates.size () - 1)
+        : static_cast<GSSize> (currentCoordinates.size ());
+    if (currentUniqueCount != static_cast<GSSize> (coordinates.size ()) || currentUniqueCount + 1 != static_cast<GSSize> (element.zone.poly.nCoords))
+        return "Zone polygon memo updates cannot change the existing vertex topology.";
+    const double currentArea = SignedZonePolygonArea (currentCoordinates);
+    if (std::abs (currentArea) <= ZonePolygonEpsilon || (currentArea < 0.0) != (newArea < 0.0))
+        return "Zone polygon memo updates must preserve the existing polygon winding.";
+
+    const GSSize maxInt32 = static_cast<GSSize> (std::numeric_limits<Int32>::max ());
+    if (coordinates.size () > maxInt32 - 1)
+        return "Zone polygon memo dimensions exceed the supported range.";
+    const GSSize coordMemoCount = static_cast<GSSize> (coordinates.size ()) + 2; // index 0 is unused; last point closes the ring
+    if (coordMemoCount > std::numeric_limits<GSSize>::max () / sizeof (API_Coord))
+        return "Zone polygon memo dimensions exceed the supported range.";
+    memo.coords = reinterpret_cast<API_Coord**> (BMAllocateHandle (coordMemoCount * sizeof (API_Coord), ALLOCATE_CLEAR, 0));
+    memo.pends = reinterpret_cast<Int32**> (BMAllocateHandle (static_cast<GSSize> (2) * sizeof (Int32), ALLOCATE_CLEAR, 0));
+    if (memo.coords == nullptr || *memo.coords == nullptr || memo.pends == nullptr || *memo.pends == nullptr)
+        return "Failed to allocate Zone polygon memo data.";
+
+    Int32 iCoord = 1;
+    Int32 iArc = 0;
+    Int32 iPends = 1;
+    const GSErrCode memoError = AddPolyToMemo (coordinateStates, arcs, iCoord, iArc, iPends, memo);
+    if (memoError != NoError)
+        return GS::UniString::Printf ("Failed to populate Zone polygon memo data (error %d).", memoError);
+
+    // Keep every non-geometric Zone setting from the exact ACAPI_Element_Get
+    // result.  The caller sets only API_ZoneType::poly in the element mask.
+    element.zone.poly.nCoords = static_cast<Int32> (coordinates.size () + 1);
+    element.zone.poly.nSubPolys = 1;
+    element.zone.poly.nArcs = 0;
+    return {};
+}
 
 static bool IsFiniteBounds (const API_Box3D& bounds)
 {
@@ -509,6 +684,11 @@ GS::Optional<GS::UniString> GetDetailsOfElementsCommand::GetInputParametersSchem
                 "type": "string",
                 "enum": ["full", "drafting"]
             },
+            "includeFoundPolygon": {
+                "type": "boolean",
+                "description": "Read the AC25-tested Zone found-polygon memo as separate output-only evidence. Defaults to false.",
+                "default": false
+            },
             "pageSize": {
                 "type": "integer",
                 "minimum": 1
@@ -833,6 +1013,8 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
     GS::UniString detailProfile;
     parameters.Get ("detailProfile", detailProfile);
     const bool draftingProfile = detailProfile == "drafting";
+    bool includeFoundPolygon = false;
+    parameters.Get ("includeFoundPolygon", includeFoundPolygon);
 
     GS::ObjectState response;
     const auto& detailsOfElements = response.AddList<GS::ObjectState> ("detailsOfElements");
@@ -996,11 +1178,27 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                     }
                     typeSpecificDetails.Add ("categoryAttributeId", CreateGuidObjectState (categoryAttributeGuid));
                 }
+                // `refPos` is the native automatic-Zone seed.  Keep it as a
+                // separate output-only coordinate so a consumer can
+                // distinguish the stamp placement from the point Archicad
+                // uses to find the Zone boundary.
+                typeSpecificDetails.Add ("referencePosition", Create2DCoordinateObjectState (elem.zone.refPos));
                 typeSpecificDetails.Add ("stampPosition", Create2DCoordinateObjectState (elem.zone.pos));
                 typeSpecificDetails.Add ("stampAngle", elem.zone.stampAngle);
                 typeSpecificDetails.Add ("fixedStampAngle", elem.zone.fixedAngle);
                 typeSpecificDetails.Add ("isManual", elem.zone.manual);
                 typeSpecificDetails.Add ("zCoordinate", GetZPos (elem.header.floorInd, elem.zone.roomBaseLev, stories));
+                if (includeFoundPolygon) {
+                    const bool foundPolygonAvailable = AddAdditionalPolygonWithHolesFromMemoCoords (
+                        elem.header.guid,
+                        typeSpecificDetails,
+                        "foundPolygonOutline",
+                        "foundPolygonArcs",
+                        "foundPolygonHoles",
+                        "polygonOutline",
+                        "polygonArcs");
+                    typeSpecificDetails.Add ("foundPolygonStatus", foundPolygonAvailable ? "available" : "unavailable");
+                }
                 {
                     PerfTrace::ScopeTimer timer (PerfTrace::Phase::TypeMemo);
                     AddPolygonWithHolesFromMemoCoords (elem.header.guid, typeSpecificDetails, "polygonOutline", "polygonArcs", "holes", "polygonOutline", "polygonArcs");
@@ -1901,6 +2099,10 @@ GS::ObjectState SetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
             details->Get ("drawIndex", drwIndexTarget);
 
             const GS::ObjectState* typeSpecificDetails = details->Get ("typeSpecificDetails");
+            API_ElementMemo clipMemo = {};
+            const GS::OnExit clipMemoGuard ([&clipMemo] () { ACAPI_DisposeElemMemoHdls (&clipMemo); });
+            UInt64 memoMask = 0;
+            bool hasMemoChanges = false;
             if (typeSpecificDetails != nullptr) {
                 switch (GetElemTypeId (elem.header)) {
                     case API_WallID: {
@@ -1935,6 +2137,19 @@ GS::ObjectState SetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                         }
                     } break;
                     case API_ZoneID: {
+                        const GS::ObjectState* geometry = typeSpecificDetails->Get ("geometry");
+                        if (geometry != nullptr) {
+                            bool allowAutomaticZoneProbe = false;
+                            typeSpecificDetails->Get ("allowAutomaticZonePolygonProbe", allowAutomaticZoneProbe);
+                            const GS::Optional<GS::UniString> memoError = BuildZonePolygonMemo (elem, clipMemo, *geometry, allowAutomaticZoneProbe);
+                            if (memoError.HasValue ()) {
+                                executionResults (CreateFailedExecutionResult (APIERR_BADPARS, memoError.Get ()));
+                                continue;
+                            }
+                            ACAPI_ELEMENT_MASK_SET (mask, API_ZoneType, poly);
+                            memoMask = APIMemoMask_Polygon;
+                            hasMemoChanges = true;
+                        }
                         const GS::ObjectState* stampPosition = typeSpecificDetails->Get ("stampPosition");
                         if (stampPosition != nullptr) {
                             elem.zone.pos = Get2DCoordinateFromObjectState (*stampPosition);
@@ -2039,11 +2254,6 @@ GS::ObjectState SetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                 }
                 hasElementChanges = true;
             }
-
-            API_ElementMemo clipMemo = {};
-            const GS::OnExit clipMemoGuard ([&clipMemo] () { ACAPI_DisposeElemMemoHdls (&clipMemo); });
-            UInt64 memoMask = 0;
-            bool hasMemoChanges = false;
 
             if (typeSpecificDetails != nullptr && GetElemTypeId (elem.header) == API_DrawingID) {
                 GS::Array<GS::ObjectState> clipCoords;
