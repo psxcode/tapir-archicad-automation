@@ -4,6 +4,7 @@
 #include "ElementCreationCommands.hpp"
 #include "ExtendedElementCommands.hpp"
 #include "MigrationHelper.hpp"
+#include "NativeOwnership.hpp"
 #include "NativeRichTextMemo.hpp"
 #include "NotificationCommands.hpp"
 
@@ -15,6 +16,16 @@
 namespace {
 
 constexpr GSSize MaxMutationItems = 256;
+
+// This is a compile-time, disposable-test-only seam.  It is deliberately not
+// read from semanticMetadata or any caller payload: production APX builds keep
+// it disabled, and only an internal test build can request the rollback after
+// the first successfully applied item.
+#if defined(TAPIR_NATIVE_CRUD_TEST_FAULT_AFTER_FIRST_APPLIED)
+constexpr bool NativeCrudTestFaultAfterFirstApplied = true;
+#else
+constexpr bool NativeCrudTestFaultAfterFirstApplied = false;
+#endif
 
 struct ElementTypeSpec {
     API_ElemTypeID typeID;
@@ -462,7 +473,7 @@ GS::Optional<GS::UniString> ValidateAllowedPayloadFields (
     const char* operationName = isCreate ? "create" : "update";
 
     static const char* knownFields[] = {
-        "begCoordinate", "endCoordinate", "coordinates", "origin", "floorIndex", "zCoordinate", "level",
+        "begCoordinate", "endCoordinate", "coordinates", "origin", "floorIndex", "storyIndex", "zCoordinate", "elevation", "level",
         "height", "width", "depth", "thickness", "bottomOffset", "offset", "slantAngle", "arcAngle",
         "verticalCurveHeight", "axisRotationAngle", "profileAngle", "referenceLineLocation", "referencePlaneLocation",
         "structureType", "buildingMaterialId", "compositeId", "profileId", "anchorPoint", "coreAnchor",
@@ -496,8 +507,8 @@ GS::Optional<GS::UniString> ValidateAllowedPayloadFields (
             });
         }
         return rejectUnsupportedFields ({
-                "begCoordinate", "endCoordinate", "arcAngle", "height", "thickness", "bottomOffset", "offset",
-                "structureType", "buildingMaterialId", "compositeId", "profileId"
+                "begCoordinate", "endCoordinate", "storyIndex", "elevation", "arcAngle", "height", "thickness", "bottomOffset", "offset",
+                "referenceLineLocation", "structureType", "buildingMaterialId", "compositeId", "profileId"
         });
     } else if (typeID == API_SlabID) {
         if (isCreate) {
@@ -562,7 +573,7 @@ GS::Optional<GS::UniString> ValidateTextPayload (
         API_TextType textData = {};
         GS::UniString richTextError;
         const GSErrCode memoError = NativeRichTextMemo::BuildMemo (*richText, memo, textData, richTextError);
-        ACAPI_DisposeElemMemoHdls (&memo);
+        NativeMemoGuard memoGuard (memo);
         if (memoError != NoError) {
             return richTextError.IsEmpty ()
                 ? GS::UniString::Printf ("The 'richText' payload is invalid (error %d).", memoError)
@@ -670,8 +681,14 @@ GS::Optional<GS::UniString> ValidatePayload (
 
     if (typeID == API_WallID) {
         if (!isCreate && (payload.Contains ("floorIndex") || payload.Contains ("zCoordinate"))) {
-            return "Wall update uses 'bottomOffset'; floorIndex/zCoordinate are creation fields.";
+            return "Wall update uses canonical storyIndex/elevation; floorIndex/zCoordinate are creation fields.";
         }
+        error = ValidateIntegerField (payload, "storyIndex");
+        if (error.HasValue ()) return error;
+        error = ValidateFloorIndexField (payload, "storyIndex");
+        if (error.HasValue ()) return error;
+        error = ValidateFiniteNumberField (payload, "elevation");
+        if (error.HasValue ()) return error;
         error = ValidateEnumField (payload, "referenceLineLocation", {
             "Outside", "Center", "Inside", "CoreOutside", "CoreCenter", "CoreInside"
         });
@@ -1032,6 +1049,298 @@ GS::ObjectState ExecuteDraftingUpdate (
     return response;
 }
 
+GS::Optional<GS::UniString> ResolveNativeWallAttributeIndex (
+    const GS::ObjectState& details,
+    const char* fieldName,
+    const API_AttrTypeID attributeType,
+    API_AttributeIndex& attributeIndex)
+{
+    const GS::ObjectState* attributeID = details.Get (fieldName);
+    if (attributeID == nullptr)
+        return {};
+
+    API_Attribute attribute = {};
+    attribute.header.typeID = attributeType;
+    attribute.header.guid = GetGuidFromObjectState (*attributeID);
+    if (attribute.header.guid == APINULLGuid || ACAPI_Attribute_Get (&attribute) != NoError)
+        return GS::UniString::Printf ("Invalid attribute reference in '%s'.", fieldName);
+
+    attributeIndex = attribute.header.index;
+    return {};
+}
+
+GS::Optional<GS::UniString> ApplyNativeCrudWallStructure (
+    API_Element& element,
+    API_Element& mask,
+    const GS::ObjectState& details,
+    bool& changed)
+{
+    const bool hasBuildingMaterial = details.Contains ("buildingMaterialId");
+    const bool hasComposite = details.Contains ("compositeId");
+    const bool hasProfile = details.Contains ("profileId");
+    const int referenceCount = static_cast<int> (hasBuildingMaterial)
+        + static_cast<int> (hasComposite)
+        + static_cast<int> (hasProfile);
+    if (referenceCount > 1)
+        return "Only one of 'buildingMaterialId', 'compositeId' or 'profileId' may be provided at a time.";
+
+    API_AttributeIndex buildingMaterial = APIInvalidAttributeIndex;
+    API_AttributeIndex composite = APIInvalidAttributeIndex;
+    API_AttributeIndex profile = APIInvalidAttributeIndex;
+    auto error = ResolveNativeWallAttributeIndex (details, "buildingMaterialId", API_BuildingMaterialID, buildingMaterial);
+    if (error.HasValue ()) return error;
+    error = ResolveNativeWallAttributeIndex (details, "compositeId", API_CompWallID, composite);
+    if (error.HasValue ()) return error;
+    error = ResolveNativeWallAttributeIndex (details, "profileId", API_ProfileID, profile);
+    if (error.HasValue ()) return error;
+
+    GS::UniString structureType;
+    const bool hasStructureType = details.Contains ("structureType");
+    if (hasStructureType && !details.Get ("structureType", structureType))
+        return "'structureType' must be a string enum.";
+    if (!hasStructureType) {
+        if (hasBuildingMaterial) structureType = "Basic";
+        else if (hasComposite) structureType = "Composite";
+        else if (hasProfile) structureType = "Profile";
+    }
+    if (structureType.IsEmpty ())
+        return {};
+    if (structureType != "Basic" && structureType != "Composite" && structureType != "Profile")
+        return "Invalid 'structureType'. Use 'Basic', 'Composite' or 'Profile'.";
+    if (structureType == "Composite" && !hasComposite)
+        return "'structureType=Composite' requires 'compositeId'.";
+    if (structureType == "Profile" && !hasProfile)
+        return "'structureType=Profile' requires 'profileId'.";
+    if (structureType == "Basic" && (hasComposite || hasProfile))
+        return "'structureType=Basic' cannot be combined with 'compositeId' or 'profileId'.";
+    if (structureType == "Composite" && (hasBuildingMaterial || hasProfile))
+        return "'structureType=Composite' cannot be combined with 'buildingMaterialId' or 'profileId'.";
+    if (structureType == "Profile" && (hasBuildingMaterial || hasComposite))
+        return "'structureType=Profile' cannot be combined with 'buildingMaterialId' or 'compositeId'.";
+
+    if (structureType == "Basic") {
+        element.wall.modelElemStructureType = API_BasicStructure;
+        if (hasBuildingMaterial) element.wall.buildingMaterial = buildingMaterial;
+        element.wall.composite = APIInvalidAttributeIndex;
+        element.wall.profileAttr = APIInvalidAttributeIndex;
+        if (element.wall.type == APIWtyp_Poly) element.wall.type = APIWtyp_Normal;
+    } else if (structureType == "Composite") {
+        element.wall.modelElemStructureType = API_CompositeStructure;
+        element.wall.composite = composite;
+        element.wall.profileAttr = APIInvalidAttributeIndex;
+        if (element.wall.type == APIWtyp_Poly) element.wall.type = APIWtyp_Normal;
+    } else {
+        element.wall.modelElemStructureType = API_ProfileStructure;
+        element.wall.profileAttr = profile;
+    }
+
+    ACAPI_ELEMENT_MASK_SET (mask, API_WallType, modelElemStructureType);
+    ACAPI_ELEMENT_MASK_SET (mask, API_WallType, buildingMaterial);
+    ACAPI_ELEMENT_MASK_SET (mask, API_WallType, composite);
+    ACAPI_ELEMENT_MASK_SET (mask, API_WallType, profileAttr);
+    ACAPI_ELEMENT_MASK_SET (mask, API_WallType, type);
+    changed = true;
+    return {};
+}
+
+GS::Optional<GS::UniString> ApplyNativeCrudWallPlacement (
+    API_Element& element,
+    API_Element& mask,
+    const GS::ObjectState& details,
+    const Stories& stories,
+    bool& changed)
+{
+    const bool hasStoryIndex = details.Contains ("storyIndex");
+    const bool hasElevation = details.Contains ("elevation");
+    if (!hasStoryIndex && !hasElevation)
+        return {};
+    if (stories.empty ())
+        return "Story settings are unavailable; Wall placement cannot be updated.";
+
+    const short currentStoryIndex = element.header.floorInd;
+    if (!hasStoryIndex && stories.find (currentStoryIndex) == stories.end())
+        return "The Wall current story is unavailable; absolute elevation cannot be resolved.";
+
+    short targetStoryIndex = currentStoryIndex;
+    Int32 requestedStoryIndex = 0;
+    if (hasStoryIndex) {
+        if (!details.Get ("storyIndex", requestedStoryIndex)
+            || requestedStoryIndex < static_cast<Int32> (std::numeric_limits<short>::min ())
+            || requestedStoryIndex > static_cast<Int32> (std::numeric_limits<short>::max ()))
+            return "'storyIndex' is outside the Archicad story-index range.";
+        targetStoryIndex = static_cast<short> (requestedStoryIndex);
+        if (stories.find (targetStoryIndex) == stories.end())
+            return "Unknown Archicad story index in 'storyIndex'.";
+    }
+
+    const double currentElevation = GetZPos (currentStoryIndex, element.wall.bottomOffset, stories);
+    double targetElevation = currentElevation;
+    if (hasElevation) {
+        if (!details.Get ("elevation", targetElevation) || !std::isfinite (targetElevation))
+            return "'elevation' must be a finite real number.";
+    }
+    const double targetBottomOffset = targetElevation - GetZPos (targetStoryIndex, 0.0, stories);
+    if (!std::isfinite (targetBottomOffset))
+        return "Wall placement resolved to a non-finite bottom offset.";
+
+    element.header.floorInd = targetStoryIndex;
+    element.wall.bottomOffset = targetBottomOffset;
+    ACAPI_ELEMENT_MASK_SET (mask, API_Elem_Head, floorInd);
+    ACAPI_ELEMENT_MASK_SET (mask, API_WallType, bottomOffset);
+    changed = true;
+    return {};
+}
+
+bool ApplyNativeCrudWallDetails (
+    API_Element& element,
+    API_Element& mask,
+    const GS::ObjectState& details,
+    bool& changed)
+{
+    const GS::ObjectState* begCoordinate = details.Get ("begCoordinate");
+    if (begCoordinate != nullptr) {
+        element.wall.begC = Get2DCoordinateFromObjectState (*begCoordinate);
+        ACAPI_ELEMENT_MASK_SET (mask, API_WallType, begC);
+        changed = true;
+    }
+    const GS::ObjectState* endCoordinate = details.Get ("endCoordinate");
+    if (endCoordinate != nullptr) {
+        element.wall.endC = Get2DCoordinateFromObjectState (*endCoordinate);
+        ACAPI_ELEMENT_MASK_SET (mask, API_WallType, endC);
+        changed = true;
+    }
+    double arcAngle = 0.0;
+    if (details.Get ("arcAngle", arcAngle)) {
+        element.wall.angle = arcAngle;
+        ACAPI_ELEMENT_MASK_SET (mask, API_WallType, angle);
+        changed = true;
+    }
+    double height = 0.0;
+    if (details.Get ("height", height)) {
+        element.wall.height = height;
+        element.wall.relativeTopStory = 0;
+        ACAPI_ELEMENT_MASK_SET (mask, API_WallType, height);
+        ACAPI_ELEMENT_MASK_SET (mask, API_WallType, relativeTopStory);
+        changed = true;
+    }
+    double offset = 0.0;
+    if (details.Get ("offset", offset)) {
+        element.wall.offset = offset;
+        ACAPI_ELEMENT_MASK_SET (mask, API_WallType, offset);
+        changed = true;
+    }
+    double thickness = 0.0;
+    if (details.Get ("thickness", thickness)) {
+        element.wall.thickness = thickness;
+        ACAPI_ELEMENT_MASK_SET (mask, API_WallType, thickness);
+        changed = true;
+    }
+    GS::UniString referenceLineLocation;
+    if (details.Get ("referenceLineLocation", referenceLineLocation)) {
+        if (referenceLineLocation == "Outside") {
+            element.wall.referenceLineLocation = APIWallRefLine_Outside;
+        } else if (referenceLineLocation == "Center") {
+            element.wall.referenceLineLocation = APIWallRefLine_Center;
+        } else if (referenceLineLocation == "Inside") {
+            element.wall.referenceLineLocation = APIWallRefLine_Inside;
+        } else if (referenceLineLocation == "CoreOutside") {
+            element.wall.referenceLineLocation = APIWallRefLine_CoreOutside;
+        } else if (referenceLineLocation == "CoreCenter") {
+            element.wall.referenceLineLocation = APIWallRefLine_CoreCenter;
+        } else if (referenceLineLocation == "CoreInside") {
+            element.wall.referenceLineLocation = APIWallRefLine_CoreInside;
+        } else {
+            return false;
+        }
+        ACAPI_ELEMENT_MASK_SET (mask, API_WallType, referenceLineLocation);
+        changed = true;
+    }
+    return true;
+}
+
+GS::ObjectState ExecuteNativeCrudWallUpdate (const GS::Array<GS::ObjectState>& items)
+{
+    GS::ObjectState response;
+    const auto& results = response.AddList<GS::ObjectState> ("executionResults");
+    const Stories stories = GetStories ();
+    GSErrCode callbackError = NoError;
+
+    const GSErrCode undoError = ACAPI_CallUndoableCommand ("Update Native Walls", [&]() -> GSErrCode {
+        for (GSSize index = 0; index < static_cast<GSSize> (items.GetSize ()); ++index) {
+            const GS::ObjectState& item = items[index];
+            if (callbackError != NoError) {
+                results (CreateFailedExecutionResult (callbackError, "Wall item was not attempted because the batch was rolled back."));
+                continue;
+            }
+
+            const GS::ObjectState* elementID = item.Get ("elementId");
+            const API_Guid guid = elementID == nullptr ? APINULLGuid : GetGuidFromObjectState (*elementID);
+            API_Element element = {};
+            element.header.guid = guid;
+            GSErrCode error = guid == APINULLGuid ? APIERR_BADPARS : ACAPI_Element_Get (&element);
+            if (error == NoError && GetElemTypeId (element.header) != API_WallID)
+                error = APIERR_BADID;
+
+            API_Element mask = {};
+            ACAPI_ELEMENT_MASK_CLEAR (mask);
+            bool changed = false;
+            if (error == NoError) {
+                const auto placementError = ApplyNativeCrudWallPlacement (element, mask, item, stories, changed);
+                if (placementError.HasValue ()) {
+                    error = APIERR_BADPARS;
+                    results (CreateFailedExecutionResult (error, placementError.Get ()));
+                    callbackError = error;
+                    continue;
+                }
+                if (!ApplyNativeCrudWallDetails (element, mask, item, changed)) {
+                    error = APIERR_BADPARS;
+                    results (CreateFailedExecutionResult (error, "Invalid Wall reference-line location."));
+                    callbackError = error;
+                    continue;
+                }
+                const auto structureError = ApplyNativeCrudWallStructure (element, mask, item, changed);
+                if (structureError.HasValue ()) {
+                    error = APIERR_BADPARS;
+                    results (CreateFailedExecutionResult (error, structureError.Get ()));
+                    callbackError = error;
+                    continue;
+                }
+                if (IsSame2DCoordinate (element.wall.begC, element.wall.endC)) {
+                    error = APIERR_BADPARS;
+                    results (CreateFailedExecutionResult (error, "Wall begin and end coordinates must not be identical."));
+                    callbackError = error;
+                    continue;
+                }
+                if (!changed) {
+                    error = APIERR_BADPARS;
+                    results (CreateFailedExecutionResult (error, "No Wall fields to modify."));
+                    callbackError = error;
+                    continue;
+                }
+                error = ACAPI_Element_Change (&element, &mask, nullptr, 0, true);
+            }
+            if (error != NoError) {
+                results (CreateFailedExecutionResult (error, "Failed to update Wall."));
+                callbackError = error;
+                continue;
+            }
+            results (CreateSuccessfulExecutionResult ());
+            if (index == 0 && NativeCrudTestFaultAfterFirstApplied) {
+                callbackError = APIERR_COMMANDFAILED;
+                results (CreateFailedExecutionResult (callbackError, "Disposable native CRUD test fault seam requested rollback after the first applied Wall item."));
+                return callbackError;
+            }
+        }
+        return callbackError == NoError ? NoError : APIERR_COMMANDFAILED;
+    });
+
+    if (undoError != NoError) {
+        response.Add ("transactionRolledBack", true);
+        response.Add ("transactionError", undoError);
+    }
+    return response;
+}
+
 GS::ObjectState ExecuteUpdate (
     const API_ElemTypeID typeID,
     const GS::ObjectState& parameters,
@@ -1041,7 +1350,12 @@ GS::ObjectState ExecuteUpdate (
         // MutateElements is the single project-owned batch boundary.  It opts
         // into the atomic mode of the legacy typed modifiers so a runtime
         // failure in any item causes Archicad to roll back the whole batch.
-        case API_WallID:   return ModifyWallsCommand (true).Execute (parameters, processControl);
+        case API_WallID: {
+            GS::Array<GS::ObjectState> items;
+            if (!parameters.Get ("wallsWithDetails", items))
+                return CreateErrorResponse (APIERR_BADPARS, "Wall update items are missing.");
+            return ExecuteNativeCrudWallUpdate (items);
+        }
         case API_SlabID:   return ModifySlabsCommand (true).Execute (parameters, processControl);
         case API_ColumnID: return ModifyColumnsCommand (true).Execute (parameters, processControl);
         case API_BeamID:   return ModifyBeamsCommand (true).Execute (parameters, processControl);
@@ -1271,7 +1585,7 @@ GS::ObjectState ExecuteTextCreate (
 
             API_Element element = {};
             API_ElementMemo memo = {};
-            const GS::OnExit memoGuard ([&memo] () { ACAPI_DisposeElemMemoHdls (&memo); });
+            NativeMemoGuard memoGuard (memo);
 #ifdef ServerMainVers_2600
             element.header.type = API_TextID;
 #else
@@ -1384,7 +1698,7 @@ GS::ObjectState ExecuteTextUpdate (
             API_Element element = {};
             API_Element mask = {};
             API_ElementMemo memo = {};
-            const GS::OnExit memoGuard ([&memo] () { ACAPI_DisposeElemMemoHdls (&memo); });
+            NativeMemoGuard memoGuard (memo);
             element.header.guid = guid;
             GSErrCode error = guid == APINULLGuid ? APIERR_BADPARS : ACAPI_Element_Get (&element);
             if (error == NoError) {
@@ -1446,9 +1760,7 @@ bool AddNativeSectionReadback (
     GS::ObjectState& target)
 {
     API_ElementMemo memo = {};
-    const GS::OnExit cleanup ([&memo] () {
-        ACAPI_DisposeElemMemoHdls (&memo);
-    });
+    NativeMemoGuard cleanup (memo);
 
     const UInt64 memoMask = typeID == API_ColumnID ? APIMemoMask_ColumnSegment : APIMemoMask_BeamSegment;
     const GSErrCode err = ACAPI_Element_GetMemo (elementGuid, &memo, memoMask);

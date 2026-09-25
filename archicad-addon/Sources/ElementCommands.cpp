@@ -993,6 +993,130 @@ static GS::ObjectState CreateUnavailableElementDetails (const GS::ObjectState* e
     return detailsOfElement;
 }
 
+// Read the bounded Column section memo without exposing API-owned handles or
+// treating a missing/malformed memo as a default section.  The candidate
+// contract only concerns simple vertical single-segment Columns, but the
+// factual readback keeps the observed segment count explicit so callers can
+// reject anything outside that scope.
+static void AddColumnSectionReadback (
+    const API_Guid& elementGuid,
+    const bool isSlanted,
+    GS::ObjectState& target)
+{
+    API_ElementMemo memo = {};
+    NativeMemoGuard memoGuard (memo);
+    GS::ObjectState section;
+    const auto unavailable = [&section] (const GSErrCode errorCode, const char* reason) {
+        section.Add ("status", "unavailable");
+        section.Add ("reason", reason);
+        section.Add ("errorCode", errorCode);
+    };
+
+    const GSErrCode memoError = ACAPI_Element_GetMemo (elementGuid, &memo, APIMemoMask_ColumnSegment);
+    if (memoError != NoError) {
+        unavailable (memoError, "Column section memo could not be read.");
+        target.Add ("columnSectionReadback", section);
+        return;
+    }
+    if (memo.columnSegments == nullptr) {
+        unavailable (APIERR_BADPARS, "Column section memo handle is missing.");
+        target.Add ("columnSectionReadback", section);
+        return;
+    }
+
+    const GSSize bytes = BMGetPtrSize (reinterpret_cast<GSPtr> (memo.columnSegments));
+    if (bytes == 0 || bytes % sizeof (API_ColumnSegmentType) != 0) {
+        unavailable (APIERR_BADPARS, "Column section memo size is malformed.");
+        target.Add ("columnSectionReadback", section);
+        return;
+    }
+    const GSSize segmentCount = bytes / sizeof (API_ColumnSegmentType);
+    constexpr GSSize MaxFactualColumnSegments = 256;
+    if (segmentCount == 0 || segmentCount > MaxFactualColumnSegments) {
+        unavailable (APIERR_BADPARS, "Column section memo segment count is outside the bounded factual range.");
+        target.Add ("columnSectionReadback", section);
+        return;
+    }
+
+    section.Add ("status", "available");
+    section.Add ("segmentCount", static_cast<Int32> (segmentCount));
+    section.Add ("simpleVerticalSingleSegment", !isSlanted && segmentCount == 1);
+    const auto& segments = section.AddList<GS::ObjectState> ("segments");
+    for (GSSize index = 0; index < segmentCount; ++index) {
+        const API_AssemblySegmentData& data = memo.columnSegments[index].assemblySegmentData;
+        if (!std::isfinite (data.nominalWidth) || !std::isfinite (data.nominalHeight)
+            || data.nominalWidth <= 0.0 || data.nominalHeight <= 0.0) {
+            unavailable (APIERR_BADPARS, "Column section memo dimensions are missing or malformed.");
+            target.Add ("columnSectionReadback", section);
+            return;
+        }
+        if (data.circleBased && std::abs (data.nominalWidth - data.nominalHeight) > 1.0e-9) {
+            unavailable (APIERR_BADPARS, "Circular Column section dimensions are not equal.");
+            target.Add ("columnSectionReadback", section);
+            return;
+        }
+
+        GS::ObjectState segment;
+        segment.Add ("index", static_cast<Int32> (index));
+        segment.Add ("shape", data.circleBased ? "circular" : "rectangular");
+        segment.Add ("dimensions", GS::ObjectState (
+            "width", data.nominalWidth,
+            "depth", data.nominalHeight));
+        segment.Add ("circleBased", data.circleBased);
+        segment.Add ("linkage", GS::ObjectState (
+            "dimensionsLinked", data.isWidthAndHeightLinked));
+
+        switch (data.modelElemStructureType) {
+            case API_BasicStructure: {
+                if (data.buildingMaterial == APIInvalidAttributeIndex) {
+                    unavailable (APIERR_BADPARS, "Basic Column section has no material attribute.");
+                    target.Add ("columnSectionReadback", section);
+                    return;
+                }
+                const API_Guid materialGuid = GetAttributeGuidFromIndex (API_BuildingMaterialID, data.buildingMaterial);
+                if (materialGuid == APINULLGuid) {
+                    unavailable (APIERR_BADPARS, "Basic Column section material attribute is malformed.");
+                    target.Add ("columnSectionReadback", section);
+                    return;
+                }
+                segment.Add ("structure", "Basic");
+                segment.Add ("material", CreateGuidObjectState (materialGuid));
+                break;
+            }
+            case API_ProfileStructure: {
+                if (data.profileAttr == APIInvalidAttributeIndex) {
+                    unavailable (APIERR_BADPARS, "Profile Column section has no profile attribute.");
+                    target.Add ("columnSectionReadback", section);
+                    return;
+                }
+                const API_Guid profileGuid = GetAttributeGuidFromIndex (API_ProfileID, data.profileAttr);
+                if (profileGuid == APINULLGuid) {
+                    unavailable (APIERR_BADPARS, "Profile Column section profile attribute is malformed.");
+                    target.Add ("columnSectionReadback", section);
+                    return;
+                }
+                segment.Add ("structure", "Profile");
+                segment.Add ("profile", CreateGuidObjectState (profileGuid));
+                break;
+            }
+            default:
+                unavailable (APIERR_BADPARS, "Column section structure is outside the simple factual contract.");
+                target.Add ("columnSectionReadback", section);
+                return;
+        }
+
+        // This marker is evidence of which memo values were actually read;
+        // it is not a writable field or a default synthesized by the add-on.
+        segment.Add ("preservation", GS::ObjectState (
+            "dimensions", true,
+            "circleBased", true,
+            "materialOrProfile", true,
+            "linkage", true));
+        segments (segment);
+    }
+    target.Add ("columnSectionReadback", section);
+}
+
 GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl& /*processControl*/) const
 {
     PerfTrace::ResetAccumulator ();
@@ -1240,14 +1364,23 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                 typeSpecificDetails.Add ("linked", elem.opening.extrusionGeometryData.parameters.linkedStatus == API_OpeningLinked);
                 break;
 
-            case API_ColumnID:
+            case API_ColumnID: {
                 typeSpecificDetails.Add ("origin", Create2DCoordinateObjectState (elem.column.origoPos));
                 typeSpecificDetails.Add ("zCoordinate", GetZPos (elem.header.floorInd, elem.column.bottomOffset, stories));
+                typeSpecificDetails.Add ("axisRotationAngle", elem.column.axisRotationAngle);
                 typeSpecificDetails.Add ("height", elem.column.height);
                 typeSpecificDetails.Add ("bottomOffset", elem.column.bottomOffset);
                 typeSpecificDetails.Add ("slantAngle", elem.column.slantAngle);
                 typeSpecificDetails.Add ("isSlanted", elem.column.isSlanted);
+                const auto story = stories.find (elem.header.floorInd);
+                if (story != stories.end ())
+                    typeSpecificDetails.Add ("storyLevel", story->second.level);
+                {
+                    PerfTrace::ScopeTimer timer (PerfTrace::Phase::TypeMemo);
+                    AddColumnSectionReadback (elem.header.guid, elem.column.isSlanted, typeSpecificDetails);
+                }
                 break;
+            }
 
             case API_DoorID:
             case API_WindowID:

@@ -7,6 +7,45 @@
 #include <limits>
 #include <memory>
 
+// API_ElementMemo owns one or more API handles allocated by Archicad. Keep
+// disposal on every success, validation-failure and API-failure path behind
+// a non-copyable guard. The guard is intentionally limited to ownership; it
+// never clones or borrows memo data.
+class NativeMemoGuard final {
+public:
+    explicit NativeMemoGuard (API_ElementMemo& memoIn) : memo (memoIn) {}
+
+    ~NativeMemoGuard ()
+    {
+        ACAPI_DisposeElemMemoHdls (&memo);
+    }
+
+    NativeMemoGuard (const NativeMemoGuard&) = delete;
+    NativeMemoGuard& operator= (const NativeMemoGuard&) = delete;
+
+private:
+    API_ElementMemo& memo;
+};
+
+// Marker sub-elements carry the same API-owned memo handles as ordinary
+// element memos. Keep marker disposal separate so a call site cannot
+// accidentally pass the parent element's memo to the disposer.
+class NativeMarkerMemoGuard final {
+public:
+    explicit NativeMarkerMemoGuard (API_SubElement& markerIn) : marker (markerIn) {}
+
+    ~NativeMarkerMemoGuard ()
+    {
+        ACAPI_DisposeElemMemoHdls (&marker.memo);
+    }
+
+    NativeMarkerMemoGuard (const NativeMarkerMemoGuard&) = delete;
+    NativeMarkerMemoGuard& operator= (const NativeMarkerMemoGuard&) = delete;
+
+private:
+    API_SubElement& marker;
+};
+
 // API_LibPart::location is allocated by the legacy Archicad API. Keep the
 // required API ownership rule behind a small RAII guard so call sites do not
 // manually delete API-owned pointers or forget cleanup on an early return.

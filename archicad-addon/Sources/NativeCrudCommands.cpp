@@ -5,12 +5,14 @@
 #include "ElementMutationCommands.hpp"
 #include "ExtendedElementCommands.hpp"
 #include "MigrationHelper.hpp"
+#include "NativeOwnership.hpp"
 #include "NativeRichTextMemo.hpp"
 #include "ObjectStateJSONConversion.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cmath>
 #include <chrono>
 #include <ctime>
 #include <cstdint>
@@ -35,6 +37,13 @@ constexpr const char* ContractVersion = "native-crud-v1";
 constexpr const char* SnapshotVersion = "native-element-snapshot-v1";
 constexpr const char* ReceiptVersion = "native-mutation-receipt-v1";
 constexpr const char* HistoryVersion = "native-mutation-history-v1";
+constexpr const char* CapabilitySchemaVersion = "native-crud-capabilities-v1";
+constexpr const char* CapabilitySchemaHash = "0040a843c2ef78687412f3080405da3900c37ac780abbbb450534f6723ecb7fc";
+constexpr const char* ImpactEnvelopeVersion = "native-impact-envelope-v1";
+constexpr const char* ImpactEvidenceVersion = "native-impact-evidence-v1";
+constexpr const char* ImpactMetadataKey = "nativeImpact";
+constexpr const char* ImpactScope = "wall-zone-pair-v1";
+constexpr const char* ImpactEvidenceSource = "native-impact-coordinator-v1";
 constexpr GSSize MaxMutationItems = 25;
 constexpr GSSize MaxDiscoveryReferences = 100;
 constexpr GSSize MaxImpactElements = 256;
@@ -106,7 +115,7 @@ void RememberCachedReceipt (const GS::ObjectState& receipt)
         }
     }
     constexpr GSSize MaxCachedReceipts = 256;
-    if (cache.size () >= MaxCachedReceipts)
+    if (cache.size () >= static_cast<std::size_t> (MaxCachedReceipts))
         cache.erase (cache.begin ());
     cache.push_back ({ key, scope, receipt });
 }
@@ -272,6 +281,13 @@ void CopyObjectField (const GS::ObjectState& source, const char* sourceName, GS:
     if (value != nullptr) target.Add (targetName, *value);
 }
 
+void CopyColumnCreateCoordinates (const GS::ObjectState& payload, GS::ObjectState& target)
+{
+    // CreateColumns consumes one native 3D `coordinates` value.  Origin and
+    // elevation are update vocabulary and must never be synthesized into it.
+    CopyObjectField (payload, "coordinates", target, "coordinates");
+}
+
 void CopyArrayField (const GS::ObjectState& source, const char* sourceName, GS::ObjectState& target, const char* targetName)
 {
     GS::Array<GS::ObjectState> values;
@@ -391,6 +407,45 @@ GS::ObjectState CanonicalWritableState (
     return state;
 }
 
+// Column placement/section observations are deliberately kept outside
+// writableState.  In particular, origin is the native UPDATE placement
+// projection and is never presented as CREATE coordinates or a recreateState.
+GS::ObjectState FactualColumnReadbackState (const GS::ObjectState& details, const GS::ObjectState& row)
+{
+    GS::ObjectState readback;
+    CopyObjectField (details, "origin", readback, "origin");
+    CopyIntField (row, "floorIndex", readback, "storyIndex");
+    CopyDoubleField (details, "zCoordinate", readback, "absoluteElevation");
+    CopyDoubleField (details, "bottomOffset", readback, "bottomOffset");
+    CopyDoubleField (details, "height", readback, "height");
+    CopyDoubleField (details, "axisRotationAngle", readback, "rotation");
+    CopyBoolField (details, "isSlanted", readback, "isSlanted");
+    CopyObjectField (details, "columnSectionReadback", readback, "section");
+
+    double absoluteElevation = 0.0;
+    double storyLevel = 0.0;
+    double bottomOffset = 0.0;
+    GS::ObjectState elevationRelation;
+    if (details.Get ("zCoordinate", absoluteElevation)
+        && details.Get ("storyLevel", storyLevel)
+        && details.Get ("bottomOffset", bottomOffset)
+        && std::isfinite (absoluteElevation)
+        && std::isfinite (storyLevel)
+        && std::isfinite (bottomOffset)) {
+        const bool relationVerified = std::abs ((storyLevel + bottomOffset) - absoluteElevation) <= 1.0e-9;
+        elevationRelation.Add ("status", relationVerified ? "verified" : "unavailable");
+        elevationRelation.Add ("rule", "absoluteElevation=storyLevel+bottomOffset");
+        elevationRelation.Add ("storyLevel", storyLevel);
+        elevationRelation.Add ("bottomOffset", bottomOffset);
+        elevationRelation.Add ("absoluteElevation", absoluteElevation);
+    } else {
+        elevationRelation.Add ("status", "unavailable");
+        elevationRelation.Add ("rule", "absoluteElevation=storyLevel+bottomOffset");
+    }
+    readback.Add ("elevationRelation", elevationRelation);
+    return readback;
+}
+
 GS::ObjectState SnapshotFromDetailRow (const GS::ObjectState& row, const GS::UniString& scope)
 {
     const GS::ObjectState* elementId = row.Get ("elementId");
@@ -429,7 +484,14 @@ GS::ObjectState SnapshotFromDetailRow (const GS::ObjectState& row, const GS::Uni
         snapshot.Add ("ownerElementId", *owner);
     const GS::ObjectState writableState = CanonicalWritableState (canonicalTypeName, *details, row);
     snapshot.Add ("writableState", writableState);
-    snapshot.Add ("recreateState", writableState);
+    if (canonicalTypeName == "Column") {
+        snapshot.Add ("factualState", FactualColumnReadbackState (*details, row));
+        // A Column UPDATE origin/elevation projection is not the CREATE
+        // coordinates vocabulary.  Omit recreateState until a complete,
+        // factual candidate writer exists.
+    } else {
+        snapshot.Add ("recreateState", writableState);
+    }
     snapshot.Add ("fingerprintAlgorithm", "native-json-fnv1a-64-v1");
     // The TypeScript adapter treats this as an opaque precondition.  The
     // deterministic FNV value is intentionally derived from the serialized
@@ -641,7 +703,11 @@ void AddCanonicalWritableFields (GS::ObjectState& target, const GS::UniString& t
         count = sizeof (values) / sizeof (values[0]);
         for (GSSize i = 0; i < count; ++i) fields[i] = values[i];
     } else if (typeName == "Column") {
-        const char* values[] = { "origin", "storyIndex", "elevation", "height", "offset", "slant" };
+        // The typed Column create/update commands use different native field
+        // vocabularies.  `height` is the only canonical field accepted by
+        // both routes; keep the shared APX/TS allowlist fail-closed rather
+        // than advertising operation-specific fields.
+        const char* values[] = { "height" };
         count = sizeof (values) / sizeof (values[0]);
         for (GSSize i = 0; i < count; ++i) fields[i] = values[i];
     } else if (typeName == "Text") {
@@ -649,24 +715,32 @@ void AddCanonicalWritableFields (GS::ObjectState& target, const GS::UniString& t
         count = sizeof (values) / sizeof (values[0]);
         for (GSSize i = 0; i < count; ++i) fields[i] = values[i];
     } else if (typeName == "Line") {
-        const char* values[] = { "begin", "end", "storyIndex", "database", "lineType", "pen", "roomSeparator", "arrowSettings" };
+        const char* values[] = { "begin", "end", "storyIndex", "lineType", "pen", "roomSeparator" };
         count = sizeof (values) / sizeof (values[0]);
         for (GSSize i = 0; i < count; ++i) fields[i] = values[i];
     } else if (typeName == "Arc") {
-        const char* values[] = { "origin", "radius", "ratio", "axisAngle", "beginAngle", "endAngle", "whole", "reflected", "lineType", "pen", "roomSeparator", "arrowSettings" };
+        const char* values[] = { "origin", "radius", "ratio", "axisAngle", "beginAngle", "endAngle", "reflected", "storyIndex", "lineType", "pen", "roomSeparator" };
         count = sizeof (values) / sizeof (values[0]);
         for (GSSize i = 0; i < count; ++i) fields[i] = values[i];
     } else if (typeName == "Hatch") {
-        const char* values[] = { "polygon", "arcs", "holes", "storyIndex", "database", "hatch", "fill", "contourPen", "backgroundPen", "foregroundPen", "orientation" };
-        count = sizeof (values) / sizeof (values[0]);
-        for (GSSize i = 0; i < count; ++i) fields[i] = values[i];
+        // The legacy CreateHatches command has no typed Native CRUD update
+        // route or factual CRUD round-trip.  Keep this capability explicitly
+        // read-only until a separate Hatch writer proves the complete memo
+        // and readback contract.
     } else if (typeName == "Door" || typeName == "Window") {
-        const char* values[] = { "ownerWallId", "offset", "sill", "width", "height", "orientation", "libraryPart", "parameters" };
-        count = sizeof (values) / sizeof (values[0]);
-        for (GSSize i = 0; i < count; ++i) fields[i] = values[i];
+        // Door/Window details are factual readback, while the available
+        // CreateObjects/clone and GDL-parameter commands are legacy routes,
+        // not typed Native CRUD writers.  Keep writableFields empty until a
+        // typed create/update path proves the complete native round-trip.
     }
-    const auto& output = target.AddList<GS::UniString> ("writableFields");
-    for (GSSize i = 0; i < count; ++i) output (fields[i]);
+    const auto& writableFields = target.AddList<GS::UniString> ("writableFields");
+    const auto& createFields = target.AddList<GS::UniString> ("createFields");
+    const auto& updateFields = target.AddList<GS::UniString> ("updateFields");
+    for (GSSize i = 0; i < count; ++i) {
+        writableFields (fields[i]);
+        createFields (fields[i]);
+        updateFields (fields[i]);
+    }
 }
 
 GS::Optional<GS::UniString> ReadRequestedGuids (
@@ -847,25 +921,70 @@ bool ReceiptPrimaryGuidsMatch (
     return true;
 }
 
+bool ReceiptImpactEnvelopeMatches (
+    const GS::ObjectState& receipt,
+    const GS::ObjectState* requestedSemanticMetadata)
+{
+    const GS::ObjectState* requestedImpact = requestedSemanticMetadata == nullptr
+        ? nullptr
+        : requestedSemanticMetadata->Get (ImpactMetadataKey);
+    const GS::ObjectState* receiptSemanticMetadata = receipt.Get ("semanticMetadata");
+    const GS::ObjectState* receiptImpact = receiptSemanticMetadata == nullptr
+        ? nullptr
+        : receiptSemanticMetadata->Get (ImpactMetadataKey);
+    if ((requestedImpact == nullptr) != (receiptImpact == nullptr)) return false;
+    if (requestedImpact == nullptr) return true;
+    GS::UniString requestedJson;
+    GS::UniString receiptJson;
+    if (JSON::CreateFromObjectState (*requestedImpact, requestedJson) != NoError
+        || JSON::CreateFromObjectState (*receiptImpact, receiptJson) != NoError)
+        return false;
+    // The TypeScript coordinator canonicalizes the complete carrier before
+    // requestHash and dispatch.  Comparing the complete persisted carrier,
+    // not only primary IDs or a hash-shaped string, binds cache replay to the
+    // exact closure/evidence contract.
+    return requestedJson == receiptJson;
+}
+
 bool ReceiptRequestIdentityMatches (
     const GS::ObjectState& receipt,
+    const GS::UniString& expectedScope,
     const GS::UniString& operation,
     const GS::UniString& typeName,
     const GS::UniString& requestHash,
-    const GS::Array<GS::ObjectState>& requestedIds)
+    const GS::UniString& description,
+    const GS::UniString& operatorNote,
+    const GS::UniString& origin,
+    const GS::Array<GS::ObjectState>& requestedIds,
+    const GS::ObjectState* requestedSemanticMetadata)
 {
+    GS::UniString recordedScope;
     GS::UniString recordedOperation;
     GS::UniString recordedType;
     GS::UniString recordedHash;
-    if (!receipt.Get ("operation", recordedOperation)
+    GS::UniString recordedDescription;
+    GS::UniString recordedOrigin;
+    GS::UniString recordedOperatorNote;
+    if (!receipt.Get ("fileScopeKey", recordedScope)
+        || !receipt.Get ("operation", recordedOperation)
         || !receipt.Get ("elementType", recordedType)
-        || !receipt.Get ("requestHash", recordedHash))
+        || !receipt.Get ("requestHash", recordedHash)
+        || !receipt.Get ("description", recordedDescription)
+        || !receipt.Get ("origin", recordedOrigin))
         return false;
 
-    if (recordedOperation != operation
+    const GS::UniString expectedOrigin = origin.IsEmpty () ? GS::UniString ("NATIVE") : origin;
+    const bool hasRecordedOperatorNote = receipt.Get ("operatorNote", recordedOperatorNote);
+    if (recordedScope != expectedScope
+        || recordedOperation != operation
         || recordedType != typeName
-        || LowerAscii (recordedHash) != LowerAscii (requestHash))
+        || LowerAscii (recordedHash) != LowerAscii (requestHash)
+        || recordedDescription != description
+        || recordedOrigin != expectedOrigin
+        || hasRecordedOperatorNote != !operatorNote.IsEmpty ()
+        || (hasRecordedOperatorNote && recordedOperatorNote != operatorNote))
         return false;
+    if (!ReceiptImpactEnvelopeMatches (receipt, requestedSemanticMetadata)) return false;
 
     // CREATE has no caller-supplied primary GUIDs; its typed payload and
     // clone source are covered by requestHash.  UPDATE/DELETE must also
@@ -925,6 +1044,223 @@ GS::ObjectState BuildDeleteReadback (
     return readback;
 }
 
+struct NativeImpactEnvelope {
+    GS::ObjectState envelope;
+    GS::Array<GS::ObjectState> collateralIds;
+    GS::Array<GS::ObjectState> impactIds;
+    GS::Array<GS::UniString> collateralGuids;
+    GS::Array<GS::UniString> collateralElementTypes;
+};
+
+bool GuidListMatchesRequested (
+    const GS::Array<GS::UniString>& recorded,
+    const GS::Array<GS::ObjectState>& requested)
+{
+    if (recorded.GetSize () != requested.GetSize ()) return false;
+    GS::Array<API_Guid> seen;
+    for (const GS::UniString& value : recorded) {
+        const API_Guid guid = APIGuidFromString (value.ToCStr ());
+        if (guid == APINULLGuid || seen.Contains (guid)) return false;
+        seen.Push (guid);
+    }
+    for (const GS::ObjectState& requestedId : requested) {
+        const API_Guid guid = GetRequestedElementGuid (requestedId);
+        if (guid == APINULLGuid || !seen.Contains (guid)) return false;
+    }
+    return true;
+}
+
+GS::Optional<GS::UniString> ParseNativeImpactEnvelope (
+    const GS::ObjectState* semanticMetadata,
+    const GS::UniString& scope,
+    const GS::UniString& operationId,
+    const GS::UniString& operation,
+    const GS::UniString& typeName,
+    const GS::Array<GS::ObjectState>& requestedIds,
+    NativeImpactEnvelope& output)
+{
+    if (semanticMetadata == nullptr) return {};
+    const GS::ObjectState* raw = semanticMetadata->Get (ImpactMetadataKey);
+    if (raw == nullptr) return {};
+    output.envelope = *raw;
+    GS::UniString schemaVersion;
+    GS::UniString fileScopeKey;
+    GS::UniString bindingId;
+    GS::UniString recordedOperationId;
+    GS::UniString recordedOperation;
+    GS::UniString recordedType;
+    GS::UniString patchHash;
+    Int32 archicadMajor = 0;
+    Int32 maxElements = 0;
+    if (!raw->Get ("schemaVersion", schemaVersion)
+        || !raw->Get ("fileScopeKey", fileScopeKey)
+        || !raw->Get ("archicadMajor", archicadMajor)
+        || !raw->Get ("bindingId", bindingId)
+        || !raw->Get ("operationId", recordedOperationId)
+        || !raw->Get ("operation", recordedOperation)
+        || !raw->Get ("elementType", recordedType)
+        || !raw->Get ("patchHash", patchHash)
+        || !raw->Get ("maxElements", maxElements))
+        return GS::UniString ("nativeImpact envelope is missing required identity fields.");
+    if (schemaVersion != ImpactEnvelopeVersion || fileScopeKey != scope || archicadMajor != TAPIR_AC_VERSION
+        || bindingId.IsEmpty () || recordedOperationId != operationId || recordedOperation != operation
+        || recordedType != typeName || !IsHex64 (patchHash)
+        || maxElements < 1 || maxElements > static_cast<Int32> (MaxImpactElements))
+        return GS::UniString ("nativeImpact envelope identity or bounded version is invalid.");
+    GS::Array<GS::UniString> primaryGuids;
+    if (!raw->Get ("primaryGuids", primaryGuids) || !GuidListMatchesRequested (primaryGuids, requestedIds))
+        return GS::UniString ("nativeImpact primaryGuids do not match the requested native targets.");
+    GS::Array<GS::UniString> collateralGuids;
+    if (!raw->Get ("collateralGuids", collateralGuids))
+        return GS::UniString ("nativeImpact collateralGuids are required.");
+    GS::Array<GS::UniString> collateralElementTypes;
+    if (!raw->Get ("collateralElementTypes", collateralElementTypes)
+        || collateralElementTypes.GetSize () != collateralGuids.GetSize ())
+        return GS::UniString ("nativeImpact collateralElementTypes must match collateralGuids.");
+    if (operation != "update" || (typeName != "Wall" && typeName != "Zone")
+        || primaryGuids.GetSize () != 1 || collateralGuids.GetSize () != 1
+        || maxElements < 2)
+        return GS::UniString ("wall-zone-pair-v1 requires exactly one primary and one collateral member.");
+    GS::Array<API_Guid> primary;
+    for (const GS::ObjectState& requestedId : requestedIds) primary.Push (GetRequestedElementGuid (requestedId));
+    GS::Array<API_Guid> collateral;
+    for (const GS::UniString& value : collateralGuids) {
+        const API_Guid guid = APIGuidFromString (value.ToCStr ());
+        if (guid == APINULLGuid || collateral.Contains (guid) || primary.Contains (guid))
+            return GS::UniString ("nativeImpact collateralGuids are malformed or overlap primaryGuids.");
+        collateral.Push (guid);
+        output.collateralIds.Push (IdFromGuid (guid));
+    }
+    const GSSize maxImpactElements = static_cast<GSSize> (maxElements);
+    const GSSize primaryCount = static_cast<GSSize> (primary.GetSize ());
+    const GSSize collateralCount = static_cast<GSSize> (collateral.GetSize ());
+    if (primaryCount > maxImpactElements
+        || collateralCount > maxImpactElements - primaryCount)
+        return GS::UniString ("nativeImpact closure exceeds its declared cap.");
+    for (const GS::UniString& collateralType : collateralElementTypes) {
+        const bool expected = typeName == "Wall" ? collateralType == "Zone" : typeName == "Zone" ? collateralType == "Wall" : false;
+        if (!expected) return GS::UniString ("nativeImpact collateralElementTypes do not match the bounded Wall/Zone pair.");
+    }
+    GS::ObjectState evidence;
+    GS::UniString evidenceVersion;
+    GS::UniString source;
+    GS::UniString impactScope;
+    GS::Array<GS::UniString> nativeCommands;
+    GS::Array<GS::ObjectState> relationEdges;
+    GS::Array<GS::ObjectState> ownershipEdges;
+    bool relationComplete = false;
+    bool ownershipComplete = false;
+    bool frontierComplete = false;
+    if (!raw->Get ("evidence", evidence)
+        || !evidence.Get ("schemaVersion", evidenceVersion)
+        || !evidence.Get ("source", source)
+        || !evidence.Get ("scope", impactScope)
+        || !evidence.Get ("nativeCommands", nativeCommands)
+        || !evidence.Get ("relationComplete", relationComplete)
+        || !evidence.Get ("ownershipComplete", ownershipComplete)
+        || !evidence.Get ("frontierComplete", frontierComplete)
+        || !evidence.Get ("relationEdges", relationEdges)
+        || !evidence.Get ("ownershipEdges", ownershipEdges)
+        || evidenceVersion != ImpactEvidenceVersion
+        || source != "native-wall-zone-relations"
+        || impactScope != ImpactScope
+        || nativeCommands.IsEmpty ()
+        || relationEdges.IsEmpty ()
+        || !relationComplete || !ownershipComplete || !frontierComplete)
+        return GS::UniString ("nativeImpact evidence does not prove a complete native relation frontier.");
+    if (relationEdges.GetSize () != 1 || !ownershipEdges.IsEmpty ())
+        return GS::UniString ("wall-zone-pair-v1 requires exactly one relation edge and no ownership edges.");
+    const API_Guid expectedZoneGuid = typeName == "Wall"
+        ? APIGuidFromString (collateralGuids[0].ToCStr ())
+        : APIGuidFromString (primaryGuids[0].ToCStr ());
+    const API_Guid expectedWallGuid = typeName == "Wall"
+        ? APIGuidFromString (primaryGuids[0].ToCStr ())
+        : APIGuidFromString (collateralGuids[0].ToCStr ());
+    for (const GS::ObjectState& edge : relationEdges) {
+        GS::UniString sourceGuid;
+        GS::UniString targetGuid;
+        GS::UniString relation;
+        if (!edge.Get ("sourceGuid", sourceGuid) || !edge.Get ("targetGuid", targetGuid) || !edge.Get ("relation", relation))
+            return GS::UniString ("nativeImpact relation edge is malformed.");
+        const API_Guid source = APIGuidFromString (sourceGuid.ToCStr ());
+        const API_Guid target = APIGuidFromString (targetGuid.ToCStr ());
+        if (relation != "zone.wallPart" || source != expectedZoneGuid || target != expectedWallGuid
+            || relation.IsEmpty () || source == APINULLGuid || target == APINULLGuid
+            || (!primary.Contains (source) && !collateral.Contains (source))
+            || (!primary.Contains (target) && !collateral.Contains (target)))
+            return GS::UniString ("nativeImpact relation edge is malformed.");
+    }
+    for (const GS::ObjectState& edge : ownershipEdges) {
+        GS::UniString childGuid;
+        GS::UniString ownerGuid;
+        GS::UniString relation;
+        if (!edge.Get ("childGuid", childGuid) || !edge.Get ("ownerGuid", ownerGuid) || !edge.Get ("relation", relation))
+            return GS::UniString ("nativeImpact ownership edge is malformed.");
+        const API_Guid child = APIGuidFromString (childGuid.ToCStr ());
+        const API_Guid owner = APIGuidFromString (ownerGuid.ToCStr ());
+        if (relation.IsEmpty () || child == APINULLGuid || owner == APINULLGuid
+            || (!primary.Contains (child) && !collateral.Contains (child))
+            || (!primary.Contains (owner) && !collateral.Contains (owner)))
+            return GS::UniString ("nativeImpact ownership edge is malformed.");
+    }
+    output.collateralGuids = collateralGuids;
+    output.collateralElementTypes = collateralElementTypes;
+    output.impactIds = requestedIds;
+    for (const GS::ObjectState& id : output.collateralIds) output.impactIds.Push (id);
+    return {};
+}
+
+GS::Optional<GS::UniString> ValidateNativeImpactSnapshotTypes (
+    const GS::Array<GS::ObjectState>& beforeRows,
+    const GS::Array<GS::ObjectState>& impactIds,
+    const GS::Array<GS::ObjectState>& requestedIds,
+    const GS::UniString& typeName,
+    const NativeImpactEnvelope* impact)
+{
+    if (impact == nullptr) return {};
+    if (beforeRows.GetSize () != impactIds.GetSize ())
+        return GS::UniString ("SNAPSHOT_COVERAGE_INCOMPLETE: nativeImpact before-state does not cover the exact hashed member set.");
+
+    GS::Array<API_Guid> seen;
+    const GSSize collateralIdCount = static_cast<GSSize> (impact->collateralIds.GetSize ());
+    const GSSize collateralTypeCount = static_cast<GSSize> (impact->collateralElementTypes.GetSize ());
+    for (GSSize rowIndex = 0; rowIndex < static_cast<GSSize> (beforeRows.GetSize ()); ++rowIndex) {
+        const GS::ObjectState& row = beforeRows[rowIndex];
+        const GS::ObjectState* id = row.Get ("elementId");
+        const API_Guid guid = id == nullptr ? APINULLGuid : GetGuidFromObjectState (*id);
+        if (guid == APINULLGuid || seen.Contains (guid))
+            return GS::UniString ("NATIVE_TYPE_MISMATCH: nativeImpact before-state contains an invalid or duplicate member GUID.");
+        seen.Push (guid);
+
+        GS::UniString expectedType = typeName;
+        bool selected = false;
+        for (GSSize primaryIndex = 0; primaryIndex < static_cast<GSSize> (requestedIds.GetSize ()); ++primaryIndex) {
+            if (GetRequestedElementGuid (requestedIds[primaryIndex]) == guid) {
+                selected = true;
+                break;
+            }
+        }
+        if (!selected) {
+            for (GSSize collateralIndex = 0; collateralIndex < collateralIdCount; ++collateralIndex) {
+                if (GetRequestedElementGuid (impact->collateralIds[collateralIndex]) == guid) {
+                    if (collateralIndex >= collateralTypeCount)
+                        return GS::UniString ("NATIVE_TYPE_MISMATCH: nativeImpact collateral type index is incomplete.");
+                    expectedType = impact->collateralElementTypes[collateralIndex];
+                    selected = true;
+                    break;
+                }
+            }
+        }
+        if (!selected)
+            return GS::UniString ("NATIVE_TYPE_MISMATCH: nativeImpact before-state contains a GUID outside the hashed primary/collateral set.");
+
+        GS::UniString actualType;
+        if (!row.Get ("elementType", actualType) || actualType != expectedType)
+            return GS::UniString ("NATIVE_TYPE_MISMATCH: nativeImpact before-state GUID does not match its hashed native element type.");
+    }
+    return {};
+}
+
 GS::ObjectState BuildReceipt (
     const GS::UniString& scope,
     const GS::UniString& operationId,
@@ -936,13 +1272,15 @@ GS::ObjectState BuildReceipt (
     const GS::ObjectState& beforeResponse,
     const GS::ObjectState& afterResponse,
     const GS::Array<GS::ObjectState>& requestedIds,
+    const GS::Array<GS::ObjectState>& impactIds,
     const bool complete,
     const bool dispatchComplete,
     const GS::ObjectState* semanticMetadata,
     const GS::UniString& operatorNote,
     const GS::ObjectState* mutationDiagnostics = nullptr,
     const char* statusOverride = nullptr,
-    const API_Guid* normalizeSurvivor = nullptr)
+    const API_Guid* normalizeSurvivor = nullptr,
+    const NativeImpactEnvelope* impact = nullptr)
 {
     GS::ObjectState receipt;
     receipt.Add ("schemaVersion", ReceiptVersion);
@@ -970,13 +1308,15 @@ GS::ObjectState BuildReceipt (
         const API_Guid guid = GetRequestedElementGuid (id);
         primary (APIGuidToString (guid));
     }
-    receipt.AddList<GS::UniString> ("collateralGuids");
+    const auto& collateral = receipt.AddList<GS::UniString> ("collateralGuids");
+    if (impact != nullptr)
+        for (const GS::UniString& guid : impact->collateralGuids) collateral (guid);
     const auto& elements = receipt.AddList<GS::ObjectState> ("elements");
     GS::Array<GS::ObjectState> before;
     GS::Array<GS::ObjectState> after;
     beforeResponse.Get ("elements", before);
     afterResponse.Get ("elements", after);
-    for (const GS::ObjectState& id : requestedIds) {
+    for (const GS::ObjectState& id : impactIds) {
         const API_Guid guid = GetRequestedElementGuid (id);
         const GS::ObjectState* beforeSnapshot = nullptr;
         const GS::ObjectState* afterSnapshot = nullptr;
@@ -990,8 +1330,33 @@ GS::ObjectState BuildReceipt (
         }
         GS::ObjectState element;
         element.Add ("elementId", id);
-        element.Add ("elementType", typeName);
-        element.Add ("role", "PRIMARY");
+        bool primaryElement = false;
+        for (const GS::ObjectState& primaryId : requestedIds) {
+            if (GetRequestedElementGuid (primaryId) == guid) {
+                primaryElement = true;
+                break;
+            }
+        }
+        GS::UniString snapshotType;
+        if (beforeSnapshot != nullptr && beforeSnapshot->Get ("elementType", snapshotType))
+            element.Add ("elementType", snapshotType);
+        else if (afterSnapshot != nullptr && afterSnapshot->Get ("elementType", snapshotType))
+            element.Add ("elementType", snapshotType);
+        else if (impact != nullptr && !primaryElement) {
+            GS::UniString collateralType;
+            const GSSize collateralIdCount = static_cast<GSSize> (impact->collateralIds.GetSize ());
+            const GSSize collateralTypeCount = static_cast<GSSize> (impact->collateralElementTypes.GetSize ());
+            for (GSSize index = 0; index < collateralIdCount; ++index) {
+                if (GetRequestedElementGuid (impact->collateralIds[index]) == guid
+                    && index < collateralTypeCount) {
+                    collateralType = impact->collateralElementTypes[index];
+                    break;
+                }
+            }
+            element.Add ("elementType", collateralType.IsEmpty () ? typeName : collateralType);
+        } else
+            element.Add ("elementType", typeName);
+        element.Add ("role", primaryElement ? "PRIMARY" : "COLLATERAL");
         const bool isNormalizedDelete = operation == "normalize_multiline"
             && normalizeSurvivor != nullptr
             && guid != *normalizeSurvivor;
@@ -1007,6 +1372,45 @@ GS::ObjectState BuildReceipt (
         const auto& changed = element.AddList<GS::ObjectState> ("changedFields");
         if (beforeState != nullptr || afterState != nullptr) changed (ChangedField (beforeState, afterState));
         elements (element);
+    }
+    if (impact != nullptr) {
+        bool collateralBeforeComplete = true;
+        bool collateralAfterComplete = true;
+        for (const GS::ObjectState& collateralId : impact->collateralIds) {
+            const API_Guid guid = GetRequestedElementGuid (collateralId);
+            bool hasBefore = false;
+            for (const GS::ObjectState& row : before) {
+                const GS::ObjectState* id = row.Get ("elementId");
+                if (id != nullptr && GetGuidFromObjectState (*id) == guid) {
+                    hasBefore = true;
+                    break;
+                }
+            }
+            bool hasAfter = false;
+            for (const GS::ObjectState& row : after) {
+                const GS::ObjectState* id = row.Get ("elementId");
+                if (id != nullptr && GetGuidFromObjectState (*id) == guid) {
+                    hasAfter = true;
+                    break;
+                }
+            }
+            collateralBeforeComplete = collateralBeforeComplete && hasBefore;
+            collateralAfterComplete = collateralAfterComplete && (operation == "delete" ? true : hasAfter);
+        }
+        const bool impactCoverageComplete = complete && collateralBeforeComplete && collateralAfterComplete;
+        GS::ObjectState evidence;
+        evidence.Add ("schemaVersion", ImpactEvidenceVersion);
+        evidence.Add ("source", ImpactEvidenceSource);
+        evidence.Add ("envelope", impact->envelope);
+        evidence.Add ("impactComplete", impactCoverageComplete);
+        evidence.Add ("predictedImpactComplete", true);
+        evidence.Add ("collateralBeforeComplete", collateralBeforeComplete);
+        evidence.Add ("collateralAfterComplete", collateralAfterComplete);
+        evidence.Add ("coverage", impactCoverageComplete ? "complete" : "incomplete");
+        receipt.Add ("impactEvidence", evidence);
+        GS::ObjectState dependency = evidence;
+        dependency.Add ("status", status);
+        receipt.Add ("dependencyEvidence", dependency);
     }
     GS::ObjectState transaction (
         "atomic", true,
@@ -1048,8 +1452,18 @@ GS::ObjectState BuildNativeMutationParameters (
             if (typeName == "Wall") {
                 CopyObjectField (*payload, "begCoordinate", mapped, "begCoordinate");
                 CopyObjectField (*payload, "endCoordinate", mapped, "endCoordinate");
-                CopyIntField (*payload, "storyIndex", mapped, "floorIndex");
-                CopyDoubleField (*payload, "elevation", mapped, "zCoordinate");
+                if (operation == "create") {
+                    CopyIntField (*payload, "storyIndex", mapped, "floorIndex");
+                    CopyDoubleField (*payload, "elevation", mapped, "zCoordinate");
+                } else {
+                    // Wall UPDATE has a different native mask contract from
+                    // CREATE.  Keep the canonical placement names internal
+                    // to the narrow adapter; the update helper converts
+                    // them to floorInd/bottomOffset without ever forwarding
+                    // rejected floorIndex/zCoordinate fields.
+                    CopyIntField (*payload, "storyIndex", mapped, "storyIndex");
+                    CopyDoubleField (*payload, "elevation", mapped, "elevation");
+                }
                 CopyDoubleField (*payload, "height", mapped, "height");
                 CopyDoubleField (*payload, "thickness", mapped, "thickness");
                 CopyDoubleField (*payload, "offset", mapped, "offset");
@@ -1059,14 +1473,16 @@ GS::ObjectState BuildNativeMutationParameters (
                 CopyObjectField (*payload, "composite", mapped, "compositeId");
                 CopyStringField (*payload, "referenceLine", mapped, "referenceLineLocation");
             } else if (typeName == "Column") {
-                CopyObjectField (*payload, "origin", mapped, "origin");
-                // CreateColumns historically calls its 3D placement
-                // `coordinates`; updates call it `origin`.  Preserve both
-                // forms so the delegated command can apply the operation
-                // specific validation.
-                if (operation == "create") CopyObjectField (*payload, "origin", mapped, "coordinates");
-                CopyIntField (*payload, "storyIndex", mapped, "floorIndex");
-                CopyDoubleField (*payload, "elevation", mapped, "zCoordinate");
+                if (operation == "create") {
+                    CopyColumnCreateCoordinates (*payload, mapped);
+                    CopyIntField (*payload, "storyIndex", mapped, "floorIndex");
+                } else {
+                    // ModifyColumns consumes the 2D update placement field
+                    // `origin`; CREATE must never receive this field and
+                    // UPDATE must never receive the incompatible `coordinates`
+                    // field or a rejected zCoordinate translation.
+                    CopyObjectField (*payload, "origin", mapped, "origin");
+                }
                 CopyDoubleField (*payload, "height", mapped, "height");
                 CopyDoubleField (*payload, "offset", mapped, "bottomOffset");
                 CopyDoubleField (*payload, "rotation", mapped, "axisRotationAngle");
@@ -1459,6 +1875,10 @@ GS::ObjectState GetNativeCrudCapabilitiesCommand::Execute (const GS::ObjectState
     response.Add ("snapshotVersion", SnapshotVersion);
     response.Add ("receiptVersion", ReceiptVersion);
     response.Add ("historyVersion", HistoryVersion);
+    response.Add ("capabilityIdentity", GS::ObjectState (
+        "schemaVersion", CapabilitySchemaVersion,
+        "schemaHash", CapabilitySchemaHash,
+        "source", "apx"));
     response.Add ("fileScope", "saved Solo PLN canonical path");
     response.Add ("limits", GS::ObjectState (
         "maxItems", static_cast<Int32> (MaxMutationItems),
@@ -1475,11 +1895,17 @@ GS::ObjectState GetNativeCrudCapabilitiesCommand::Execute (const GS::ObjectState
             "update", true,
             "delete", true));
         type.Add ("read", true);
-        const bool validatedWriter = GS::UniString (typeName) == "Wall" || GS::UniString (typeName) == "Column" || GS::UniString (typeName) == "Text";
+        const bool validatedWriter = GS::UniString (typeName) == "Wall" || GS::UniString (typeName) == "Text";
+        const bool updateValidatedWriter = validatedWriter || GS::UniString (typeName) == "Column";
         type.Add ("create", validatedWriter);
-        type.Add ("update", validatedWriter);
+        type.Add ("update", updateValidatedWriter);
         type.Add ("delete", true);
-        type.Add ("writerStatus", validatedWriter ? "validated" : "read_only_until_memo_writer_gate");
+        type.Add ("writerStatus", GS::UniString (typeName) == "Column" ? "update_validated_create_unavailable" : validatedWriter ? "validated" : "read_only_until_memo_writer_gate");
+        type.Add ("capabilityState", GS::ObjectState (
+            "create", validatedWriter ? "verified" : "unavailable",
+            "read", "verified",
+            "update", updateValidatedWriter ? "verified" : "unavailable",
+            "delete", "verified"));
         AddCanonicalWritableFields (type, GS::UniString (typeName));
         elementTypes (type);
     }
@@ -1750,6 +2176,13 @@ GS::ObjectState MutateNativeElementsCommand::Execute (const GS::ObjectState& par
     }
 
     const GS::UniString scope = CurrentSoloFileScope ().Get ();
+    NativeImpactEnvelope impact;
+    const GS::Optional<GS::UniString> impactError = ParseNativeImpactEnvelope (
+        semanticMetadata, scope, operationId, operation, typeName, requestedIds, impact);
+    if (impactError.HasValue ()) return CreateErrorResponse (APIERR_BADPARS, impactError.Get ());
+    const GS::Array<GS::ObjectState>& impactIds = impact.impactIds.IsEmpty () ? requestedIds : impact.impactIds;
+    GS::UniString impactSchema;
+    const bool hasImpactEnvelope = impact.envelope.Get ("schemaVersion", impactSchema);
 
     // Idempotency is owned durably by MCP SQLite.  APX keeps only a bounded
     // process-local receipt cache for response-loss reconciliation while this
@@ -1757,10 +2190,19 @@ GS::ObjectState MutateNativeElementsCommand::Execute (const GS::ObjectState& par
     // request identity; an operation-id collision is never silently replayed.
     const GS::Optional<GS::ObjectState> cachedReceipt = FindCachedReceipt (operationId, scope);
     if (cachedReceipt.HasValue ()) {
-        if (!ReceiptRequestIdentityMatches (cachedReceipt.Get (), operation, typeName, requestHash, requestedIds)) {
+        // The APX has no canonical request/patch hash implementation.  A
+        // syntactically valid requestHash/patchHash is therefore not enough
+        // to replay a Wall/Zone receipt: the MCP coordinator must reconcile
+        // the exact persisted record instead of allowing an unverified cache
+        // hit to acknowledge a different patch.
+        if (semanticMetadata != nullptr && semanticMetadata->Get (ImpactMetadataKey) != nullptr)
+            return NativeContractError (
+                "NATIVE_IMPACT_REPLAY_UNVERIFIED",
+                "nativeImpact cache replay is disabled because requestHash and patchHash cannot be recomputed from the exact request items in APX.");
+        if (!ReceiptRequestIdentityMatches (cachedReceipt.Get (), scope, operation, typeName, requestHash, description, operatorNote, origin, requestedIds, semanticMetadata)) {
             return NativeContractError (
                 "DUPLICATE_OPERATION_CONFLICT",
-                "operationId already has a different requestHash, operation, elementType or exact GUID set.");
+                "operationId already has a different complete native request identity.");
         }
         GS::ObjectState replay;
         replay.Add ("receipt", cachedReceipt.Get ());
@@ -1771,7 +2213,7 @@ GS::ObjectState MutateNativeElementsCommand::Execute (const GS::ObjectState& par
     bool beforeComplete = operation == "create";
     GS::ObjectState before = operation == "create"
         ? GS::ObjectState ("elements", GS::ObjectState ())
-        : ExactSnapshots (requestedIds, scope, processControl, beforeComplete);
+        : ExactSnapshots (impactIds, scope, processControl, beforeComplete);
     if (!beforeComplete && operation != "create") return CreateErrorResponse (APIERR_BADID, "SNAPSHOT_COVERAGE_INCOMPLETE: native before-state is incomplete; no mutation was dispatched.");
 
     if (operation == "update" || operation == "delete") {
@@ -1799,6 +2241,14 @@ GS::ObjectState MutateNativeElementsCommand::Execute (const GS::ObjectState& par
             if (matching == nullptr || !matching->Get ("fingerprint", actualFingerprint) || actualFingerprint != expectedFingerprint)
                 return CreateErrorResponse (APIERR_BADID, "STALE_NATIVE_SNAPSHOT: expectedFingerprint does not match the current native element.");
         }
+        const GS::Optional<GS::UniString> impactTypeError = ValidateNativeImpactSnapshotTypes (
+            beforeRows,
+            impactIds,
+            requestedIds,
+            typeName,
+            hasImpactEnvelope ? &impact : nullptr);
+        if (impactTypeError.HasValue ())
+            return CreateErrorResponse (APIERR_BADID, impactTypeError.Get ());
     }
 
     const GS::ObjectState mutationResult = DispatchMutation (operation, typeName, items, processControl, semanticMetadata);
@@ -1834,15 +2284,18 @@ GS::ObjectState MutateNativeElementsCommand::Execute (const GS::ObjectState& par
         // leave the receipt incomplete when any absence cannot be proven.
         bool deleteVerified = true;
         GSSize absentCount = 0;
-        deleteReadback = BuildDeleteReadback (requestedIds, typeID, deleteVerified, absentCount);
-        afterComplete = deleteVerified && absentCount == static_cast<GSSize> (requestedIds.GetSize ());
+        deleteReadback = BuildDeleteReadback (impactIds, typeID, deleteVerified, absentCount);
+        afterComplete = deleteVerified && absentCount == static_cast<GSSize> (impactIds.GetSize ());
         after = GS::ObjectState ("elements", GS::ObjectState ());
     } else {
-        after = ExactSnapshots (afterIds, scope, processControl, afterComplete);
+        const GS::Array<GS::ObjectState>& requestedAfterIds = operation == "create" ? afterIds : impactIds;
+        after = ExactSnapshots (requestedAfterIds, scope, processControl, afterComplete);
         afterComplete = afterComplete && createIdsComplete;
     }
     const bool complete = dispatchComplete && afterComplete;
-    GS::ObjectState receipt = BuildReceipt (scope, operationId, operation, typeName, description, origin, requestHash, before, after, operation == "create" ? afterIds : requestedIds, complete, dispatchComplete, semanticMetadata, operatorNote, &mutationResult);
+    const GS::Array<GS::ObjectState>& primaryAfterIds = operation == "create" ? afterIds : requestedIds;
+    const GS::Array<GS::ObjectState>& receiptImpactIds = hasImpactEnvelope ? impactIds : primaryAfterIds;
+    GS::ObjectState receipt = BuildReceipt (scope, operationId, operation, typeName, description, origin, requestHash, before, after, primaryAfterIds, receiptImpactIds, complete, dispatchComplete, semanticMetadata, operatorNote, &mutationResult, nullptr, nullptr, hasImpactEnvelope ? &impact : nullptr);
     GS::ObjectState response;
     bool groupModeRestored = false;
     if (mutationResult.Get ("groupModeRestored", groupModeRestored))
@@ -2066,7 +2519,7 @@ GS::ObjectState NormalizeTextClusterCommand::Execute (const GS::ObjectState& par
         API_Element element = {};
         API_Element mask = {};
         API_ElementMemo memo = {};
-        const GS::OnExit memoGuard ([&memo] () { ACAPI_DisposeElemMemoHdls (&memo); });
+        NativeMemoGuard memoGuard (memo);
         element.header.guid = GetRequestedElementGuid (*survivorId);
         GSErrCode error = ACAPI_Element_Get (&element);
         if (error != NoError) return callbackError = error;
@@ -2122,7 +2575,7 @@ GS::ObjectState NormalizeTextClusterCommand::Execute (const GS::ObjectState& par
     const API_Guid survivorGuid = GetRequestedElementGuid (*survivorId);
     GS::ObjectState receipt = BuildReceipt (
         scope, operationId, operation, elementType, description, origin, requestHash,
-        before, after, ids, complete, dispatchComplete, parameters.Get ("semanticMetadata"),
+        before, after, ids, ids, complete, dispatchComplete, parameters.Get ("semanticMetadata"),
         operatorNote, nullptr, nullptr, &survivorGuid);
     receipt.Add ("nativeSequence", NextCachedReceiptSequence ());
     RememberCachedReceipt (receipt);
@@ -2526,7 +2979,7 @@ GS::ObjectState UpdateAutomaticZoneGeometryCommand::Execute (const GS::ObjectSta
     const GSErrCode undoError = ACAPI_CallUndoableCommand ("Update Automatic Zone Geometry", [&]() -> GSErrCode {
         API_Element replacement = {};
         API_ElementMemo memo = {};
-        const GS::OnExit memoGuard ([&memo] () { ACAPI_DisposeElemMemoHdls (&memo); });
+        NativeMemoGuard memoGuard (memo);
 #ifdef ServerMainVers_2600
         replacement.header.type = API_ZoneID;
 #else
