@@ -602,6 +602,12 @@ GSErrCode Initialize (void)
             elementCommands, "1.0.0",
             "Returns exact canonical native snapshots for a bounded list of GUIDs."
         );
+#if TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS
+        err |= RegisterCommand<GetNativeArcDrawingPrimitivesCommand> (
+            elementCommands, "1.0.0",
+            "Developer-only bounded Arc drawing-primitives projection for candidate Native CRUD diagnostics."
+        );
+#endif
         err |= RegisterCommand<DiscoverNativeElementsCommand> (
             elementCommands, "1.0.0",
             "Discovers native elements only inside an explicit bounded document, story or rectangle scope."

@@ -1,4 +1,5 @@
 #include "ElementCommands.hpp"
+#include "ElementGDLParameterCommands.hpp"
 #include "MigrationHelper.hpp"
 #include "PerfTrace.hpp"
 #include "GSUnID.hpp"
@@ -11,6 +12,7 @@
 #include "Base64Converter.hpp"
 #include "NativeOwnership.hpp"
 #include "NativeRichTextMemo.hpp"
+#include "ObjectStateJSONConversion.hpp"
 #ifdef ServerMainVers_2800
 #include "ACAPI/ZoneBoundaryQuery.hpp"
 #endif
@@ -22,6 +24,8 @@
 #include <cstring>
 #include <limits>
 #include <new>
+#include <iomanip>
+#include <sstream>
 #include <vector>
 
 namespace {
@@ -350,7 +354,7 @@ static GS::UniString HatchTypeToString (API_HatchSubType hatchType)
         case API_BuildingMaterialHatch:
             return "BuildingMaterial";
         default:
-            return "Fill";
+            return "Unknown";
     }
 }
 
@@ -362,8 +366,9 @@ static GS::UniString HatchDeterminationToString (short determination)
         case APIHatch_CoverFills:
             return "Cover";
         case APIHatch_DraftingFills:
-        default:
             return "Drafting";
+        default:
+            return "Unknown";
     }
 }
 
@@ -864,6 +869,129 @@ static void AddFloorPlanPolygonsIfAvailable (const API_Guid& guid, GS::ObjectSta
     }
 }
 
+struct NativeArcDrawingPrimitiveContext {
+    GS::Array<GS::ObjectState> arcs;
+    GSSize primitiveCount = 0;
+    GSSize otherPrimitiveCount = 0;
+    bool invalid = false;
+};
+
+static thread_local NativeArcDrawingPrimitiveContext* tl_nativeArcPrimitivesCtx = nullptr;
+constexpr GSSize MaxNativeArcDrawingPrimitives = 256;
+
+static GSErrCode CollectNativeArcDrawingPrimitives (const API_PrimElement* primElem,
+                                                     const void* /*par1*/, const void* /*par2*/, const void* /*par3*/)
+{
+    if (tl_nativeArcPrimitivesCtx == nullptr || primElem == nullptr)
+        return NoError;
+    NativeArcDrawingPrimitiveContext& ctx = *tl_nativeArcPrimitivesCtx;
+    if (ctx.primitiveCount >= MaxNativeArcDrawingPrimitives) {
+        ctx.invalid = true;
+        return APIERR_MEMFULL;
+    }
+    ++ctx.primitiveCount;
+    if (primElem->header.typeID != API_PrimArcID) {
+        ++ctx.otherPrimitiveCount;
+        return NoError;
+    }
+    const API_PrimArc& arc = primElem->arc;
+    if (!std::isfinite (arc.orig.x) || !std::isfinite (arc.orig.y) || !std::isfinite (arc.r)
+        || !std::isfinite (arc.begAng) || !std::isfinite (arc.endAng) || !std::isfinite (arc.angle)
+        || !std::isfinite (arc.ratio) || arc.r <= 0.0 || arc.ratio <= 0.0) {
+        ctx.invalid = true;
+        return APIERR_BADPARS;
+    }
+    ctx.arcs.Push (GS::ObjectState (
+        "origin", Create2DCoordinateObjectState (arc.orig),
+        "radius", arc.r,
+        "beginAngle", arc.begAng,
+        "endAngle", arc.endAng,
+        "axisAngle", arc.angle,
+        "ratio", arc.ratio,
+        "reflected", arc.reflected,
+        "whole", arc.whole));
+    return NoError;
+}
+
+GetNativeArcDrawingPrimitivesCommand::GetNativeArcDrawingPrimitivesCommand () : CommandBase (CommonSchema::NotUsed) {}
+GS::String GetNativeArcDrawingPrimitivesCommand::GetName () const { return "GetNativeArcDrawingPrimitives"; }
+GS::Optional<GS::UniString> GetNativeArcDrawingPrimitivesCommand::GetInputParametersSchema () const
+{
+    return R"({"type":"object","properties":{"fileScopeKey":{"type":"string"},"storyIndex":{"type":"integer","minimum":0},"elements":{"type":"array","minItems":1,"maxItems":10,"items":{"type":"object","properties":{"elementId":{"type":"object","properties":{"guid":{"type":"string"}},"required":["guid"],"additionalProperties":false}},"required":["elementId"],"additionalProperties":false}}},"required":["fileScopeKey","storyIndex","elements"],"additionalProperties":false})";
+}
+GS::Optional<GS::UniString> GetNativeArcDrawingPrimitivesCommand::GetResponseSchema () const { return {}; }
+GS::ObjectState GetNativeArcDrawingPrimitivesCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl& /*processControl*/) const
+{
+    GS::UniString expectedScope;
+    Int32 expectedStory = -1;
+    if (!parameters.Get ("fileScopeKey", expectedScope) || expectedScope.IsEmpty ()
+        || !parameters.Get ("storyIndex", expectedStory) || expectedStory < 0)
+        return CreateErrorResponse (APIERR_BADPARS, "GetNativeArcDrawingPrimitives requires the exact disposable file scope and story index.");
+    API_ProjectInfo projectInfo = {};
+    if (ACAPI_ProjectOperation_Project (&projectInfo) != NoError || projectInfo.untitled || projectInfo.teamwork || projectInfo.projectPath == nullptr)
+        return CreateErrorResponse (APIERR_BADPARS, "Arc drawing primitives are limited to a saved Solo PLN project.");
+    GS::UniString actualPath (*projectInfo.projectPath);
+    actualPath.ReplaceAll ("\\", "/");
+    actualPath = actualPath.ToLowerCase ();
+    const std::string actualPathUtf8 (actualPath.ToCStr (CC_UTF8).Get ());
+    const bool isDisposableScratch = actualPathUtf8.find ("/scratch/ac25/mutation-") != std::string::npos
+        || actualPathUtf8.find ("/scratch/ac28/mutation-") != std::string::npos;
+    if (!isDisposableScratch)
+        return CreateErrorResponse (APIERR_BADPARS, "Arc drawing primitives are limited to a disposable Scratch Plans mutation copy.");
+    GS::UniString actualScope ("saved:");
+    actualScope.Append (actualPath);
+    if (actualScope != expectedScope)
+        return CreateErrorResponse (APIERR_BADPARS, "Arc drawing-primitives file scope does not match the opened Solo PLN.");
+    GS::Array<GS::ObjectState> requested;
+    if (!parameters.Get ("elements", requested) || requested.IsEmpty () || requested.GetSize () > 10)
+        return CreateErrorResponse (APIERR_BADPARS, "GetNativeArcDrawingPrimitives requires between one and ten exact Arc GUIDs.");
+    GS::HashSet<API_Guid> seen;
+    GS::ObjectState response ("status", "success");
+    const auto& results = response.AddList<GS::ObjectState> ("elements");
+    for (const GS::ObjectState& item : requested) {
+        const API_Guid guid = GetGuidFromElementsArrayItem (item);
+        if (guid == APINULLGuid || seen.Contains (guid))
+            return CreateErrorResponse (APIERR_BADPARS, "GetNativeArcDrawingPrimitives requires unique valid GUIDs.");
+        seen.Add (guid);
+        API_Elem_Head head = {};
+        head.guid = guid;
+        const GSErrCode headerErr = ACAPI_Element_GetHeader (&head);
+        if (headerErr != NoError)
+            return CreateErrorResponse (headerErr, "Could not read the exact Arc element header.");
+        if (GetElemTypeId (head) != API_ArcID && GetElemTypeId (head) != API_CircleID)
+            return CreateErrorResponse (APIERR_BADID, "An exact drawing-primitives GUID is not an Arc or Circle.");
+        if (static_cast<Int32> (head.floorInd) != expectedStory)
+            return CreateErrorResponse (APIERR_BADID, "An exact Arc drawing-primitives GUID is outside the requested story scope.");
+        NativeArcDrawingPrimitiveContext ctx;
+        tl_nativeArcPrimitivesCtx = &ctx;
+        const GS::OnExit ctxGuard ([&] () { tl_nativeArcPrimitivesCtx = nullptr; });
+        API_ShapePrimsParams shapeParams = {};
+        shapeParams.dontClip = true;
+        shapeParams.allStories = true;
+#if defined(ServerMainVers_2700)
+        const GSErrCode shapeErr = ACAPI_DrawingPrimitive_ShapePrimsExt (head, CollectNativeArcDrawingPrimitives, &shapeParams);
+#else
+        const GSErrCode shapeErr = ACAPI_Element_ShapePrimsExt (head, CollectNativeArcDrawingPrimitives, &shapeParams);
+#endif
+        GS::ObjectState result;
+        result.Add ("elementId", CreateGuidObjectState (guid));
+        result.Add ("elementType", "Arc");
+        result.Add ("complete", shapeErr == NoError && !ctx.invalid && !ctx.arcs.IsEmpty ());
+        result.Add ("primitiveCount", static_cast<Int32> (ctx.primitiveCount));
+        result.Add ("arcPrimitiveCount", static_cast<Int32> (ctx.arcs.GetSize ()));
+        result.Add ("otherPrimitiveCount", static_cast<Int32> (ctx.otherPrimitiveCount));
+        const auto& arcs = result.AddList<GS::ObjectState> ("arcs");
+        for (const GS::ObjectState& arc : ctx.arcs)
+            arcs (arc);
+        if (shapeErr != NoError)
+            result.Add ("errorCode", static_cast<Int32> (shapeErr));
+        if (ctx.invalid)
+            result.Add ("error", "ShapePrimsExt returned invalid or over-limit Arc primitive data.");
+        results (result);
+    }
+    return response;
+}
+
 static void AddLibPartBasedElementDetails (GS::ObjectState& os, const Int32 libInd, const API_Guid& owner, API_ElemTypeID ownerType = API_ZombieElemID)
 {
     os.Add ("libPartIndex", libInd);
@@ -874,6 +1002,9 @@ static void AddLibPartBasedElementDetails (GS::ObjectState& os, const Int32 libI
     if (libPartErr == NoError) {
         os.Add ("libPart", GS::ObjectState (
             "name", GS::UniString (lp.docu_UName),
+            "fileName", GS::UniString (lp.file_UName),
+            "version", static_cast<Int32> (lp.version),
+            "missingDefinition", lp.missingDef,
             "parentUnID", CreateGuidObjectState (GS::UnID (lp.parentUnID).GetMainGuid ()),
             "ownUnID", CreateGuidObjectState (GS::UnID (lp.ownUnID).GetMainGuid ())));
     } else {
@@ -1038,9 +1169,6 @@ static void AddColumnSectionReadback (
         return;
     }
 
-    section.Add ("status", "available");
-    section.Add ("segmentCount", static_cast<Int32> (segmentCount));
-    section.Add ("simpleVerticalSingleSegment", !isSlanted && segmentCount == 1);
     const auto& segments = section.AddList<GS::ObjectState> ("segments");
     for (GSSize index = 0; index < segmentCount; ++index) {
         const API_AssemblySegmentData& data = memo.columnSegments[index].assemblySegmentData;
@@ -1059,12 +1187,35 @@ static void AddColumnSectionReadback (
         GS::ObjectState segment;
         segment.Add ("index", static_cast<Int32> (index));
         segment.Add ("shape", data.circleBased ? "circular" : "rectangular");
+        segment.Add ("profileType", static_cast<Int32> (data.profileType));
         segment.Add ("dimensions", GS::ObjectState (
             "width", data.nominalWidth,
             "depth", data.nominalHeight));
         segment.Add ("circleBased", data.circleBased);
-        segment.Add ("linkage", GS::ObjectState (
-            "dimensionsLinked", data.isWidthAndHeightLinked));
+        segment.Add ("homogeneous", data.isHomogeneous);
+        GS::ObjectState endDimensions;
+        if (data.isHomogeneous) {
+            // Graphisoft defines a homogeneous assembly segment as having the
+            // same profile size at its beginning and end. The endWidth/endHeight
+            // members are only meaningful for non-homogeneous segments, so do
+            // not interpret their default bytes as measured end dimensions.
+            endDimensions.Add ("status", "same-as-nominal");
+            endDimensions.Add ("width", data.nominalWidth);
+            endDimensions.Add ("depth", data.nominalHeight);
+        } else if (std::isfinite (data.endWidth) && std::isfinite (data.endHeight)
+            && data.endWidth > 0.0 && data.endHeight > 0.0) {
+            endDimensions.Add ("status", "available-nonhomogeneous");
+            endDimensions.Add ("width", data.endWidth);
+            endDimensions.Add ("depth", data.endHeight);
+        } else {
+            endDimensions.Add ("status", "unavailable");
+        }
+        segment.Add ("endDimensions", endDimensions);
+        GS::ObjectState linkage;
+        linkage.Add ("dimensionsLinked", data.isWidthAndHeightLinked);
+        if (!data.isHomogeneous)
+            linkage.Add ("endDimensionsLinked", data.isEndWidthAndHeightLinked);
+        segment.Add ("linkage", linkage);
 
         switch (data.modelElemStructureType) {
             case API_BasicStructure: {
@@ -1114,10 +1265,15 @@ static void AddColumnSectionReadback (
             "linkage", true));
         segments (segment);
     }
+    // Mark the section available only after every bounded segment passed
+    // validation. Failure paths above then have exactly one status key.
+    section.Add ("status", "available");
+    section.Add ("segmentCount", static_cast<Int32> (segmentCount));
+    section.Add ("simpleVerticalSingleSegment", !isSlanted && segmentCount == 1);
     target.Add ("columnSectionReadback", section);
 }
 
-GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl& /*processControl*/) const
+GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const
 {
     PerfTrace::ResetAccumulator ();
     std::chrono::steady_clock::time_point perfTraceStart = std::chrono::steady_clock::now ();
@@ -1340,11 +1496,44 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                 typeSpecificDetails.Add ("fillBackgroundPen", (Int32) elem.hatch.fillBGPen);
                 typeSpecificDetails.Add ("fillAttributeIndex", GetAttributeIndex (elem.hatch.fillInd));
                 typeSpecificDetails.Add ("buildingMaterialIndex", GetAttributeIndex (elem.hatch.buildingMaterial));
+                typeSpecificDetails.Add ("contourPenBase", (Int32) elem.hatch.contPen.penIndex);
+                typeSpecificDetails.Add ("contourPenOverride", (Int32) elem.hatch.contPen.colorOverridePenIndex);
+                typeSpecificDetails.Add ("fillPenBase", (Int32) elem.hatch.fillPen.penIndex);
+                typeSpecificDetails.Add ("fillPenOverride", (Int32) elem.hatch.fillPen.colorOverridePenIndex);
+                typeSpecificDetails.Add ("hatchFlags", (Int32) elem.hatch.hatchFlags);
                 typeSpecificDetails.Add ("hasForegroundRGB", (elem.hatch.hatchFlags & APIHatch_HasFgRGBColor) != 0);
                 typeSpecificDetails.Add ("hasBackgroundRGB", (elem.hatch.hatchFlags & APIHatch_HasBkgRGBColor) != 0);
+                typeSpecificDetails.Add ("contourPenOverridden", elem.hatch.contPen.IsOverriden ());
+                typeSpecificDetails.Add ("fillPenOverridden", elem.hatch.fillPen.IsOverriden ());
+                typeSpecificDetails.Add ("hatchOrientationType", static_cast<Int32> (elem.hatch.hatchOrientation.type));
+                typeSpecificDetails.Add ("hatchOrientationFlags", static_cast<Int32> (elem.hatch.hatchOrientation.flags));
                 {
                     PerfTrace::ScopeTimer timer (PerfTrace::Phase::TypeMemo);
                     AddPolygonWithHolesFromMemoCoords (elem.header.guid, typeSpecificDetails, "polygonOutline", "polygonArcs", "holes", "polygonOutline", "polygonArcs");
+                }
+                {
+                    API_ElementMemo hatchMemo = {};
+                    const GS::OnExit hatchMemoGuard ([&hatchMemo] () { ACAPI_DisposeElemMemoHdls (&hatchMemo); });
+                    const GSErrCode memoError = ACAPI_Element_GetMemo (elem.header.guid, &hatchMemo, APIMemoMask_Polygon);
+                    bool memoVertexIdsComplete = memoError == NoError && elem.hatch.poly.nCoords > 0
+                        && hatchMemo.vertexIDs != nullptr && *hatchMemo.vertexIDs != nullptr;
+                    GSSize vertexCapacity = 0;
+                    if (memoVertexIdsComplete) {
+                        vertexCapacity = BMhGetSize (reinterpret_cast<GSHandle> (hatchMemo.vertexIDs)) / sizeof (UInt32);
+                        memoVertexIdsComplete = vertexCapacity > static_cast<GSSize> (elem.hatch.poly.nCoords);
+                    }
+                    if (memoVertexIdsComplete) {
+                        const auto& vertexIds = typeSpecificDetails.AddList<Int32> ("memoVertexIds");
+                        for (Int32 index = 1; index <= elem.hatch.poly.nCoords; ++index) {
+                            const UInt32 vertexId = (*hatchMemo.vertexIDs)[index];
+                            if (vertexId > static_cast<UInt32> (std::numeric_limits<Int32>::max ())) {
+                                memoVertexIdsComplete = false;
+                                break;
+                            }
+                            vertexIds (static_cast<Int32> (vertexId));
+                        }
+                    }
+                    typeSpecificDetails.Add ("memoVertexIdsStatus", memoVertexIdsComplete ? "available" : "unavailable");
                 }
                 break;
 
@@ -1370,6 +1559,7 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                 typeSpecificDetails.Add ("axisRotationAngle", elem.column.axisRotationAngle);
                 typeSpecificDetails.Add ("height", elem.column.height);
                 typeSpecificDetails.Add ("bottomOffset", elem.column.bottomOffset);
+                typeSpecificDetails.Add ("relativeTopStory", static_cast<Int32> (elem.column.relativeTopStory));
                 typeSpecificDetails.Add ("slantAngle", elem.column.slantAngle);
                 typeSpecificDetails.Add ("isSlanted", elem.column.isSlanted);
                 const auto story = stories.find (elem.header.floorInd);
@@ -1387,6 +1577,125 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                 {
                     PerfTrace::ScopeTimer timer (PerfTrace::Phase::LibPart);
                     AddLibPartBasedElementDetails (typeSpecificDetails, elem.window.openingBase.libInd, elem.window.owner);
+                }
+                typeSpecificDetails.Add ("stampGuid", CreateGuidObjectState (elem.window.openingBase.markGuid));
+                if (elem.window.openingBase.markGuid != APINULLGuid) {
+                    API_Element markerElement = {};
+                    markerElement.header.guid = elem.window.openingBase.markGuid;
+                    const GSErrCode markerElementError = ACAPI_Element_Get (&markerElement);
+                    GS::ObjectState stamp;
+                    stamp.Add ("elementId", CreateGuidObjectState (elem.window.openingBase.markGuid));
+                    bool markerLibraryComplete = false;
+                    bool parametersAvailable = false;
+                    if (markerElementError == NoError && GetElemTypeId (markerElement.header) == API_ObjectID) {
+                        stamp.Add ("elementType", "Object");
+                        // markGuid is the opening's exact MainMarker identity.
+                        // Keep its API-returned scalar Object state in the
+                        // source fingerprint as well as its GDL parameters;
+                        // GetMemo(AddPars) alone does not describe the marker
+                        // instance's placement, pen/style or story/layer.
+                        GS::ObjectState markerElementState;
+                        markerElementState.Add ("elementId", CreateGuidObjectState (markerElement.header.guid));
+                        markerElementState.Add ("floorIndex", markerElement.header.floorInd);
+                        markerElementState.Add ("layerIndex", GetAttributeIndex (markerElement.header.layer));
+                        markerElementState.Add ("position", Create2DCoordinateObjectState (markerElement.object.pos));
+                        markerElementState.Add ("offset", Create2DCoordinateObjectState (markerElement.object.offset));
+                        markerElementState.Add ("angle", markerElement.object.angle);
+                        markerElementState.Add ("level", markerElement.object.level);
+                        markerElementState.Add ("xRatio", markerElement.object.xRatio);
+                        markerElementState.Add ("yRatio", markerElement.object.yRatio);
+                        markerElementState.Add ("fixedAngle", markerElement.object.fixedAngle);
+                        markerElementState.Add ("pen", static_cast<Int32> (markerElement.object.pen));
+                        markerElementState.Add ("lineTypeIndex", GetAttributeIndex (markerElement.object.ltypeInd));
+                        markerElementState.Add ("materialIndex", GetAttributeIndex (markerElement.object.mat));
+                        markerElementState.Add ("sectionFillIndex", GetAttributeIndex (markerElement.object.sectFill));
+                        markerElementState.Add ("sectionFillPen", static_cast<Int32> (markerElement.object.sectFillPen));
+                        markerElementState.Add ("sectionBackgroundPen", static_cast<Int32> (markerElement.object.sectBGPen));
+                        markerElementState.Add ("sectionContourPen", static_cast<Int32> (markerElement.object.sectContPen));
+                        markerElementState.Add ("useObjectPens", markerElement.object.useObjPens);
+                        markerElementState.Add ("useObjectLineTypes", markerElement.object.useObjLtypes);
+                        markerElementState.Add ("useObjectMaterials", markerElement.object.useObjMaterials);
+                        markerElementState.Add ("useObjectSectionAttributes", markerElement.object.useObjSectAttrs);
+                        markerElementState.Add ("reflected", markerElement.object.reflected);
+                        markerElementState.Add ("useXYFixSize", markerElement.object.useXYFixSize);
+                        markerElementState.Add ("fixPoint", static_cast<Int32> (markerElement.object.fixPoint));
+                        markerElementState.Add ("lightColor", GS::ObjectState (
+                            "red", markerElement.object.lightColor.f_red,
+                            "green", markerElement.object.lightColor.f_green,
+                            "blue", markerElement.object.lightColor.f_blue));
+                        markerElementState.Add ("visibility", GS::ObjectState (
+                            "showOnHome", markerElement.object.visibility.showOnHome,
+                            "showAllAbove", markerElement.object.visibility.showAllAbove,
+                            "showAllBelow", markerElement.object.visibility.showAllBelow,
+                            "showRelAbove", static_cast<Int32> (markerElement.object.visibility.showRelAbove),
+                            "showRelBelow", static_cast<Int32> (markerElement.object.visibility.showRelBelow)));
+                        markerElementState.Add ("linkToSettings", GS::ObjectState (
+                            "homeStoryDifference", static_cast<Int32> (markerElement.object.linkToSettings.homeStoryDifference),
+                            "newCreationMode", markerElement.object.linkToSettings.newCreationMode));
+                        markerElementState.Add ("lightIsOn", markerElement.object.lightIsOn);
+                        markerElementState.Add ("isAutoOnStoryVisibility", markerElement.object.isAutoOnStoryVisibility);
+                        markerElementState.Add ("lookId", markerElement.object.lookId);
+                        markerElementState.Add ("ownerElementId", CreateGuidObjectState (markerElement.object.owner));
+#ifdef ServerMainVers_2600
+                        markerElementState.Add ("ownerElementType", GetElementTypeNonLocalizedName (GetElemTypeId (markerElement.object.ownerType)));
+#else
+                        markerElementState.Add ("ownerElementType", GetElementTypeNonLocalizedName (markerElement.object.ownerID));
+#endif
+                        markerElementState.Add ("libraryPartIndex", markerElement.object.libInd);
+                        stamp.Add ("elementState", markerElementState);
+                        AddLibPartBasedElementDetails (stamp, markerElement.object.libInd, APINULLGuid);
+                        const GS::ObjectState* markerLibrary = stamp.Get ("libPart");
+                        if (markerLibrary != nullptr) {
+                            GS::UniString libraryFile;
+                            GS::ObjectState ownUnID;
+                            Int32 libraryRevision = 0;
+                            bool missingDefinition = true;
+                            markerLibraryComplete = markerLibrary->Get ("fileName", libraryFile) && !libraryFile.IsEmpty ()
+                                && markerLibrary->Get ("ownUnID", ownUnID) && GetGuidFromObjectState (ownUnID) != APINULLGuid
+                                && markerLibrary->Get ("version", libraryRevision) && libraryRevision > 0
+                                && markerLibrary->Get ("missingDefinition", missingDefinition) && !missingDefinition;
+                        }
+
+                        GS::ObjectState markerParameterRequest;
+                        const auto& markerIds = markerParameterRequest.AddList<GS::ObjectState> ("elements");
+                        markerIds (GS::ObjectState ("elementId", CreateGuidObjectState (elem.window.openingBase.markGuid)));
+                        GS::ObjectState markerParameters = GetGDLParametersOfElementsCommand ().Execute (markerParameterRequest, processControl);
+                        GS::Array<GS::ObjectState> parameterRows;
+                        GS::ObjectState markerParameterState;
+                        if (markerParameters.Get ("gdlParametersOfElements", parameterRows) && parameterRows.GetSize () == 1
+                            && parameterRows[0].Get ("error") == nullptr) {
+                            markerParameterState = parameterRows[0];
+                            stamp.Add ("parameterState", markerParameterState);
+                            parametersAvailable = true;
+                        } else {
+                            stamp.Add ("parameterStatus", "unavailable");
+                        }
+                    } else {
+                        stamp.Add ("reason", "markGuid did not resolve to an API_ObjectID element.");
+                    }
+                    GS::UniString serializedStamp;
+                    JSON::CreateFromObjectState (stamp, serializedStamp);
+                    const std::string stampBytes (serializedStamp.ToCStr (CC_UTF8).Get ());
+                    std::uint64_t stampHash = 1469598103934665603ULL;
+                    for (const unsigned char byte : stampBytes) {
+                        stampHash ^= byte;
+                        stampHash *= 1099511628211ULL;
+                    }
+                    std::ostringstream stampFingerprint;
+                    stampFingerprint << std::hex << std::setfill ('0') << std::setw (64) << stampHash;
+                    stamp.Add ("fingerprint", GS::UniString (stampFingerprint.str ().c_str (), CC_UTF8));
+                    if (parametersAvailable && markerLibraryComplete && markerElementError == NoError && GetElemTypeId (markerElement.header) == API_ObjectID)
+                        stamp.Add ("status", "available");
+                    else {
+                        stamp.Add ("parameterStatus", GS::UniString (parametersAvailable ? "available" : "unavailable"));
+                        stamp.Add ("libraryStatus", markerLibraryComplete ? "available" : "unavailable");
+                        stamp.Add ("status", "unavailable");
+                    }
+                    typeSpecificDetails.Add ("stamp", stamp);
+                } else {
+                    if (GetElemTypeId (elem.header) == API_DoorID || GetElemTypeId (elem.header) == API_WindowID) {
+                        typeSpecificDetails.Add ("stamp", GS::ObjectState ("status", "markerless", "reason", "openingBase.markGuid is APINULLGuid."));
+                    }
                 }
                 typeSpecificDetails.Add ("width", elem.window.openingBase.width);
                 typeSpecificDetails.Add ("height", elem.window.openingBase.height);
@@ -1408,6 +1717,11 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                 typeSpecificDetails.Add ("reflected", elem.window.openingBase.reflected);
                 typeSpecificDetails.Add ("refSide", elem.window.openingBase.refSide);
                 typeSpecificDetails.Add ("oSide", elem.window.openingBase.oSide);
+                typeSpecificDetails.Add ("openingTopology", GS::ObjectState (
+                    "libraryPartIndex", elem.window.openingBase.libInd,
+                    "fixPoint", elem.window.fixPoint,
+                    "verticalLink", static_cast<Int32> (elem.window.openingBase.verticalLink.linkType),
+                    "directionType", static_cast<Int32> (elem.window.directionType)));
                 break;
 
             case API_LabelID:
@@ -2155,6 +2469,19 @@ GS::ObjectState SetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
 {
     GS::Array<GS::ObjectState> elementsWithDetails;
     parameters.Get ("elementsWithDetails", elementsWithDetails);
+    bool nativeCrudAtomic = false;
+    parameters.Get ("nativeCrudAtomic", nativeCrudAtomic);
+    bool nativeCrudZoneWriter = false;
+    parameters.Get ("nativeCrudZoneWriter", nativeCrudZoneWriter);
+    bool nativeCrudTestFaultAfterFirstApplied = false;
+    parameters.Get ("nativeCrudTestFaultAfterFirstApplied", nativeCrudTestFaultAfterFirstApplied);
+#if defined(TAPIR_NATIVE_CRUD_TEST_FAULT_AFTER_FIRST_APPLIED)
+    if (nativeCrudTestFaultAfterFirstApplied && (!nativeCrudAtomic || elementsWithDetails.GetSize () != 2))
+        return CreateErrorResponse (APIERR_BADPARS, "Zone first-applied fault test requires an atomic two-element detail update.");
+#else
+    if (nativeCrudTestFaultAfterFirstApplied)
+        return CreateErrorResponse (APIERR_BADPARS, "Native CRUD first-applied fault seam is not enabled in this APX build.");
+#endif
 
     GS::ObjectState response;
     const auto& executionResults = response.AddList<GS::ObjectState> ("executionResults");
@@ -2192,11 +2519,17 @@ GS::ObjectState SetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
             sortedElements.Push (ewd);
     }
 
-    ACAPI_CallUndoableCommand ("SetDetailsOfElementsCommand", [&]() {
+    GSErrCode callbackError = NoError;
+#if defined(TAPIR_NATIVE_CRUD_TEST_FAULT_AFTER_FIRST_APPLIED)
+    bool nativeCrudFaultInjected = false;
+#endif
+    GSSize nativeCrudAppliedCount = 0;
+    const GSErrCode undoError = ACAPI_CallUndoableCommand ("SetDetailsOfElementsCommand", [&]() -> GSErrCode {
         for (const GS::ObjectState& elementWithDetails : sortedElements) {
             const GS::ObjectState* elementId = elementWithDetails.Get ("elementId");
             if (elementId == nullptr) {
                 executionResults (CreateFailedExecutionResult (APIERR_BADPARS, "elementId is missing"));
+                if (nativeCrudAtomic) return APIERR_BADPARS;
                 continue;
             }
 
@@ -2206,13 +2539,21 @@ GS::ObjectState SetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
 
             if (err != NoError) {
                 executionResults (CreateFailedExecutionResult (err, "Failed to find the element"));
+                if (nativeCrudAtomic) return err;
                 continue;
             }
+            const short originalStoryIndex = elem.header.floorInd;
 
             const GS::ObjectState* details = elementWithDetails.Get ("details");
             if (details == nullptr) {
                 executionResults (CreateFailedExecutionResult (APIERR_BADPARS, "details field is missing"));
+                if (nativeCrudAtomic) return APIERR_BADPARS;
                 continue;
+            }
+            if (nativeCrudAtomic && details->Contains ("floorIndex")) {
+                executionResults (CreateFailedExecutionResult (APIERR_BADPARS,
+                    "Native CRUD UPDATE cannot change the element story."));
+                return APIERR_BADPARS;
             }
 
             API_Element mask = {};
@@ -2270,6 +2611,46 @@ GS::ObjectState SetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                         }
                     } break;
                     case API_ZoneID: {
+                        if (!nativeCrudZoneWriter) {
+                            executionResults (CreateFailedExecutionResult (APIERR_BADPARS, "Zone updates are only available through the validated Native CRUD writer."));
+                            if (nativeCrudAtomic) return APIERR_BADPARS;
+                            continue;
+                        }
+                        if (typeSpecificDetails->Contains ("referencePosition")) {
+                            executionResults (CreateFailedExecutionResult (APIERR_BADPARS, "Zone referencePosition is read-only in Native CRUD."));
+                            if (nativeCrudAtomic) return APIERR_BADPARS;
+                            continue;
+                        }
+                        if (typeSpecificDetails->Contains ("name")) {
+                            if (!SetUCharProperty (typeSpecificDetails, "name", elem.zone.roomName)) {
+                                executionResults (CreateFailedExecutionResult (APIERR_BADPARS, "Zone name must be a string."));
+                                if (nativeCrudAtomic) return APIERR_BADPARS;
+                                continue;
+                            }
+                            ACAPI_ELEMENT_MASK_SET (mask, API_ZoneType, roomName);
+                            hasElementChanges = true;
+                        }
+                        if (typeSpecificDetails->Contains ("numberStr")) {
+                            if (!SetUCharProperty (typeSpecificDetails, "numberStr", elem.zone.roomNoStr)) {
+                                executionResults (CreateFailedExecutionResult (APIERR_BADPARS, "Zone number must be a string."));
+                                if (nativeCrudAtomic) return APIERR_BADPARS;
+                                continue;
+                            }
+                            ACAPI_ELEMENT_MASK_SET (mask, API_ZoneType, roomNoStr);
+                            hasElementChanges = true;
+                        }
+                        const GS::ObjectState* category = typeSpecificDetails->Get ("categoryAttributeId");
+                        if (category != nullptr) {
+                            const API_Guid categoryGuid = GetGuidFromObjectState (*category);
+                            if (categoryGuid == APINULLGuid) {
+                                executionResults (CreateFailedExecutionResult (APIERR_BADPARS, "Zone categoryAttributeId must contain an exact GUID."));
+                                if (nativeCrudAtomic) return APIERR_BADPARS;
+                                continue;
+                            }
+                            elem.zone.catInd = GetAttributeIndexFromGuid (API_ZoneCatID, categoryGuid);
+                            ACAPI_ELEMENT_MASK_SET (mask, API_ZoneType, catInd);
+                            hasElementChanges = true;
+                        }
                         const GS::ObjectState* geometry = typeSpecificDetails->Get ("geometry");
                         if (geometry != nullptr) {
                             bool allowAutomaticZoneProbe = false;
@@ -2277,6 +2658,7 @@ GS::ObjectState SetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                             const GS::Optional<GS::UniString> memoError = BuildZonePolygonMemo (elem, clipMemo, *geometry, allowAutomaticZoneProbe);
                             if (memoError.HasValue ()) {
                                 executionResults (CreateFailedExecutionResult (APIERR_BADPARS, memoError.Get ()));
+                                if (nativeCrudAtomic) return APIERR_BADPARS;
                                 continue;
                             }
                             ACAPI_ELEMENT_MASK_SET (mask, API_ZoneType, poly);
@@ -2287,12 +2669,15 @@ GS::ObjectState SetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                         if (stampPosition != nullptr) {
                             elem.zone.pos = Get2DCoordinateFromObjectState (*stampPosition);
                             ACAPI_ELEMENT_MASK_SET (mask, API_ZoneType, pos);
+                            hasElementChanges = true;
                         }
                         if (typeSpecificDetails->Get ("stampAngle", elem.zone.stampAngle)) {
                             ACAPI_ELEMENT_MASK_SET (mask, API_ZoneType, stampAngle);
+                            hasElementChanges = true;
                         }
                         if (typeSpecificDetails->Get ("fixedStampAngle", elem.zone.fixedAngle)) {
                             ACAPI_ELEMENT_MASK_SET (mask, API_ZoneType, fixedAngle);
+                            hasElementChanges = true;
                         }
                     } break;
                     case API_LineID: {
@@ -2429,11 +2814,29 @@ GS::ObjectState SetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
 
             constexpr bool withDel = true;
             if (hasElementChanges || hasMemoChanges) {
+                bool storyChanged = false;
                 err = ACAPI_Element_Change (&elem, &mask,
                                             hasMemoChanges ? &clipMemo : nullptr,
                                             memoMask, withDel);
+                if (err == NoError && nativeCrudAtomic) {
+                    API_Elem_Head updatedHeader = {};
+                    updatedHeader.guid = elem.header.guid;
+                    const GSErrCode storyReadError = ACAPI_Element_GetHeader (&updatedHeader);
+                    if (storyReadError != NoError)
+                        err = storyReadError;
+                    else if (updatedHeader.floorInd != originalStoryIndex) {
+                        storyChanged = true;
+                        err = APIERR_COMMANDFAILED;
+                    }
+                }
                 if (err != NoError) {
-                    executionResults (CreateFailedExecutionResult (err, "Failed to change element"));
+                    executionResults (CreateFailedExecutionResult (err, storyChanged
+                        ? "Native CRUD UPDATE changed the element story; the undoable batch must roll back."
+                        : "Failed to change element"));
+                    if (nativeCrudAtomic) {
+                        callbackError = err;
+                        return err;
+                    }
                     continue;
                 }
             }
@@ -2480,10 +2883,36 @@ GS::ObjectState SetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
             }
 
             executionResults (CreateSuccessfulExecutionResult ());
+            ++nativeCrudAppliedCount;
+#if defined(TAPIR_NATIVE_CRUD_TEST_FAULT_AFTER_FIRST_APPLIED)
+            if (nativeCrudTestFaultAfterFirstApplied && nativeCrudAppliedCount == 1) {
+                nativeCrudFaultInjected = true;
+                callbackError = APIERR_COMMANDFAILED;
+                executionResults (CreateFailedExecutionResult (callbackError, "Disposable Native CRUD fault seam requested rollback after the first applied Zone item."));
+                return callbackError;
+            }
+#endif
         }
 
-        return NoError;
+        return callbackError;
     });
+
+    if (nativeCrudAtomic && (callbackError != NoError || undoError != NoError)) {
+        // Only a non-zero host undoable-command result is factual rollback
+        // evidence.  A callback error alone is insufficient proof that the
+        // host discarded an earlier applied row.
+        response.Add ("transactionRolledBack", undoError != NoError);
+        response.Add ("transactionError", undoError != NoError ? undoError : callbackError);
+#if defined(TAPIR_NATIVE_CRUD_TEST_FAULT_AFTER_FIRST_APPLIED)
+        if (nativeCrudFaultInjected && undoError != NoError) {
+            response.Add ("testFaultEvidence", GS::ObjectState (
+                "schemaVersion", "native-crud-test-fault-evidence/v1",
+                "firstAppliedItemIndex", 0,
+                "firstItemChangeSucceeded", true,
+                "hostRollbackReported", true));
+        }
+#endif
+    }
 
     return response;
 }

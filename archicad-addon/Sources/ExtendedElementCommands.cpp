@@ -331,21 +331,43 @@ static bool HasBeamSectionFields (const GS::ObjectState& details)
            details.Contains ("buildingMaterialId") || details.Contains ("profileId");
 }
 
-static GSErrCode ValidateColumnSectionMemo (API_Guid elementGuid)
+static GSErrCode ValidateColumnSupportedUpdateState (const API_Element& element, const GS::ObjectState& patch)
 {
+    if (element.column.isSlanted || !std::isfinite (element.column.slantAngle)
+        || !std::isfinite (element.column.origoPos.x) || !std::isfinite (element.column.origoPos.y)
+        || !std::isfinite (element.column.bottomOffset) || !std::isfinite (element.column.height)
+        || element.column.height <= 0.0 || !std::isfinite (element.column.axisRotationAngle))
+        return APIERR_NOTSUPPORTED;
+    if (patch.Contains ("height") && element.column.relativeTopStory != 0)
+        return APIERR_NOTSUPPORTED;
+
     API_ElementMemo memo = {};
     const GS::OnExit cleanup ([&memo] () {
         ACAPI_DisposeElemMemoHdls (&memo);
     });
 
-    const GSErrCode err = ACAPI_Element_GetMemo (elementGuid, &memo, APIMemoMask_ColumnSegment);
+    const GSErrCode err = ACAPI_Element_GetMemo (element.header.guid, &memo, APIMemoMask_ColumnSegment);
     if (err != NoError) {
         return err;
     }
-    if (memo.columnSegments == nullptr ||
-        BMGetPtrSize (reinterpret_cast<GSPtr> (memo.columnSegments)) < sizeof (API_ColumnSegmentType)) {
+    if (memo.columnSegments == nullptr) {
         return APIERR_BADPARS;
     }
+    const GSSize bytes = BMGetPtrSize (reinterpret_cast<GSPtr> (memo.columnSegments));
+    if (bytes == 0 || bytes % sizeof (API_ColumnSegmentType) != 0
+        || bytes / sizeof (API_ColumnSegmentType) != 1)
+        return APIERR_NOTSUPPORTED;
+
+    const API_AssemblySegmentData& segment = memo.columnSegments[0].assemblySegmentData;
+    if (segment.circleBased || segment.modelElemStructureType != API_BasicStructure
+        || segment.profileType != APISect_Normal || !segment.isHomogeneous
+        || !std::isfinite (segment.nominalWidth) || segment.nominalWidth <= 0.0
+        || !std::isfinite (segment.nominalHeight) || segment.nominalHeight <= 0.0
+        || segment.buildingMaterial == APIInvalidAttributeIndex
+        || GetAttributeGuidFromIndex (API_BuildingMaterialID, segment.buildingMaterial) == APINULLGuid)
+        return APIERR_NOTSUPPORTED;
+    if (HasColumnSectionFields (patch) && segment.isWidthAndHeightLinked)
+        return APIERR_NOTSUPPORTED;
     return NoError;
 }
 
@@ -4689,9 +4711,20 @@ GS::ObjectState ModifyColumnsCommand::Execute (const GS::ObjectState& parameters
     }
 
     const Stories stories = GetStories ();
+    bool faultAfterFirstApplied = false;
+    parameters.Get ("nativeCrudTestFaultAfterFirstApplied", faultAfterFirstApplied);
+#if !defined(TAPIR_NATIVE_CRUD_TEST_FAULT_AFTER_FIRST_APPLIED)
+    if (faultAfterFirstApplied)
+        return CreateErrorResponse (APIERR_BADPARS, "Column first-applied rollback fault seam is unavailable in this APX build.");
+#else
+    if (faultAfterFirstApplied && (!atomic || items.GetSize () != 2))
+        return CreateErrorResponse (APIERR_BADPARS, "Column first-applied rollback fault requires an atomic two-item UPDATE.");
+#endif
 
-    return ExecuteModifyWithResults ("Modify Columns", [&](GS::Array<GS::ObjectState>& results) {
-        for (const auto& item : items) {
+    GS::ObjectState response = ExecuteModifyWithResults ("Modify Columns", [&](GS::Array<GS::ObjectState>& results) {
+        const GSSize itemCount = static_cast<GSSize> (items.GetSize ());
+        for (GSSize index = 0; index < itemCount; ++index) {
+            const auto& item = items[index];
             if (item.Get ("elementId") == nullptr) {
                 results.Push (CreateFailedExecutionResult (APIERR_BADPARS, "Missing required 'elementId' field."));
                 continue;
@@ -4703,6 +4736,7 @@ GS::ObjectState ModifyColumnsCommand::Execute (const GS::ObjectState& parameters
                 results.Push (CreateFailedExecutionResult (err, "Failed to load column."));
                 continue;
             }
+            const short originalStoryIndex = element.header.floorInd;
 
             API_Element mask = {};
             ACAPI_ELEMENT_MASK_CLEAR (mask);
@@ -4713,12 +4747,10 @@ GS::ObjectState ModifyColumnsCommand::Execute (const GS::ObjectState& parameters
             }
 
             const bool hasSectionFields = HasColumnSectionFields (item);
-            if (hasSectionFields) {
-                err = ValidateColumnSectionMemo (element.header.guid);
-                if (err != NoError) {
-                    results.Push (CreateFailedExecutionResult (err, "Column cross section memo is not available for update."));
-                    continue;
-                }
+            err = ValidateColumnSupportedUpdateState (element, item);
+            if (err != NoError) {
+                results.Push (CreateFailedExecutionResult (err, "Column UPDATE requires fresh supported vertical homogeneous rectangular Basic section facts and supported linkage."));
+                continue;
             }
 
             const bool changed = ApplyColumnDetails (element, mask, item, stories);
@@ -4737,15 +4769,51 @@ GS::ObjectState ModifyColumnsCommand::Execute (const GS::ObjectState& parameters
 
             if (hasSectionFields) {
                 err = ApplyColumnSectionToMemo (element.header.guid, item);
-                results.Push (err == NoError
-                    ? CreateSuccessfulExecutionResult ()
-                    : CreateFailedExecutionResult (err, "Failed to modify column cross section."));
-                continue;
+                if (err != NoError) {
+                    results.Push (CreateFailedExecutionResult (err, "Failed to modify column cross section."));
+                    continue;
+                }
+            }
+
+            if (atomic) {
+                API_Elem_Head updatedHeader = {};
+                updatedHeader.guid = element.header.guid;
+                err = ACAPI_Element_GetHeader (&updatedHeader);
+                if (err != NoError) {
+                    results.Push (CreateFailedExecutionResult (err, "Failed to verify Column story preservation."));
+                    continue;
+                }
+                if (updatedHeader.floorInd != originalStoryIndex) {
+                    results.Push (CreateFailedExecutionResult (APIERR_COMMANDFAILED,
+                        "Native CRUD Column UPDATE changed story; the undoable batch must roll back."));
+                    continue;
+                }
             }
 
             results.Push (CreateSuccessfulExecutionResult ());
+#if defined(TAPIR_NATIVE_CRUD_TEST_FAULT_AFTER_FIRST_APPLIED)
+            if (faultAfterFirstApplied && index == 0) {
+                // Inject only after API_Element_Change and any Column memo
+                // write for item zero have both completed inside this same
+                // undoable callback. The failed result makes the atomic
+                // wrapper return an error and Archicad roll back the batch.
+                results.Push (CreateFailedExecutionResult (APIERR_COMMANDFAILED, "Disposable Column fault seam requested rollback after the first complete item."));
+                break;
+            }
+#endif
         }
     }, atomic);
+#if defined(TAPIR_NATIVE_CRUD_TEST_FAULT_AFTER_FIRST_APPLIED)
+    bool rolledBack = false;
+    if (faultAfterFirstApplied && response.Get ("transactionRolledBack", rolledBack) && rolledBack) {
+        response.Add ("testFaultEvidence", GS::ObjectState (
+            "schemaVersion", "native-crud-test-fault-evidence/v1",
+            "firstAppliedItemIndex", 0,
+            "firstItemChangeSucceeded", true,
+            "hostRollbackReported", true));
+    }
+#endif
+    return response;
 }
 
 ModifyWindowsCommand::ModifyWindowsCommand () :

@@ -12,6 +12,11 @@ option (TAPIR_ENABLE_NATIVE_CRUD_TEST_FAULT
     OFF
 )
 
+option (TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS
+    "Enable explicitly guarded developer-only candidate Native CRUD writers for disposable qualification."
+    OFF
+)
+
 option (TAPIR_ENABLE_NATIVE_DISPOSABLE_CHANNEL_PROBE
     "Compile the default-off disposable channel read-only probe into a test-only APX."
     OFF
@@ -105,6 +110,14 @@ if ((TAPIR_ENABLE_NATIVE_DISPOSABLE_CHANNEL_PROBE AND TAPIR_ENABLE_NATIVE_DISPOS
     message (FATAL_ERROR "Disposable channel, permit, Column, Line, Arc, Hatch, Zone, Door, Window and fault profiles must use separate isolated APX builds.")
 endif ()
 
+if (TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS AND (TAPIR_ENABLE_NATIVE_DISPOSABLE_CHANNEL_PROBE
+    OR TAPIR_ENABLE_NATIVE_DISPOSABLE_PERMIT OR TAPIR_ENABLE_NATIVE_DISPOSABLE_COLUMN
+    OR TAPIR_ENABLE_NATIVE_DISPOSABLE_LINE OR TAPIR_ENABLE_NATIVE_DISPOSABLE_ARC
+    OR TAPIR_ENABLE_NATIVE_DISPOSABLE_HATCH OR TAPIR_ENABLE_NATIVE_DISPOSABLE_ZONE
+    OR TAPIR_ENABLE_NATIVE_DISPOSABLE_DOOR OR TAPIR_ENABLE_NATIVE_DISPOSABLE_WINDOW))
+    message (FATAL_ERROR "Native candidate writers cannot be combined with per-type disposable marker profiles.")
+endif ()
+
 set_property (GLOBAL PROPERTY USE_FOLDERS ON)
 
 set (CMAKE_CONFIGURATION_TYPES Debug;Release;RelWithDebInfo)
@@ -124,7 +137,11 @@ else ()
 	set (NamePostFix Mac)
 endif ()
 set (AddOnName "TapirAddOn_AC${AC_VERSION}_${NamePostFix}")
-if (TAPIR_ENABLE_NATIVE_CRUD_TEST_FAULT)
+if (TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS)
+    # Candidate writers retain one shared developer-only identity, including
+    # when combined with the first-applied rollback fault seam.
+    set (AddOnName "${AddOnName}_NativeCandidateWriters")
+elseif (TAPIR_ENABLE_NATIVE_CRUD_TEST_FAULT)
     # This target name is intentionally distinct from the runtime APX.  The
     # disposable fault profile must never look deployable by filename alone.
     set (AddOnName "${AddOnName}_NativeCrudTestFault")
@@ -255,6 +272,11 @@ else ()
 endif ()
 target_compile_definitions (AddOn PRIVATE TAPIR_BUILD_ID="${TAPIR_BUILD_ID_SAFE}")
 target_compile_definitions (AddOn PRIVATE TAPIR_AC_VERSION=${AC_VERSION})
+if (TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS)
+    target_compile_definitions (AddOn PRIVATE TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS=1)
+else ()
+    target_compile_definitions (AddOn PRIVATE TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS=0)
+endif ()
 if (TAPIR_ENABLE_NATIVE_CRUD_TEST_FAULT)
     # The ordinary profile deliberately does not define this macro.  The
     # source seam is therefore compiled out unless the explicit disposable

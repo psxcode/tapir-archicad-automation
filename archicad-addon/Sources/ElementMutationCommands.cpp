@@ -2,6 +2,7 @@
 
 #include "ElementCommands.hpp"
 #include "ElementCreationCommands.hpp"
+#include "ElementGDLParameterCommands.hpp"
 #include "ExtendedElementCommands.hpp"
 #include "MigrationHelper.hpp"
 #include "NativeOwnership.hpp"
@@ -41,6 +42,7 @@ const ElementTypeSpec* GetElementTypeSpec (const API_ElemTypeID typeID)
     static const ElementTypeSpec beam   { API_BeamID,   "beamsData",   "beamsWithDetails" };
     static const ElementTypeSpec line   { API_LineID,   "linesData",   "linesWithDetails" };
     static const ElementTypeSpec arc    { API_ArcID,    "arcsData",    "arcsWithDetails" };
+    static const ElementTypeSpec hatch  { API_HatchID,  "hatchesData", "hatchesWithDetails" };
 
     switch (typeID) {
         case API_WallID:   return &wall;
@@ -49,8 +51,424 @@ const ElementTypeSpec* GetElementTypeSpec (const API_ElemTypeID typeID)
         case API_BeamID:   return &beam;
         case API_LineID:   return &line;
         case API_ArcID:    return &arc;
+        case API_HatchID:  return &hatch;
         default:           return nullptr;
     }
+}
+
+bool SameDoorMarkerScalarState (const API_Element& left, const API_Element& right)
+{
+    return GetElemTypeId (left.header) == API_ObjectID && GetElemTypeId (right.header) == API_ObjectID
+        // These are appearance/library/GDL scalars. The marker's story, owner,
+        // GUID and position are identity/placement facts checked separately:
+        // CreateExt is expected to remap them to the newly created Door.
+        && left.header.layer == right.header.layer
+        && left.object.pen == right.object.pen && left.object.ltypeInd == right.object.ltypeInd
+        && left.object.mat == right.object.mat && left.object.sectFill == right.object.sectFill
+        && left.object.sectFillPen == right.object.sectFillPen && left.object.sectBGPen == right.object.sectBGPen
+        && left.object.sectContPen == right.object.sectContPen && left.object.useObjPens == right.object.useObjPens
+        && left.object.useObjLtypes == right.object.useObjLtypes && left.object.useObjMaterials == right.object.useObjMaterials
+        && left.object.useObjSectAttrs == right.object.useObjSectAttrs && left.object.reflected == right.object.reflected
+        && left.object.useXYFixSize == right.object.useXYFixSize && left.object.fixPoint == right.object.fixPoint
+        && left.object.angle == right.object.angle && left.object.level == right.object.level
+        && left.object.xRatio == right.object.xRatio && left.object.yRatio == right.object.yRatio
+        && left.object.offset.x == right.object.offset.x && left.object.offset.y == right.object.offset.y
+        && left.object.fixedAngle == right.object.fixedAngle
+        && left.object.libInd == right.object.libInd
+        && left.object.lightIsOn == right.object.lightIsOn && left.object.isAutoOnStoryVisibility == right.object.isAutoOnStoryVisibility
+        && left.object.visibility.showOnHome == right.object.visibility.showOnHome
+        && left.object.visibility.showAllAbove == right.object.visibility.showAllAbove
+        && left.object.visibility.showAllBelow == right.object.visibility.showAllBelow
+        && left.object.visibility.showRelAbove == right.object.visibility.showRelAbove
+        && left.object.visibility.showRelBelow == right.object.visibility.showRelBelow
+        && left.object.linkToSettings.homeStoryDifference == right.object.linkToSettings.homeStoryDifference
+        && left.object.linkToSettings.newCreationMode == right.object.linkToSettings.newCreationMode
+        && left.object.lightColor.f_red == right.object.lightColor.f_red
+        && left.object.lightColor.f_green == right.object.lightColor.f_green
+        && left.object.lightColor.f_blue == right.object.lightColor.f_blue
+        && left.object.lookId == right.object.lookId;
+}
+
+bool SameDoorMarkerOwner (const API_Element& left, const API_Element& right)
+{
+    if (left.object.owner != right.object.owner) return false;
+#ifdef ServerMainVers_2600
+    return left.object.ownerType == right.object.ownerType;
+#else
+    return left.object.ownerID == right.object.ownerID;
+#endif
+}
+
+bool DoorMarkerOwnedByDoor (const API_Element& marker, const API_Guid& doorGuid)
+{
+#ifdef ServerMainVers_2600
+    return marker.object.owner == doorGuid && marker.object.ownerType == API_DoorID;
+#else
+    return marker.object.owner == doorGuid && marker.object.ownerID == API_DoorID;
+#endif
+}
+
+bool SameDoorMarkerPosition (const API_Element& left, const API_Element& right)
+{
+    return left.object.pos.x == right.object.pos.x && left.object.pos.y == right.object.pos.y;
+}
+
+bool SameDoorSourceScalarState (const API_Element& left, const API_Element& right)
+{
+    return GetElemTypeId (left.header) == API_DoorID && GetElemTypeId (right.header) == API_DoorID
+        && left.header.guid == right.header.guid && left.header.floorInd == right.header.floorInd
+        && left.header.layer == right.header.layer && left.door.owner == right.door.owner
+        && left.door.objLoc == right.door.objLoc && left.door.lower == right.door.lower
+        && left.door.openingBase.width == right.door.openingBase.width
+        && left.door.openingBase.height == right.door.openingBase.height
+        && left.door.openingBase.libInd == right.door.openingBase.libInd
+        && left.door.openingBase.markGuid == right.door.openingBase.markGuid
+        && left.door.openingBase.reflected == right.door.openingBase.reflected
+        && left.door.openingBase.refSide == right.door.openingBase.refSide
+        && left.door.openingBase.oSide == right.door.openingBase.oSide
+        && left.door.reveal == right.door.reveal && left.door.revealDepthLocation == right.door.revealDepthLocation
+        && left.door.revealDepthOffset == right.door.revealDepthOffset
+        && left.door.revealDepthFromSide == right.door.revealDepthFromSide
+        && left.door.jambDepthHead == right.door.jambDepthHead && left.door.jambDepthSill == right.door.jambDepthSill
+        && left.door.jambDepth == right.door.jambDepth && left.door.jambDepth2 == right.door.jambDepth2;
+}
+
+bool SameWindowSourceScalarState (const API_Element& left, const API_Element& right)
+{
+    return GetElemTypeId (left.header) == API_WindowID && GetElemTypeId (right.header) == API_WindowID
+        && left.header.guid == right.header.guid && left.header.floorInd == right.header.floorInd
+        && left.header.layer == right.header.layer && left.window.owner == right.window.owner
+        && left.window.objLoc == right.window.objLoc && left.window.lower == right.window.lower
+        && left.window.openingBase.width == right.window.openingBase.width
+        && left.window.openingBase.height == right.window.openingBase.height
+        && left.window.openingBase.libInd == right.window.openingBase.libInd
+        && left.window.openingBase.markGuid == right.window.openingBase.markGuid
+        && left.window.openingBase.verticalLink.linkType == right.window.openingBase.verticalLink.linkType
+        && left.window.openingBase.verticalLink.linkValue == right.window.openingBase.verticalLink.linkValue
+        && left.window.fixPoint == right.window.fixPoint && left.window.directionType == right.window.directionType
+        && left.window.openingBase.reflected == right.window.openingBase.reflected
+        && left.window.openingBase.refSide == right.window.openingBase.refSide
+        && left.window.openingBase.oSide == right.window.openingBase.oSide
+        && left.window.reveal == right.window.reveal && left.window.revealDepthLocation == right.window.revealDepthLocation
+        && left.window.revealDepthOffset == right.window.revealDepthOffset
+        && left.window.revealDepthFromSide == right.window.revealDepthFromSide
+        && left.window.jambDepthHead == right.window.jambDepthHead && left.window.jambDepthSill == right.window.jambDepthSill
+        && left.window.jambDepth == right.window.jambDepth && left.window.jambDepth2 == right.window.jambDepth2;
+}
+
+bool SameWindowLibraryPartIdentity (const API_LibPart& left, const API_LibPart& right)
+{
+    return left.index == right.index && left.version == right.version
+        && GS::UniString (left.ownUnID) == GS::UniString (right.ownUnID)
+        && GS::UniString (left.file_UName) == GS::UniString (right.file_UName);
+}
+
+bool WindowNativeTopologySupported (const API_Element& element)
+{
+    return GetElemTypeId (element.header) == API_WindowID
+        && element.window.openingBase.libInd > 0
+        && element.window.fixPoint == APIHoleAnchor_CenterFix
+        && element.window.openingBase.verticalLink.linkType == API_LinkSillToWallBottom
+        && element.window.directionType == API_WDAssociativeToWall;
+}
+
+constexpr double CompensatedDoorCenterOffsetForWidthChange (const double centerOffset, const double beforeWidth, const double requestedWidth)
+{
+    // Empirical hypothesis from E-486: one AC25 width increase (+0.05)
+    // shifted objLoc by -0.025 even when the previous center was included in
+    // the Change mask. The half-delta compensation still needs fresh live
+    // verification on AC25 and AC28, including other opening orientations.
+    return centerOffset + (requestedWidth - beforeWidth) * 0.5;
+}
+
+constexpr double DoorCenterCompensationTestTolerance = 1.0e-12;
+constexpr double DoorCenterCompensationAbsolute (const double value) { return value < 0.0 ? -value : value; }
+static_assert (DoorCenterCompensationAbsolute (
+    CompensatedDoorCenterOffsetForWidthChange (1.0, 0.9, 0.95) - 1.025) < DoorCenterCompensationTestTolerance,
+    "Door width increase must compensate the observed negative half-width center shift.");
+static_assert (DoorCenterCompensationAbsolute (
+    CompensatedDoorCenterOffsetForWidthChange (1.0, 0.95, 0.9) - 0.975) < DoorCenterCompensationTestTolerance,
+    "Door width decrease must apply the inverse half-width compensation.");
+static_assert (DoorCenterCompensationAbsolute (
+    CompensatedDoorCenterOffsetForWidthChange (2.0, 0.9, 0.95) - 2.025) < DoorCenterCompensationTestTolerance,
+    "Door width compensation must start from an explicitly requested center when provided.");
+
+GS::ObjectState ExecuteDoorCreate (const GS::Array<GS::ObjectState>& items, GS::ProcessControl& /*processControl*/)
+{
+    GS::ObjectState response;
+    const auto& elements = response.AddList<GS::ObjectState> ("elements");
+    GSErrCode callbackError = NoError;
+    GS::UniString failureStage = "not-started";
+    if (items.GetSize () != 1) return CreateErrorResponse (APIERR_BADPARS, "Door typed CREATE accepts one exact template case per request.");
+
+    const GSErrCode undoError = ACAPI_CallUndoableCommand ("Create Native Door from Exact Template", [&] () -> GSErrCode {
+        const GS::ObjectState& item = items[0];
+        const GS::ObjectState* sourceId = item.Get ("cloneSourceElementId");
+        const GS::ObjectState* payload = item.Get ("payload");
+        if (sourceId == nullptr || payload == nullptr) return APIERR_BADPARS;
+        const API_Guid sourceGuid = GetGuidFromObjectState (*sourceId);
+        const API_Guid hostGuid = payload->Get ("ownerWallId") == nullptr ? APINULLGuid : GetGuidFromObjectState (*payload->Get ("ownerWallId"));
+        Int32 storyIndex = std::numeric_limits<Int32>::min ();
+        if (!payload->Get ("floorIndex", storyIndex) || storyIndex < std::numeric_limits<short>::min () || storyIndex > std::numeric_limits<short>::max ())
+            return APIERR_BADPARS;
+
+        API_Element source = {};
+        source.header.guid = sourceGuid;
+        failureStage = "read-exact-door-template";
+        GSErrCode error = sourceGuid == APINULLGuid ? APIERR_BADPARS : ACAPI_Element_Get (&source);
+        if (error == NoError && (GetElemTypeId (source.header) != API_DoorID || source.header.guid != sourceGuid)) error = APIERR_BADID;
+        const API_Guid sourceMarkerGuid = error == NoError ? source.door.openingBase.markGuid : APINULLGuid;
+        const bool sourceMarkerless = sourceMarkerGuid == APINULLGuid;
+        if (error == NoError && !sourceMarkerless) error = APIERR_BADPARS;
+
+        API_Element host = {};
+        if (error == NoError) {
+            host.header.guid = hostGuid;
+            failureStage = "read-exact-host-wall";
+            error = hostGuid == APINULLGuid ? APIERR_BADPARS : ACAPI_Element_Get (&host);
+            if (error == NoError && (GetElemTypeId (host.header) != API_WallID || host.header.guid != hostGuid)) error = APIERR_BADID;
+            if (error == NoError && host.header.floorInd != static_cast<short> (storyIndex)) error = APIERR_BADPARS;
+        }
+
+        API_ElementMemo sourceMemo = {};
+        NativeMemoGuard sourceMemoGuard (sourceMemo);
+        if (error == NoError) {
+            failureStage = "read-template-door-memo";
+            error = ACAPI_Element_GetMemo (sourceGuid, &sourceMemo, APIMemoMask_All);
+        }
+        if (error != NoError) {
+            callbackError = error;
+            elements (CreateFailedExecutionResult (error, "Exact markerless Door template, host story, or complete template memo was unavailable."));
+            return error;
+        }
+
+        API_Element element = source;
+        element.header.guid = APINULLGuid;
+        element.header.floorInd = static_cast<short> (storyIndex);
+        element.door.openingBase.markGuid = APINULLGuid;
+        element.door.owner = hostGuid;
+        double value = 0.0;
+        if (payload->Get ("centerOffset", value)) element.door.objLoc = value;
+        if (payload->Get ("sillHeight", value)) element.door.lower = value;
+        if (payload->Get ("width", value)) element.door.openingBase.width = value;
+        if (payload->Get ("height", value)) element.door.openingBase.height = value;
+        bool flag = false;
+        if (payload->Get ("reflected", flag)) element.door.openingBase.reflected = flag;
+        if (payload->Get ("refSide", flag)) element.door.openingBase.refSide = flag;
+        if (payload->Get ("oSide", flag)) element.door.openingBase.oSide = flag;
+        failureStage = "createext-door-without-subelements";
+        error = ACAPI_Element_CreateExt (&element, &sourceMemo, 0UL, nullptr);
+        if (error == NoError) {
+            API_Element created = {};
+            created.header.guid = element.header.guid;
+            failureStage = "read-created-door";
+            error = ACAPI_Element_Get (&created);
+            if (error == NoError && (created.header.guid == APINULLGuid || created.header.guid == sourceGuid
+                || created.header.floorInd != static_cast<short> (storyIndex) || created.door.owner != hostGuid
+                || created.door.openingBase.width != element.door.openingBase.width || created.door.openingBase.height != element.door.openingBase.height
+                || created.door.objLoc != element.door.objLoc || created.door.lower != element.door.lower
+                || created.door.openingBase.reflected != element.door.openingBase.reflected
+                || created.door.openingBase.refSide != element.door.openingBase.refSide || created.door.openingBase.oSide != element.door.openingBase.oSide
+                || created.door.openingBase.libInd != source.door.openingBase.libInd
+                || created.door.openingBase.markGuid != APINULLGuid)) error = APIERR_COMMANDFAILED;
+            API_Element sourceAfter = {};
+            if (error == NoError) {
+                sourceAfter.header.guid = sourceGuid;
+                failureStage = "verify-template-preserved";
+                error = ACAPI_Element_Get (&sourceAfter);
+                if (error == NoError && (!SameDoorSourceScalarState (source, sourceAfter)
+                    || sourceAfter.door.openingBase.markGuid != APINULLGuid)) error = APIERR_COMMANDFAILED;
+            }
+            if (error == NoError) elements (CreateElementIdObjectState (created.header.guid));
+        }
+        if (error != NoError) {
+            callbackError = error;
+            GS::ObjectState failed = CreateFailedExecutionResult (error, "Door typed CREATE failed exact markerless-template, host, or factual preservation postconditions.");
+            failed.Add ("failureStage", failureStage);
+            elements (failed);
+            return error;
+        }
+        return NoError;
+    });
+    if (undoError != NoError) {
+        response.Add ("transactionRolledBack", true);
+        response.Add ("transactionError", undoError);
+        response.Add ("failureStage", failureStage);
+    }
+    return response;
+}
+
+GS::ObjectState ExecuteDoorUpdate (const GS::Array<GS::ObjectState>& items, const bool faultAfterFirstApplied, GS::ProcessControl& /*processControl*/)
+{
+    GS::ObjectState response;
+    const auto& results = response.AddList<GS::ObjectState> ("executionResults");
+    GSErrCode callbackError = NoError;
+    GS::UniString failureStage = "not-started";
+#if defined(TAPIR_NATIVE_CRUD_TEST_FAULT_AFTER_FIRST_APPLIED)
+    bool firstItemFaultInjectedAfterSuccessfulChange = false;
+#else
+    (void) faultAfterFirstApplied;
+#endif
+    const GSErrCode undoError = ACAPI_CallUndoableCommand ("Update Native Doors", [&] () -> GSErrCode {
+        for (GSSize index = 0; index < static_cast<GSSize> (items.GetSize ()); ++index) {
+            const GS::ObjectState& item = items[index];
+            if (callbackError != NoError) {
+                results (CreateFailedExecutionResult (callbackError, "Door item was not attempted because the batch is rolling back."));
+                continue;
+            }
+            const GS::ObjectState* id = item.Get ("elementId");
+            const API_Guid guid = id == nullptr ? APINULLGuid : GetGuidFromObjectState (*id);
+            API_Element element = {};
+            element.header.guid = guid;
+            failureStage = "read-door";
+            GSErrCode error = guid == APINULLGuid ? APIERR_BADPARS : ACAPI_Element_Get (&element);
+            if (error == NoError && (GetElemTypeId (element.header) != API_DoorID || element.header.guid != guid)) error = APIERR_BADID;
+            const API_Element before = element;
+            // Marker-bearing and unresolved targets remain outside this packet.
+            if (error == NoError && before.door.openingBase.markGuid != APINULLGuid) error = APIERR_BADPARS;
+            API_Element mask = {};
+            ACAPI_ELEMENT_MASK_CLEAR (mask);
+            bool changed = false;
+            double number = 0.0;
+            if (error == NoError && item.Get ("centerOffset", number)) { element.door.objLoc = number; ACAPI_ELEMENT_MASK_SET (mask, API_WindowType, objLoc); changed = true; }
+            if (error == NoError && item.Get ("sillHeight", number)) { element.door.lower = number; ACAPI_ELEMENT_MASK_SET (mask, API_WindowType, lower); changed = true; }
+            if (error == NoError && item.Get ("width", number)) {
+                double requestedCenterOffset = before.door.objLoc;
+                item.Get ("centerOffset", requestedCenterOffset);
+                element.door.objLoc = CompensatedDoorCenterOffsetForWidthChange (
+                    requestedCenterOffset, before.door.openingBase.width, number);
+                ACAPI_ELEMENT_MASK_SET (mask, API_WindowType, objLoc);
+                element.door.openingBase.width = number;
+                ACAPI_ELEMENT_MASK_SET (mask, API_WindowType, openingBase.width);
+                changed = true;
+            }
+            if (error == NoError && item.Get ("height", number)) { element.door.openingBase.height = number; ACAPI_ELEMENT_MASK_SET (mask, API_WindowType, openingBase.height); changed = true; }
+            bool flag = false;
+            if (error == NoError && item.Get ("reflected", flag)) { element.door.openingBase.reflected = flag; ACAPI_ELEMENT_MASK_SET (mask, API_WindowType, openingBase.reflected); changed = true; }
+            if (error == NoError && item.Get ("refSide", flag)) { element.door.openingBase.refSide = flag; ACAPI_ELEMENT_MASK_SET (mask, API_WindowType, openingBase.refSide); changed = true; }
+            if (error == NoError && item.Get ("oSide", flag)) { element.door.openingBase.oSide = flag; ACAPI_ELEMENT_MASK_SET (mask, API_WindowType, openingBase.oSide); changed = true; }
+            if (error == NoError && !changed) error = APIERR_BADPARS;
+            if (error == NoError) {
+                // This writer admits only markerless Doors. Use the established
+                // scalar element-change route; ChangeExt is needed for linked
+                // marker sub-elements, which are outside this packet.
+                failureStage = "change-door";
+                error = ACAPI_Element_Change (&element, &mask, nullptr, 0, true);
+            }
+            if (error == NoError) {
+                API_Element after = {};
+                after.header.guid = guid;
+                failureStage = "read-door-postcondition";
+                error = ACAPI_Element_Get (&after);
+                GS::UniString failureMessage = "Door postcondition read failed.";
+                const bool postconditionReadSucceeded = error == NoError;
+                if (error == NoError) {
+                    failureStage = "verify-door-preservation";
+                    failureMessage = "Door UPDATE changed protected identity, host, library, marker, reveal, or jamb state.";
+                }
+                if (error == NoError && (after.header.guid != before.header.guid || after.header.floorInd != before.header.floorInd
+                    || after.header.layer != before.header.layer || after.door.owner != before.door.owner
+                    || after.door.openingBase.libInd != before.door.openingBase.libInd
+                    || after.door.openingBase.markGuid != before.door.openingBase.markGuid
+                    || after.door.reveal != before.door.reveal || after.door.revealDepthLocation != before.door.revealDepthLocation
+                    || after.door.revealDepthOffset != before.door.revealDepthOffset || after.door.revealDepthFromSide != before.door.revealDepthFromSide
+                    || after.door.jambDepthHead != before.door.jambDepthHead || after.door.jambDepthSill != before.door.jambDepthSill
+                    || after.door.jambDepth != before.door.jambDepth || after.door.jambDepth2 != before.door.jambDepth2)) error = APIERR_COMMANDFAILED;
+                const auto expectedDouble = [&] (const char* field, const double oldValue, const double actual) {
+                    double requested = oldValue;
+                    item.Get (field, requested);
+                    return requested == actual;
+                };
+                const auto expectedBool = [&] (const char* field, const bool oldValue, const bool actual) {
+                    bool requested = oldValue;
+                    item.Get (field, requested);
+                    return requested == actual;
+                };
+                if (error == NoError) {
+                    failureStage = "verify-door-requested-values";
+                    failureMessage = "Door UPDATE did not read back its requested writable values.";
+                    if (!expectedDouble ("centerOffset", before.door.objLoc, after.door.objLoc)) {
+                        failureStage = "verify-door-requested-centerOffset";
+                        failureMessage = "Door centerOffset does not match the requested value.";
+                        error = APIERR_COMMANDFAILED;
+                    } else if (!expectedDouble ("sillHeight", before.door.lower, after.door.lower)) {
+                        failureStage = "verify-door-requested-sillHeight";
+                        failureMessage = "Door sillHeight does not match the requested value.";
+                        error = APIERR_COMMANDFAILED;
+                    } else if (!expectedDouble ("width", before.door.openingBase.width, after.door.openingBase.width)) {
+                        failureStage = "verify-door-requested-width";
+                        failureMessage = "Door width does not match the requested value.";
+                        error = APIERR_COMMANDFAILED;
+                    } else if (!expectedDouble ("height", before.door.openingBase.height, after.door.openingBase.height)) {
+                        failureStage = "verify-door-requested-height";
+                        failureMessage = "Door height does not match the requested value.";
+                        error = APIERR_COMMANDFAILED;
+                    } else if (!expectedBool ("reflected", before.door.openingBase.reflected, after.door.openingBase.reflected)) {
+                        failureStage = "verify-door-requested-reflected";
+                        failureMessage = "Door reflected does not match the requested value.";
+                        error = APIERR_COMMANDFAILED;
+                    } else if (!expectedBool ("refSide", before.door.openingBase.refSide, after.door.openingBase.refSide)) {
+                        failureStage = "verify-door-requested-refSide";
+                        failureMessage = "Door refSide does not match the requested value.";
+                        error = APIERR_COMMANDFAILED;
+                    } else if (!expectedBool ("oSide", before.door.openingBase.oSide, after.door.openingBase.oSide)) {
+                        failureStage = "verify-door-requested-oSide";
+                        failureMessage = "Door oSide does not match the requested value.";
+                        error = APIERR_COMMANDFAILED;
+                    }
+                }
+                if (error != NoError) {
+                    callbackError = error;
+                    GS::ObjectState failed = CreateFailedExecutionResult (error, failureMessage);
+                    failed.Add ("failureStage", failureStage);
+                    if (postconditionReadSucceeded
+                        && (failureStage == "verify-door-requested-centerOffset" || failureStage == "verify-door-requested-width")) {
+                        double requestedCenterOffset = before.door.objLoc;
+                        double requestedWidth = before.door.openingBase.width;
+                        item.Get ("centerOffset", requestedCenterOffset);
+                        item.Get ("width", requestedWidth);
+                        failed.Add ("nativeFailureDetails", GS::ObjectState (
+                            "requestedCenterOffset", requestedCenterOffset,
+                            "actualCenterOffset", after.door.objLoc,
+                            "requestedWidth", requestedWidth,
+                            "actualWidth", after.door.openingBase.width,
+                            "beforeWidth", before.door.openingBase.width));
+                    }
+                    results (failed);
+                    return error;
+                }
+            }
+            if (error != NoError) {
+                callbackError = error;
+                GS::ObjectState failed = CreateFailedExecutionResult (error, "Door typed UPDATE failed its exact native precondition or preservation postcondition.");
+                failed.Add ("failureStage", failureStage);
+                results (failed);
+                return error;
+            }
+            results (CreateSuccessfulExecutionResult ());
+#if defined(TAPIR_NATIVE_CRUD_TEST_FAULT_AFTER_FIRST_APPLIED)
+            if (faultAfterFirstApplied && index == 0) {
+                firstItemFaultInjectedAfterSuccessfulChange = true;
+                callbackError = APIERR_COMMANDFAILED;
+                failureStage = "fault-after-first-applied-item";
+                results (CreateFailedExecutionResult (callbackError, "Disposable Door candidate fault requested rollback after the first applied item."));
+                return callbackError;
+            }
+#endif
+        }
+        return callbackError;
+    });
+    if (undoError != NoError) {
+        response.Add ("transactionRolledBack", true);
+        response.Add ("transactionError", undoError);
+        response.Add ("failureStage", failureStage);
+#if defined(TAPIR_NATIVE_CRUD_TEST_FAULT_AFTER_FIRST_APPLIED)
+        if (firstItemFaultInjectedAfterSuccessfulChange) response.Add ("testFaultEvidence", GS::ObjectState (
+            "schemaVersion", "native-crud-test-fault-evidence/v1", "firstAppliedItemIndex", 0,
+            "firstItemChangeSucceeded", true, "hostRollbackReported", true));
+#endif
+    }
+    return response;
 }
 
 GS::Optional<GS::UniString> MissingFieldError (const char* fieldName)
@@ -479,7 +897,9 @@ GS::Optional<GS::UniString> ValidateAllowedPayloadFields (
         "structureType", "buildingMaterialId", "compositeId", "profileId", "anchorPoint", "coreAnchor",
         "circleBased", "isWidthAndHeightLinked", "isSlanted", "polygonCoordinates", "polygonOutline", "polygonArcs", "holes",
         "richText", "coordinate", "angle", "anchor", "pen", "nonBreaking", "linePen", "linePenIndex", "lineTypeIndex",
-        "roomSeparator", "axisAngle", "ratio", "begAngle", "beginAngle", "endAngle", "reflected"
+        "roomSeparator", "axisAngle", "ratio", "begAngle", "beginAngle", "endAngle", "reflected", "floorInd", "hatchCoordinates",
+        "polygonOutline", "contourPenIndex", "fillPenIndex", "fillBackgroundPenIndex", "fillAttributeIndex",
+        "ownerWallId", "centerOffset", "sillHeight", "refSide", "oSide"
     };
 
     const auto rejectUnsupportedFields = [&] (const std::initializer_list<const char*>& allowedFields) -> GS::Optional<GS::UniString> {
@@ -550,6 +970,21 @@ GS::Optional<GS::UniString> ValidateAllowedPayloadFields (
             "origin", "radius", "axisAngle", "ratio", "begAngle", "beginAngle", "endAngle", "reflected", "floorIndex",
             "linePen", "linePenIndex", "lineTypeIndex", "roomSeparator"
         });
+    } else if (typeID == API_HatchID) {
+        if (isCreate) {
+            return rejectUnsupportedFields ({
+                "floorInd", "hatchCoordinates", "contourPenIndex", "fillPenIndex", "fillBackgroundPenIndex", "fillAttributeIndex"
+            });
+        }
+        return rejectUnsupportedFields ({
+                "polygonOutline", "contourPenIndex", "fillPenIndex", "fillBackgroundPenIndex", "fillAttributeIndex"
+        });
+    } else if (typeID == API_DoorID) {
+        if (isCreate) return rejectUnsupportedFields ({ "ownerWallId", "floorIndex", "centerOffset", "sillHeight", "width", "height", "reflected", "refSide", "oSide" });
+        return rejectUnsupportedFields ({ "centerOffset", "sillHeight", "width", "height", "reflected", "refSide", "oSide" });
+    } else if (typeID == API_WindowID) {
+        if (isCreate) return rejectUnsupportedFields ({ "ownerWallId", "floorIndex", "centerOffset", "sillHeight", "width", "height", "reflected", "refSide", "oSide" });
+        return rejectUnsupportedFields ({ "centerOffset", "sillHeight", "width", "height", "reflected", "refSide", "oSide" });
     } else {
         return "Unsupported element type.";
     }
@@ -652,7 +1087,7 @@ GS::Optional<GS::UniString> ValidatePayload (
 
     const char* finiteFields[] = {
         "zCoordinate", "level", "bottomOffset", "offset", "slantAngle", "arcAngle",
-        "verticalCurveHeight", "axisRotationAngle", "profileAngle"
+        "verticalCurveHeight", "axisRotationAngle", "profileAngle", "centerOffset", "sillHeight"
     };
     for (const char* fieldName : finiteFields) {
         auto error = ValidateFiniteNumberField (payload, fieldName);
@@ -835,6 +1270,61 @@ GS::Optional<GS::UniString> ValidatePayload (
         if (error.HasValue ()) return error;
         error = ValidateBooleanField (payload, "roomSeparator");
         if (error.HasValue ()) return error;
+    } else if (typeID == API_HatchID) {
+        const char* polygonField = isCreate ? "hatchCoordinates" : "polygonOutline";
+        const auto geometryError = ValidateCoordinateArrayField (payload, polygonField, isCreate, false, 3);
+        if (geometryError.HasValue ()) return geometryError;
+        GS::Array<GS::ObjectState> coordinates;
+        if (payload.Contains (polygonField)) {
+            if (!payload.Get (polygonField, coordinates) || coordinates.GetSize () > 64)
+                return "Hatch simple polygon must contain at most 64 unclosed vertices.";
+            for (GSSize i = 0; i < static_cast<GSSize> (coordinates.GetSize ()); ++i) {
+                const API_Coord point = Get2DCoordinateFromObjectState (coordinates[i]);
+                const API_Coord next = Get2DCoordinateFromObjectState (coordinates[(i + 1) % coordinates.GetSize ()]);
+                if (IsSame2DCoordinate (point, next)) return "Hatch polygon cannot contain a zero-length edge or repeated closing vertex.";
+                for (GSSize j = 0; j < i; ++j) {
+                    if (IsSame2DCoordinate (point, Get2DCoordinateFromObjectState (coordinates[j])))
+                        return "Hatch polygon vertices must be unique.";
+                }
+            }
+            double twiceArea = 0.0;
+            for (GSSize i = 0; i < static_cast<GSSize> (coordinates.GetSize ()); ++i) {
+                const API_Coord point = Get2DCoordinateFromObjectState (coordinates[i]);
+                const API_Coord next = Get2DCoordinateFromObjectState (coordinates[(i + 1) % coordinates.GetSize ()]);
+                twiceArea += point.x * next.y - next.x * point.y;
+            }
+            if (!std::isfinite (twiceArea) || twiceArea == 0.0) return "Hatch polygon must have finite nonzero area.";
+        }
+        for (const char* fieldName : { "contourPenIndex", "fillPenIndex", "fillBackgroundPenIndex", "fillAttributeIndex" }) {
+            const auto integerError = ValidateIntegerField (payload, fieldName);
+            if (integerError.HasValue ()) return integerError;
+            if (payload.Contains (fieldName)) {
+                Int32 value = 0;
+                payload.Get (fieldName, value);
+                const bool isFillAttribute = GS::UniString (fieldName) == "fillAttributeIndex";
+                if (value <= 0 || (!isFillAttribute && value > static_cast<Int32> (std::numeric_limits<short>::max ())))
+                    return GS::UniString::Printf ("Hatch '%s' must be a positive supported index.", fieldName);
+            }
+        }
+        if (isCreate) {
+            error = ValidateIntegerField (payload, "floorInd");
+            if (error.HasValue ()) return error;
+            error = ValidateFloorIndexField (payload, "floorInd");
+            if (error.HasValue ()) return error;
+            for (const char* fieldName : { "contourPenIndex", "fillPenIndex", "fillBackgroundPenIndex", "fillAttributeIndex" })
+                if (!payload.Contains (fieldName)) return MissingFieldError (fieldName);
+        }
+    }
+    if (typeID == API_DoorID) {
+        if (isCreate) {
+            const GS::ObjectState* owner = payload.Get ("ownerWallId");
+            if (owner == nullptr || GetGuidFromObjectState (*owner) == APINULLGuid)
+                return "Door CREATE requires an exact ownerWallId GUID.";
+            if (!payload.Contains ("floorIndex")) return MissingFieldError ("floorIndex");
+            error = ValidateFloorIndexField (payload, "floorIndex");
+            if (error.HasValue ()) return error;
+            return {};
+        }
     }
 
     if (typeID == API_ColumnID) {
@@ -881,6 +1371,202 @@ GS::ObjectState BuildArrayParameters (
     return parameters;
 }
 
+GS::ObjectState ExecuteWindowCreate (const GS::Array<GS::ObjectState>& items, GS::ProcessControl& /*processControl*/)
+{
+    GS::ObjectState response;
+    const auto& created = response.AddList<GS::ObjectState> ("elements");
+    if (items.GetSize () != 1) return CreateErrorResponse (APIERR_BADPARS, "Window typed CREATE accepts one exact same-file template.");
+    GS::UniString failureStage = "not-started";
+    const GSErrCode undoError = ACAPI_CallUndoableCommand ("Create Native Window from Exact Markerless Template", [&] () -> GSErrCode {
+        const GS::ObjectState* sourceId = items[0].Get ("cloneSourceElementId");
+        const GS::ObjectState* payload = items[0].Get ("payload");
+        if (sourceId == nullptr || payload == nullptr) return APIERR_BADPARS;
+        const API_Guid sourceGuid = GetGuidFromObjectState (*sourceId);
+        const API_Guid hostGuid = payload->Get ("ownerWallId") == nullptr ? APINULLGuid : GetGuidFromObjectState (*payload->Get ("ownerWallId"));
+        Int32 storyIndex = std::numeric_limits<Int32>::min ();
+        if (!payload->Get ("floorIndex", storyIndex) || storyIndex < std::numeric_limits<short>::min () || storyIndex > std::numeric_limits<short>::max ()) return APIERR_BADPARS;
+        API_Element source = {};
+        source.header.guid = sourceGuid;
+        failureStage = "read-window-template";
+        GSErrCode error = sourceGuid == APINULLGuid ? APIERR_BADPARS : ACAPI_Element_Get (&source);
+        if (error == NoError && (GetElemTypeId (source.header) != API_WindowID || source.header.guid != sourceGuid
+            || source.window.openingBase.markGuid != APINULLGuid || !WindowNativeTopologySupported (source))) error = APIERR_BADPARS;
+        API_LibPart sourcePart = {};
+        LibraryPartLocationGuard sourcePartGuard (sourcePart);
+        if (error == NoError) {
+            sourcePart.index = source.window.openingBase.libInd;
+            failureStage = "verify-window-library";
+            error = ACAPI_LibraryPart_Get (&sourcePart);
+            if (error == NoError && (sourcePart.missingDef || sourcePart.version <= 0 || sourcePart.ownUnID[0] == '\0' || sourcePart.file_UName[0] == '\0')) error = APIERR_BADPARS;
+        }
+        API_Element host = {};
+        if (error == NoError) {
+            host.header.guid = hostGuid;
+            failureStage = "read-window-host-wall";
+            error = hostGuid == APINULLGuid ? APIERR_BADPARS : ACAPI_Element_Get (&host);
+            if (error == NoError && (GetElemTypeId (host.header) != API_WallID || host.header.guid != hostGuid || host.header.floorInd != static_cast<short> (storyIndex))) error = APIERR_BADID;
+        }
+        API_ElementMemo sourceMemo = {};
+        NativeMemoGuard sourceMemoGuard (sourceMemo);
+        if (error == NoError) { failureStage = "read-window-template-memo"; error = ACAPI_Element_GetMemo (sourceGuid, &sourceMemo, APIMemoMask_All); }
+        if (error != NoError) return error;
+        API_Element element = source;
+        element.header.guid = APINULLGuid;
+        element.header.floorInd = static_cast<short> (storyIndex);
+        element.window.owner = hostGuid;
+        element.window.openingBase.markGuid = APINULLGuid;
+        double number = 0.0;
+        if (payload->Get ("centerOffset", number)) element.window.objLoc = number;
+        if (payload->Get ("sillHeight", number)) element.window.lower = number;
+        if (payload->Get ("width", number)) element.window.openingBase.width = number;
+        if (payload->Get ("height", number)) element.window.openingBase.height = number;
+        bool flag = false;
+        if (payload->Get ("reflected", flag)) element.window.openingBase.reflected = flag;
+        if (payload->Get ("refSide", flag)) element.window.openingBase.refSide = flag;
+        if (payload->Get ("oSide", flag)) element.window.openingBase.oSide = flag;
+        failureStage = "createext-window";
+        error = ACAPI_Element_CreateExt (&element, &sourceMemo, 0UL, nullptr);
+        if (error == NoError) {
+            API_Element after = {};
+            after.header.guid = element.header.guid;
+            failureStage = "verify-created-window";
+            error = ACAPI_Element_Get (&after);
+            if (error == NoError && (after.header.guid == APINULLGuid || after.header.guid == sourceGuid || after.header.floorInd != static_cast<short> (storyIndex)
+                || after.window.owner != hostGuid || after.window.openingBase.markGuid != APINULLGuid
+                || after.window.openingBase.libInd != source.window.openingBase.libInd || !WindowNativeTopologySupported (after)
+                || after.window.objLoc != element.window.objLoc || after.window.lower != element.window.lower
+                || after.window.openingBase.width != element.window.openingBase.width || after.window.openingBase.height != element.window.openingBase.height
+                || after.window.openingBase.reflected != element.window.openingBase.reflected || after.window.openingBase.refSide != element.window.openingBase.refSide
+                || after.window.openingBase.oSide != element.window.openingBase.oSide)) error = APIERR_COMMANDFAILED;
+            API_LibPart createdPart = {};
+            LibraryPartLocationGuard createdPartGuard (createdPart);
+            if (error == NoError) {
+                createdPart.index = after.window.openingBase.libInd;
+                failureStage = "verify-created-window-library";
+                error = ACAPI_LibraryPart_Get (&createdPart);
+                if (error == NoError && (createdPart.missingDef || !SameWindowLibraryPartIdentity (sourcePart, createdPart))) error = APIERR_COMMANDFAILED;
+            }
+            API_Element sourceAfter = {};
+            if (error == NoError) {
+                sourceAfter.header.guid = sourceGuid;
+                failureStage = "verify-window-template-preserved";
+                error = ACAPI_Element_Get (&sourceAfter);
+                if (error == NoError && (!SameWindowSourceScalarState (source, sourceAfter) || sourceAfter.window.openingBase.markGuid != APINULLGuid)) error = APIERR_COMMANDFAILED;
+                API_LibPart sourcePartAfter = {};
+                LibraryPartLocationGuard sourcePartAfterGuard (sourcePartAfter);
+                if (error == NoError) {
+                    sourcePartAfter.index = sourceAfter.window.openingBase.libInd;
+                    failureStage = "verify-window-template-library-preserved";
+                    error = ACAPI_LibraryPart_Get (&sourcePartAfter);
+                    if (error == NoError && (sourcePartAfter.missingDef || !SameWindowLibraryPartIdentity (sourcePart, sourcePartAfter))) error = APIERR_COMMANDFAILED;
+                }
+            }
+            if (error == NoError) created (CreateElementIdObjectState (after.header.guid));
+        }
+        return error;
+    });
+    if (undoError != NoError) { response.Add ("transactionRolledBack", true); response.Add ("transactionError", undoError); response.Add ("failureStage", failureStage); }
+    return response;
+}
+
+GS::ObjectState ExecuteWindowUpdate (const GS::Array<GS::ObjectState>& items, const bool faultAfterFirstApplied, GS::ProcessControl& /*processControl*/)
+{
+    GS::ObjectState response;
+    const auto& results = response.AddList<GS::ObjectState> ("executionResults");
+    GSErrCode callbackError = NoError;
+    GS::UniString failureStage = "not-started";
+#if defined(TAPIR_NATIVE_CRUD_TEST_FAULT_AFTER_FIRST_APPLIED)
+    bool firstApplied = false;
+#else
+    (void) faultAfterFirstApplied;
+#endif
+    const GSErrCode undoError = ACAPI_CallUndoableCommand ("Update Native Windows", [&] () -> GSErrCode {
+        for (GSSize index = 0; index < static_cast<GSSize> (items.GetSize ()); ++index) {
+            const GS::ObjectState& item = items[index];
+            const GS::ObjectState* id = item.Get ("elementId");
+            const API_Guid guid = id == nullptr ? APINULLGuid : GetGuidFromObjectState (*id);
+            API_Element element = {};
+            element.header.guid = guid;
+            failureStage = "read-window";
+            GSErrCode error = guid == APINULLGuid ? APIERR_BADPARS : ACAPI_Element_Get (&element);
+            if (error == NoError && (GetElemTypeId (element.header) != API_WindowID || element.header.guid != guid)) error = APIERR_BADID;
+            if (error == NoError) {
+                API_Element host = {};
+                host.header.guid = element.window.owner;
+                failureStage = "verify-window-update-host";
+                error = host.header.guid == APINULLGuid ? APIERR_BADID : ACAPI_Element_Get (&host);
+                if (error == NoError && (host.header.guid != element.window.owner || GetElemTypeId (host.header) != API_WallID
+                    || host.header.floorInd != element.header.floorInd)) error = APIERR_BADID;
+            }
+            const API_Element before = element;
+            if (error == NoError && (before.window.openingBase.markGuid != APINULLGuid || !WindowNativeTopologySupported (before))) error = APIERR_BADPARS;
+            API_LibPart libraryBefore = {};
+            LibraryPartLocationGuard libraryBeforeGuard (libraryBefore);
+            if (error == NoError) {
+                libraryBefore.index = before.window.openingBase.libInd;
+                failureStage = "read-window-library-before";
+                error = ACAPI_LibraryPart_Get (&libraryBefore);
+                if (error == NoError && (libraryBefore.missingDef || libraryBefore.version <= 0 || libraryBefore.ownUnID[0] == '\0' || libraryBefore.file_UName[0] == '\0')) error = APIERR_BADPARS;
+            }
+            API_Element mask = {};
+            ACAPI_ELEMENT_MASK_CLEAR (mask);
+            bool changed = false;
+            double number = 0.0;
+            if (error == NoError && item.Get ("centerOffset", number)) { element.window.objLoc = number; ACAPI_ELEMENT_MASK_SET (mask, API_WindowType, objLoc); changed = true; }
+            if (error == NoError && item.Get ("sillHeight", number)) { element.window.lower = number; ACAPI_ELEMENT_MASK_SET (mask, API_WindowType, lower); changed = true; }
+            if (error == NoError && item.Get ("width", number)) { element.window.openingBase.width = number; ACAPI_ELEMENT_MASK_SET (mask, API_WindowType, openingBase.width); changed = true; }
+            if (error == NoError && item.Get ("height", number)) { element.window.openingBase.height = number; ACAPI_ELEMENT_MASK_SET (mask, API_WindowType, openingBase.height); changed = true; }
+            bool flag = false;
+            if (error == NoError && item.Get ("reflected", flag)) { element.window.openingBase.reflected = flag; ACAPI_ELEMENT_MASK_SET (mask, API_WindowType, openingBase.reflected); changed = true; }
+            if (error == NoError && item.Get ("refSide", flag)) { element.window.openingBase.refSide = flag; ACAPI_ELEMENT_MASK_SET (mask, API_WindowType, openingBase.refSide); changed = true; }
+            if (error == NoError && item.Get ("oSide", flag)) { element.window.openingBase.oSide = flag; ACAPI_ELEMENT_MASK_SET (mask, API_WindowType, openingBase.oSide); changed = true; }
+            if (error == NoError && !changed) error = APIERR_BADPARS;
+            if (error == NoError) { failureStage = "change-window"; error = ACAPI_Element_Change (&element, &mask, nullptr, 0, true); }
+            API_Element after = {};
+            if (error == NoError) { after.header.guid = guid; failureStage = "read-window-postcondition"; error = ACAPI_Element_Get (&after); }
+            if (error == NoError && (after.header.guid != before.header.guid || after.header.floorInd != before.header.floorInd || after.header.layer != before.header.layer
+                || after.window.owner != before.window.owner || after.window.openingBase.libInd != before.window.openingBase.libInd
+                || after.window.openingBase.markGuid != APINULLGuid || after.window.fixPoint != before.window.fixPoint
+                || after.window.openingBase.verticalLink.linkType != before.window.openingBase.verticalLink.linkType
+                || after.window.openingBase.verticalLink.linkValue != before.window.openingBase.verticalLink.linkValue
+                || after.window.directionType != before.window.directionType || after.window.reveal != before.window.reveal
+                || after.window.revealDepthLocation != before.window.revealDepthLocation || after.window.revealDepthOffset != before.window.revealDepthOffset
+                || after.window.revealDepthFromSide != before.window.revealDepthFromSide || after.window.jambDepthHead != before.window.jambDepthHead
+                || after.window.jambDepthSill != before.window.jambDepthSill || after.window.jambDepth != before.window.jambDepth
+                || after.window.jambDepth2 != before.window.jambDepth2 || !WindowNativeTopologySupported (after))) error = APIERR_COMMANDFAILED;
+            API_LibPart libraryAfter = {};
+            LibraryPartLocationGuard libraryAfterGuard (libraryAfter);
+            if (error == NoError) {
+                libraryAfter.index = after.window.openingBase.libInd;
+                failureStage = "verify-window-library-preserved";
+                error = ACAPI_LibraryPart_Get (&libraryAfter);
+                if (error == NoError && (libraryAfter.missingDef || !SameWindowLibraryPartIdentity (libraryBefore, libraryAfter))) error = APIERR_COMMANDFAILED;
+            }
+            const auto expectedDouble = [&] (const char* field, const double oldValue, const double actual) { double requested = oldValue; item.Get (field, requested); return requested == actual; };
+            const auto expectedBool = [&] (const char* field, const bool oldValue, const bool actual) { bool requested = oldValue; item.Get (field, requested); return requested == actual; };
+            if (error == NoError && (!expectedDouble ("centerOffset", before.window.objLoc, after.window.objLoc)
+                || !expectedDouble ("sillHeight", before.window.lower, after.window.lower) || !expectedDouble ("width", before.window.openingBase.width, after.window.openingBase.width)
+                || !expectedDouble ("height", before.window.openingBase.height, after.window.openingBase.height)
+                || !expectedBool ("reflected", before.window.openingBase.reflected, after.window.openingBase.reflected)
+                || !expectedBool ("refSide", before.window.openingBase.refSide, after.window.openingBase.refSide)
+                || !expectedBool ("oSide", before.window.openingBase.oSide, after.window.openingBase.oSide))) error = APIERR_COMMANDFAILED;
+            if (error != NoError) { callbackError = error; GS::ObjectState failed = CreateFailedExecutionResult (error, "Window typed UPDATE failed exact native precondition or factual requested/protected-value readback."); failed.Add ("failureStage", failureStage); results (failed); return error; }
+            results (CreateSuccessfulExecutionResult ());
+#if defined(TAPIR_NATIVE_CRUD_TEST_FAULT_AFTER_FIRST_APPLIED)
+            if (faultAfterFirstApplied && index == 0) { firstApplied = true; callbackError = APIERR_COMMANDFAILED; failureStage = "fault-after-first-applied-item"; results (CreateFailedExecutionResult (callbackError, "Disposable Window candidate fault requested rollback after the first applied item.")); return callbackError; }
+#endif
+        }
+        return callbackError;
+    });
+    if (undoError != NoError) {
+        response.Add ("transactionRolledBack", true); response.Add ("transactionError", undoError); response.Add ("failureStage", failureStage);
+#if defined(TAPIR_NATIVE_CRUD_TEST_FAULT_AFTER_FIRST_APPLIED)
+        if (firstApplied) response.Add ("testFaultEvidence", GS::ObjectState ("schemaVersion", "native-crud-test-fault-evidence/v1", "firstAppliedItemIndex", 0, "firstItemChangeSucceeded", true, "hostRollbackReported", true));
+#endif
+    }
+    return response;
+}
+
 GS::ObjectState ExecuteCreate (
     const API_ElemTypeID typeID,
     const GS::ObjectState& parameters,
@@ -893,20 +1579,380 @@ GS::ObjectState ExecuteCreate (
         case API_BeamID:   return CreateBeamsCommand ().Execute (parameters, processControl);
         case API_LineID:   return CreateLineElementsCommand ().Execute (parameters, processControl);
         case API_ArcID:    return CreateArcsCommand ().Execute (parameters, processControl);
+        case API_HatchID:  return CreateHatchesCommand ().Execute (parameters, processControl);
         default:           return CreateErrorResponse (APIERR_BADID, "Unsupported element type for create.");
     }
 }
 
-GS::ObjectState ExecuteDraftingUpdate (
-    const API_ElemTypeID typeID,
-    const GS::Array<GS::ObjectState>& items)
+double SignedAreaOfHatchRing (const std::vector<API_Coord>& points)
+{
+    double twiceArea = 0.0;
+    for (GSSize index = 0; index < points.size (); ++index) {
+        const API_Coord& point = points[index];
+        const API_Coord& next = points[(index + 1) % points.size ()];
+        twiceArea += point.x * next.y - next.x * point.y;
+    }
+    return twiceArea;
+}
+
+bool HatchPointOnSegment (const API_Coord& point, const API_Coord& begin, const API_Coord& end)
+{
+    return point.x >= std::min (begin.x, end.x) && point.x <= std::max (begin.x, end.x)
+        && point.y >= std::min (begin.y, end.y) && point.y <= std::max (begin.y, end.y);
+}
+
+double HatchOrientation (const API_Coord& first, const API_Coord& second, const API_Coord& third)
+{
+    return (second.x - first.x) * (third.y - first.y) - (second.y - first.y) * (third.x - first.x);
+}
+
+bool HatchSegmentsIntersect (const API_Coord& a, const API_Coord& b, const API_Coord& c, const API_Coord& d)
+{
+    const double o1 = HatchOrientation (a, b, c);
+    const double o2 = HatchOrientation (a, b, d);
+    const double o3 = HatchOrientation (c, d, a);
+    const double o4 = HatchOrientation (c, d, b);
+    if (((o1 > 0.0 && o2 < 0.0) || (o1 < 0.0 && o2 > 0.0))
+        && ((o3 > 0.0 && o4 < 0.0) || (o3 < 0.0 && o4 > 0.0))) return true;
+    return (o1 == 0.0 && HatchPointOnSegment (c, a, b)) || (o2 == 0.0 && HatchPointOnSegment (d, a, b))
+        || (o3 == 0.0 && HatchPointOnSegment (a, c, d)) || (o4 == 0.0 && HatchPointOnSegment (b, c, d));
+}
+
+bool IsSimpleHatchRing (const std::vector<API_Coord>& ring)
+{
+    if (ring.size () < 3 || ring.size () > 64) return false;
+    double twiceArea = 0.0;
+    for (GSSize index = 0; index < ring.size (); ++index) {
+        const API_Coord& point = ring[index];
+        const API_Coord& next = ring[(index + 1) % ring.size ()];
+        if (!std::isfinite (point.x) || !std::isfinite (point.y) || IsSame2DCoordinate (point, next)) return false;
+        for (GSSize prior = 0; prior < index; ++prior)
+            if (IsSame2DCoordinate (point, ring[prior])) return false;
+        twiceArea += point.x * next.y - next.x * point.y;
+    }
+    if (!std::isfinite (twiceArea) || twiceArea == 0.0) return false;
+    for (GSSize first = 0; first < ring.size (); ++first) {
+        const GSSize firstNext = (first + 1) % ring.size ();
+        for (GSSize second = first + 1; second < ring.size (); ++second) {
+            const GSSize secondNext = (second + 1) % ring.size ();
+            if (firstNext == second || secondNext == first) continue;
+            if (HatchSegmentsIntersect (ring[first], ring[firstNext], ring[second], ring[secondNext])) return false;
+        }
+    }
+    return true;
+}
+
+bool ReadSimpleHatchMemo (const API_Element& element, API_ElementMemo& memo, std::vector<API_Coord>& ring)
+{
+    if (element.hatch.poly.nCoords < 4 || element.hatch.poly.nSubPolys != 1 || element.hatch.poly.nArcs != 0
+        || memo.coords == nullptr || *memo.coords == nullptr || memo.pends == nullptr || *memo.pends == nullptr
+        || memo.vertexIDs == nullptr || *memo.vertexIDs == nullptr)
+        return false;
+    const GSSize coordinateCapacity = BMhGetSize (reinterpret_cast<GSHandle> (memo.coords)) / sizeof (API_Coord);
+    const GSSize polygonEndCapacity = BMhGetSize (reinterpret_cast<GSHandle> (memo.pends)) / sizeof (Int32);
+    const GSSize vertexCapacity = BMhGetSize (reinterpret_cast<GSHandle> (memo.vertexIDs)) / sizeof (UInt32);
+    if (coordinateCapacity <= static_cast<GSSize> (element.hatch.poly.nCoords)
+        || polygonEndCapacity <= static_cast<GSSize> (element.hatch.poly.nSubPolys)
+        || vertexCapacity <= static_cast<GSSize> (element.hatch.poly.nCoords)
+        || (*memo.pends)[1] != element.hatch.poly.nCoords)
+        return false;
+    const API_Coord& first = (*memo.coords)[1];
+    const API_Coord& closing = (*memo.coords)[element.hatch.poly.nCoords];
+    if (!IsSame2DCoordinate (first, closing)) return false;
+    ring.clear ();
+    ring.reserve (static_cast<GSSize> (element.hatch.poly.nCoords - 1));
+    for (Int32 index = 1; index < element.hatch.poly.nCoords; ++index)
+        ring.push_back ((*memo.coords)[index]);
+    return IsSimpleHatchRing (ring);
+}
+
+bool ReadHatchMemoVertexIds (const API_Element& element, const API_ElementMemo& memo, std::vector<UInt32>& vertexIds)
+{
+    if (element.hatch.poly.nCoords <= 0 || memo.vertexIDs == nullptr || *memo.vertexIDs == nullptr)
+        return false;
+    const GSSize capacity = BMhGetSize (reinterpret_cast<GSHandle> (memo.vertexIDs)) / sizeof (UInt32);
+    if (capacity <= static_cast<GSSize> (element.hatch.poly.nCoords))
+        return false;
+    vertexIds.clear ();
+    vertexIds.reserve (static_cast<GSSize> (element.hatch.poly.nCoords));
+    for (Int32 index = 1; index <= element.hatch.poly.nCoords; ++index) {
+        const UInt32 vertexId = (*memo.vertexIDs)[index];
+        if (vertexId > static_cast<UInt32> (std::numeric_limits<Int32>::max ())) return false;
+        vertexIds.push_back (vertexId);
+    }
+    return true;
+}
+
+GS::ObjectState ExecuteHatchUpdate (const GS::Array<GS::ObjectState>& items, const bool faultAfterFirstApplied)
 {
     GS::ObjectState response;
     const auto& results = response.AddList<GS::ObjectState> ("executionResults");
     GSErrCode callbackError = NoError;
+    GS::UniString failureStage = "not-started";
+#if defined(TAPIR_NATIVE_CRUD_TEST_FAULT_AFTER_FIRST_APPLIED)
+    bool firstItemFaultInjectedAfterSuccessfulChange = false;
+#else
+    (void) faultAfterFirstApplied;
+#endif
+    const GSErrCode undoError = ACAPI_CallUndoableCommand ("Update Native Hatches", [&] () -> GSErrCode {
+        for (GSSize itemIndex = 0; itemIndex < static_cast<GSSize> (items.GetSize ()); ++itemIndex) {
+            const GS::ObjectState& item = items[itemIndex];
+            if (callbackError != NoError) {
+                results (CreateFailedExecutionResult (callbackError, "Hatch item was not attempted because the batch is rolling back."));
+                continue;
+            }
+            const GS::ObjectState* elementId = item.Get ("elementId");
+            const API_Guid guid = elementId == nullptr ? APINULLGuid : GetGuidFromObjectState (*elementId);
+            API_Element element = {};
+            element.header.guid = guid;
+            failureStage = "get-element";
+            GSErrCode error = guid == APINULLGuid ? APIERR_BADPARS : ACAPI_Element_Get (&element);
+            if (guid == APINULLGuid) failureStage = "validate-element-guid";
+            if (error == NoError && GetElemTypeId (element.header) != API_HatchID) {
+                error = APIERR_BADID;
+                failureStage = "validate-element-type";
+            }
+            if (error == NoError && (element.hatch.hatchType != API_FillHatch || element.hatch.determination != APIHatch_DraftingFills)) {
+                error = APIERR_BADPARS;
+                failureStage = "validate-fill-drafting-profile";
+            }
+            const API_Element originalElement = element;
+            const short originalStoryIndex = element.header.floorInd;
+            const bool unsupportedOverrides = error == NoError
+                && (element.hatch.contPen.IsOverriden () || element.hatch.fillPen.IsOverriden ()
+                    || (element.hatch.hatchFlags & (APIHatch_HasFgRGBColor | APIHatch_HasBkgRGBColor)) != 0);
+            if (unsupportedOverrides) {
+                error = APIERR_BADPARS;
+                failureStage = "validate-unsupported-overrides";
+            }
+
+            API_ElementMemo memo = {};
+            NativeMemoGuard memoGuard (memo);
+            GS::Array<GS::ObjectState> coordinates;
+            const bool hasPolygon = item.Get ("polygonOutline", coordinates);
+            std::vector<API_Coord> beforeRing;
+            std::vector<UInt32> beforeVertexIds;
+            std::vector<API_Coord> requestedRing;
+            if (error == NoError) {
+                error = ACAPI_Element_GetMemo (guid, &memo, APIMemoMask_Polygon);
+                if (error != NoError) failureStage = "get-before-polygon-memo";
+                if (error == NoError && !ReadSimpleHatchMemo (element, memo, beforeRing)) {
+                    error = APIERR_BADPARS;
+                    failureStage = "validate-before-simple-polygon-memo";
+                }
+                if (error == NoError && !ReadHatchMemoVertexIds (element, memo, beforeVertexIds)) {
+                    error = APIERR_BADPARS;
+                    failureStage = "validate-before-vertex-ids";
+                }
+            }
+            if (error == NoError && hasPolygon) {
+                if (coordinates.GetSize () != beforeRing.size ()) {
+                    error = APIERR_BADPARS;
+                    failureStage = "validate-requested-vertex-count";
+                }
+                if (error == NoError) {
+                    requestedRing.reserve (static_cast<GSSize> (coordinates.GetSize ()));
+                    for (const GS::ObjectState& point : coordinates) requestedRing.push_back (Get2DCoordinateFromObjectState (point));
+                    const double beforeArea = SignedAreaOfHatchRing (beforeRing);
+                    const double requestedArea = SignedAreaOfHatchRing (requestedRing);
+                    if (!IsSimpleHatchRing (requestedRing) || !std::isfinite (beforeArea)
+                        || std::signbit (beforeArea) != std::signbit (requestedArea)) {
+                        error = APIERR_BADPARS;
+                        failureStage = "validate-requested-simple-ring-and-winding";
+                    }
+                }
+            }
+
+            API_Element mask = {};
+            ACAPI_ELEMENT_MASK_CLEAR (mask);
+            bool changed = false;
+            Int32 value = 0;
+            if (error == NoError && item.Get ("contourPenIndex", value)) {
+                if (value <= 0 || value > std::numeric_limits<short>::max ()) {
+                    error = APIERR_BADPARS;
+                    failureStage = "validate-contour-pen";
+                }
+                else { element.hatch.contPen.penIndex = static_cast<short> (value); ACAPI_ELEMENT_MASK_SET (mask, API_HatchType, contPen); changed = true; }
+            }
+            if (error == NoError && item.Get ("fillPenIndex", value)) {
+                if (value <= 0 || value > std::numeric_limits<short>::max ()) {
+                    error = APIERR_BADPARS;
+                    failureStage = "validate-foreground-pen";
+                }
+                else { element.hatch.fillPen.penIndex = static_cast<short> (value); ACAPI_ELEMENT_MASK_SET (mask, API_HatchType, fillPen); changed = true; }
+            }
+            if (error == NoError && item.Get ("fillBackgroundPenIndex", value)) {
+                if (value <= 0 || value > std::numeric_limits<short>::max ()) {
+                    error = APIERR_BADPARS;
+                    failureStage = "validate-background-pen";
+                }
+                else { element.hatch.fillBGPen = static_cast<short> (value); ACAPI_ELEMENT_MASK_SET (mask, API_HatchType, fillBGPen); changed = true; }
+            }
+            if (error == NoError && item.Get ("fillAttributeIndex", value)) {
+                if (value <= 0) {
+                    error = APIERR_BADPARS;
+                    failureStage = "validate-fill-index";
+                }
+                else { element.hatch.fillInd = ACAPI_CreateAttributeIndex (value); ACAPI_ELEMENT_MASK_SET (mask, API_HatchType, fillInd); changed = true; }
+            }
+            if (error == NoError && hasPolygon) {
+                for (GSSize index = 0; index < requestedRing.size (); ++index) (*memo.coords)[index + 1] = requestedRing[index];
+                (*memo.coords)[requestedRing.size () + 1] = requestedRing[0];
+                ACAPI_ELEMENT_MASK_SET (mask, API_HatchType, poly);
+                changed = true;
+            }
+            if (error == NoError && !changed) {
+                error = APIERR_BADPARS;
+                failureStage = "validate-nonempty-change";
+            }
+            if (error == NoError) {
+                failureStage = "acapi-element-change";
+                error = ACAPI_Element_Change (&element, &mask, hasPolygon ? &memo : nullptr, hasPolygon ? APIMemoMask_Polygon : 0, true);
+            }
+
+            if (error == NoError) {
+                API_Element after = {};
+                after.header.guid = guid;
+                failureStage = "get-after-element";
+                error = ACAPI_Element_Get (&after);
+                if (error == NoError) {
+                    // Keep preservation failures attributable to one factual
+                    // field.  A single generic stage made live Hatch UPDATE
+                    // failures impossible to distinguish from a pen alias or
+                    // profile side effect before the undoable command rolled
+                    // the element back.
+                    const char* preservationFailureStage = nullptr;
+                    // API_ExtendedPenType::IsOverriden() is true only for a
+                    // positive index. Archicad may normalize inactive Hatch
+                    // override sentinels while changing the base pen.
+                    const auto sameHatchPenOverride = [] (Int32 expected, Int32 actual) {
+                        return expected == actual || (expected <= 0 && actual <= 0);
+                    };
+                    if (after.header.floorInd != originalStoryIndex)
+                        preservationFailureStage = "verify-preserved-story";
+                    else if (after.header.layer != originalElement.header.layer)
+                        preservationFailureStage = "verify-preserved-layer";
+                    else if (GetElemTypeId (after.header) != API_HatchID)
+                        preservationFailureStage = "verify-preserved-element-type";
+                    else if (after.hatch.hatchType != originalElement.hatch.hatchType)
+                        preservationFailureStage = "verify-preserved-hatch-type";
+                    else if (after.hatch.determination != originalElement.hatch.determination)
+                        preservationFailureStage = "verify-preserved-determination";
+                    else if (after.hatch.hatchFlags != originalElement.hatch.hatchFlags)
+                        preservationFailureStage = "verify-preserved-hatch-flags";
+                    else if (!sameHatchPenOverride (originalElement.hatch.contPen.colorOverridePenIndex, after.hatch.contPen.colorOverridePenIndex)) {
+                        error = APIERR_COMMANDFAILED;
+                        failureStage = GS::UniString::Printf (
+                            "verify-preserved-contour-pen-override expected=%d actual=%d",
+                            static_cast<Int32> (originalElement.hatch.contPen.colorOverridePenIndex),
+                            static_cast<Int32> (after.hatch.contPen.colorOverridePenIndex));
+                    }
+                    else if (!sameHatchPenOverride (originalElement.hatch.fillPen.colorOverridePenIndex, after.hatch.fillPen.colorOverridePenIndex))
+                        preservationFailureStage = "verify-preserved-fill-pen-override";
+                    else if (GetAttributeIndex (after.hatch.buildingMaterial) != GetAttributeIndex (originalElement.hatch.buildingMaterial))
+                        preservationFailureStage = "verify-preserved-building-material";
+                    if (preservationFailureStage != nullptr) {
+                        error = APIERR_COMMANDFAILED;
+                        failureStage = preservationFailureStage;
+                    }
+                }
+                if (error == NoError) {
+                    Int32 expectedContourPen = originalElement.hatch.contPen.penIndex;
+                    Int32 expectedFillPen = originalElement.hatch.fillPen.penIndex;
+                    Int32 expectedBackgroundPen = originalElement.hatch.fillBGPen;
+                    Int32 expectedFill = GetAttributeIndex (originalElement.hatch.fillInd);
+                    item.Get ("contourPenIndex", expectedContourPen);
+                    item.Get ("fillPenIndex", expectedFillPen);
+                    item.Get ("fillBackgroundPenIndex", expectedBackgroundPen);
+                    item.Get ("fillAttributeIndex", expectedFill);
+                    if (after.hatch.contPen.penIndex != expectedContourPen) error = APIERR_COMMANDFAILED;
+                    if (after.hatch.fillPen.penIndex != expectedFillPen) error = APIERR_COMMANDFAILED;
+                    if (after.hatch.fillBGPen != expectedBackgroundPen) error = APIERR_COMMANDFAILED;
+                    if (GetAttributeIndex (after.hatch.fillInd) != expectedFill) error = APIERR_COMMANDFAILED;
+                    if (error == APIERR_COMMANDFAILED) failureStage = "verify-element-fields";
+                }
+                if (error == NoError) {
+                    API_ElementMemo afterMemo = {};
+                    NativeMemoGuard afterMemoGuard (afterMemo);
+                    failureStage = "get-after-polygon-memo";
+                    error = ACAPI_Element_GetMemo (guid, &afterMemo, APIMemoMask_Polygon);
+                    std::vector<API_Coord> afterRing;
+                    std::vector<UInt32> afterVertexIds;
+                    if (error == NoError && !ReadSimpleHatchMemo (after, afterMemo, afterRing)) {
+                        error = APIERR_COMMANDFAILED;
+                        failureStage = "verify-after-simple-polygon-memo";
+                    }
+                    if (error == NoError && !ReadHatchMemoVertexIds (after, afterMemo, afterVertexIds)) {
+                        error = APIERR_COMMANDFAILED;
+                        failureStage = "verify-after-vertex-ids";
+                    }
+                    const std::vector<API_Coord>& expectedRing = hasPolygon ? requestedRing : beforeRing;
+                    if (error == NoError && afterRing.size () != expectedRing.size ()) {
+                        error = APIERR_COMMANDFAILED;
+                        failureStage = "verify-after-vertex-count";
+                    }
+                    for (GSSize index = 0; error == NoError && index < expectedRing.size (); ++index)
+                        if (!IsSame2DCoordinate (afterRing[index], expectedRing[index])) {
+                            error = APIERR_COMMANDFAILED;
+                            failureStage = "verify-after-coordinates";
+                        }
+                    if (error == NoError && afterVertexIds != beforeVertexIds) {
+                        error = APIERR_COMMANDFAILED;
+                        failureStage = "verify-preserved-vertex-ids";
+                    }
+                }
+            }
+            if (error != NoError) {
+                callbackError = error;
+                GS::ObjectState failed = CreateFailedExecutionResult (error, "Hatch typed UPDATE failed its native precondition or factual postcondition.");
+                failed.Add ("failureStage", failureStage);
+                results (failed);
+                return error;
+            }
+            results (CreateSuccessfulExecutionResult ());
+#if defined(TAPIR_NATIVE_CRUD_TEST_FAULT_AFTER_FIRST_APPLIED)
+            if (faultAfterFirstApplied && itemIndex == 0) {
+                firstItemFaultInjectedAfterSuccessfulChange = true;
+                callbackError = APIERR_COMMANDFAILED;
+                failureStage = "fault-after-first-applied-item";
+                results (CreateFailedExecutionResult (callbackError, "Disposable Hatch candidate fault seam requested rollback after the first item was applied."));
+                return callbackError;
+            }
+#endif
+        }
+        return callbackError;
+    });
+    if (undoError != NoError) {
+        response.Add ("transactionRolledBack", true);
+        response.Add ("transactionError", undoError);
+        response.Add ("failureStage", failureStage);
+#if defined(TAPIR_NATIVE_CRUD_TEST_FAULT_AFTER_FIRST_APPLIED)
+        if (firstItemFaultInjectedAfterSuccessfulChange) response.Add ("testFaultEvidence", GS::ObjectState (
+            "schemaVersion", "native-crud-test-fault-evidence/v1", "firstAppliedItemIndex", 0,
+            "firstItemChangeSucceeded", true, "hostRollbackReported", true));
+#endif
+    }
+    return response;
+}
+
+GS::ObjectState ExecuteDraftingUpdate (
+    const API_ElemTypeID typeID,
+    const GS::Array<GS::ObjectState>& items,
+    const bool faultAfterFirstApplied = false)
+{
+    GS::ObjectState response;
+    const auto& results = response.AddList<GS::ObjectState> ("executionResults");
+    GSErrCode callbackError = NoError;
+#if defined(TAPIR_NATIVE_CRUD_TEST_FAULT_AFTER_FIRST_APPLIED)
+    bool firstItemFaultInjectedAfterSuccessfulChange = false;
+#else
+    (void) faultAfterFirstApplied;
+#endif
+    const GSSize itemCount = static_cast<GSSize> (items.GetSize ());
 
     const GSErrCode undoError = ACAPI_CallUndoableCommand (typeID == API_LineID ? "Update Native Lines" : "Update Native Arcs", [&]() -> GSErrCode {
-        for (const GS::ObjectState& item : items) {
+        for (GSSize itemIndex = 0; itemIndex < itemCount; ++itemIndex) {
+            const GS::ObjectState& item = items[itemIndex];
             const GS::ObjectState* elementId = item.Get ("elementId");
             const GS::ObjectState* payload = item.Get ("payload");
             // Native CRUD's adapter carries a nested payload, while the
@@ -922,19 +1968,15 @@ GS::ObjectState ExecuteDraftingUpdate (
             GSErrCode error = guid == APINULLGuid ? APIERR_BADPARS : ACAPI_Element_Get (&element);
             if (error == NoError && GetElemTypeId (element.header) != typeID)
                 error = APIERR_BADID;
+            const short originalStoryIndex = element.header.floorInd;
             API_Element mask = {};
             ACAPI_ELEMENT_MASK_CLEAR (mask);
             bool changed = false;
+            bool storyChanged = false;
             if (error == NoError && payload == nullptr)
                 error = APIERR_BADPARS;
 
             if (error == NoError && typeID == API_LineID) {
-                Int32 floorIndex = 0;
-                if (payload->Get ("floorIndex", floorIndex) || payload->Get ("floorInd", floorIndex)) {
-                    element.header.floorInd = static_cast<short> (floorIndex);
-                    ACAPI_ELEMENT_MASK_SET (mask, API_Elem_Head, floorInd);
-                    changed = true;
-                }
                 const GS::ObjectState* begin = payload->Get ("begCoordinate");
                 const GS::ObjectState* end = payload->Get ("endCoordinate");
                 if (begin != nullptr) {
@@ -965,12 +2007,6 @@ GS::ObjectState ExecuteDraftingUpdate (
                     changed = true;
                 }
             } else if (error == NoError && typeID == API_ArcID) {
-                Int32 floorIndex = 0;
-                if (payload->Get ("floorIndex", floorIndex) || payload->Get ("floorInd", floorIndex)) {
-                    element.header.floorInd = static_cast<short> (floorIndex);
-                    ACAPI_ELEMENT_MASK_SET (mask, API_Elem_Head, floorInd);
-                    changed = true;
-                }
                 const GS::ObjectState* origin = payload->Get ("origin");
                 if (origin != nullptr) {
                     element.arc.origC = Get2DCoordinateFromObjectState (*origin);
@@ -1032,12 +2068,30 @@ GS::ObjectState ExecuteDraftingUpdate (
                 error = APIERR_BADPARS;
             if (error == NoError)
                 error = ACAPI_Element_Change (&element, &mask, nullptr, 0, true);
+            if (error == NoError) {
+                API_Elem_Head updatedHeader = {};
+                updatedHeader.guid = guid;
+                error = ACAPI_Element_GetHeader (&updatedHeader);
+                if (error == NoError && updatedHeader.floorInd != originalStoryIndex) {
+                    storyChanged = true;
+                    error = APIERR_COMMANDFAILED;
+                }
+            }
             if (error != NoError) {
                 callbackError = error;
-                results (CreateFailedExecutionResult (error, "Failed to update drafting element."));
+                results (CreateFailedExecutionResult (error, storyChanged
+                    ? "Native CRUD drafting UPDATE changed story; the undoable batch must roll back."
+                    : "Failed to update drafting element."));
                 return error;
             }
             results (CreateSuccessfulExecutionResult ());
+#if defined(TAPIR_NATIVE_CRUD_TEST_FAULT_AFTER_FIRST_APPLIED)
+            if (faultAfterFirstApplied && itemIndex == 0) {
+                firstItemFaultInjectedAfterSuccessfulChange = true;
+                results (CreateFailedExecutionResult (APIERR_COMMANDFAILED, "Disposable drafting candidate fault seam requested rollback after the first item was applied."));
+                return APIERR_COMMANDFAILED;
+            }
+#endif
         }
         return callbackError;
     });
@@ -1046,6 +2100,14 @@ GS::ObjectState ExecuteDraftingUpdate (
         response.Add ("transactionRolledBack", true);
         response.Add ("transactionError", undoError);
     }
+#if defined(TAPIR_NATIVE_CRUD_TEST_FAULT_AFTER_FIRST_APPLIED)
+    if (firstItemFaultInjectedAfterSuccessfulChange && undoError != NoError)
+        response.Add ("testFaultEvidence", GS::ObjectState (
+            "schemaVersion", "native-crud-test-fault-evidence/v1",
+            "firstAppliedItemIndex", 0,
+            "firstItemChangeSucceeded", true,
+            "hostRollbackReported", true));
+#endif
     return response;
 }
 
@@ -1150,42 +2212,24 @@ GS::Optional<GS::UniString> ApplyNativeCrudWallPlacement (
     const Stories& stories,
     bool& changed)
 {
-    const bool hasStoryIndex = details.Contains ("storyIndex");
     const bool hasElevation = details.Contains ("elevation");
-    if (!hasStoryIndex && !hasElevation)
-        return {};
+    if (!hasElevation) return {};
     if (stories.empty ())
         return "Story settings are unavailable; Wall placement cannot be updated.";
 
     const short currentStoryIndex = element.header.floorInd;
-    if (!hasStoryIndex && stories.find (currentStoryIndex) == stories.end())
+    if (stories.find (currentStoryIndex) == stories.end())
         return "The Wall current story is unavailable; absolute elevation cannot be resolved.";
 
-    short targetStoryIndex = currentStoryIndex;
-    Int32 requestedStoryIndex = 0;
-    if (hasStoryIndex) {
-        if (!details.Get ("storyIndex", requestedStoryIndex)
-            || requestedStoryIndex < static_cast<Int32> (std::numeric_limits<short>::min ())
-            || requestedStoryIndex > static_cast<Int32> (std::numeric_limits<short>::max ()))
-            return "'storyIndex' is outside the Archicad story-index range.";
-        targetStoryIndex = static_cast<short> (requestedStoryIndex);
-        if (stories.find (targetStoryIndex) == stories.end())
-            return "Unknown Archicad story index in 'storyIndex'.";
-    }
-
     const double currentElevation = GetZPos (currentStoryIndex, element.wall.bottomOffset, stories);
-    double targetElevation = currentElevation;
-    if (hasElevation) {
-        if (!details.Get ("elevation", targetElevation) || !std::isfinite (targetElevation))
-            return "'elevation' must be a finite real number.";
-    }
-    const double targetBottomOffset = targetElevation - GetZPos (targetStoryIndex, 0.0, stories);
+    double targetElevation = 0.0;
+    if (!details.Get ("elevation", targetElevation) || !std::isfinite (targetElevation))
+        return "'elevation' must be a finite real number.";
+    const double targetBottomOffset = targetElevation - GetZPos (currentStoryIndex, 0.0, stories);
     if (!std::isfinite (targetBottomOffset))
         return "Wall placement resolved to a non-finite bottom offset.";
 
-    element.header.floorInd = targetStoryIndex;
     element.wall.bottomOffset = targetBottomOffset;
-    ACAPI_ELEMENT_MASK_SET (mask, API_Elem_Head, floorInd);
     ACAPI_ELEMENT_MASK_SET (mask, API_WallType, bottomOffset);
     changed = true;
     return {};
@@ -1264,6 +2308,7 @@ GS::ObjectState ExecuteNativeCrudWallUpdate (const GS::Array<GS::ObjectState>& i
     const auto& results = response.AddList<GS::ObjectState> ("executionResults");
     const Stories stories = GetStories ();
     GSErrCode callbackError = NoError;
+    bool testFaultInjectedAfterFirstApplied = false;
 
     const GSErrCode undoError = ACAPI_CallUndoableCommand ("Update Native Walls", [&]() -> GSErrCode {
         for (GSSize index = 0; index < static_cast<GSSize> (items.GetSize ()); ++index) {
@@ -1280,10 +2325,12 @@ GS::ObjectState ExecuteNativeCrudWallUpdate (const GS::Array<GS::ObjectState>& i
             GSErrCode error = guid == APINULLGuid ? APIERR_BADPARS : ACAPI_Element_Get (&element);
             if (error == NoError && GetElemTypeId (element.header) != API_WallID)
                 error = APIERR_BADID;
+            const short originalStoryIndex = element.header.floorInd;
 
             API_Element mask = {};
             ACAPI_ELEMENT_MASK_CLEAR (mask);
             bool changed = false;
+            bool storyChanged = false;
             if (error == NoError) {
                 const auto placementError = ApplyNativeCrudWallPlacement (element, mask, item, stories, changed);
                 if (placementError.HasValue ()) {
@@ -1318,14 +2365,26 @@ GS::ObjectState ExecuteNativeCrudWallUpdate (const GS::Array<GS::ObjectState>& i
                     continue;
                 }
                 error = ACAPI_Element_Change (&element, &mask, nullptr, 0, true);
+                if (error == NoError) {
+                    API_Elem_Head updatedHeader = {};
+                    updatedHeader.guid = guid;
+                    error = ACAPI_Element_GetHeader (&updatedHeader);
+                    if (error == NoError && updatedHeader.floorInd != originalStoryIndex) {
+                        storyChanged = true;
+                        error = APIERR_COMMANDFAILED;
+                    }
+                }
             }
             if (error != NoError) {
-                results (CreateFailedExecutionResult (error, "Failed to update Wall."));
+                results (CreateFailedExecutionResult (error, storyChanged
+                    ? "Native CRUD Wall UPDATE changed story; the undoable batch must roll back."
+                    : "Failed to update Wall."));
                 callbackError = error;
                 continue;
             }
             results (CreateSuccessfulExecutionResult ());
             if (index == 0 && NativeCrudTestFaultAfterFirstApplied) {
+                testFaultInjectedAfterFirstApplied = true;
                 callbackError = APIERR_COMMANDFAILED;
                 results (CreateFailedExecutionResult (callbackError, "Disposable native CRUD test fault seam requested rollback after the first applied Wall item."));
                 return callbackError;
@@ -1337,6 +2396,16 @@ GS::ObjectState ExecuteNativeCrudWallUpdate (const GS::Array<GS::ObjectState>& i
     if (undoError != NoError) {
         response.Add ("transactionRolledBack", true);
         response.Add ("transactionError", undoError);
+#if defined(TAPIR_NATIVE_CRUD_TEST_FAULT_AFTER_FIRST_APPLIED)
+        if (testFaultInjectedAfterFirstApplied) {
+            GS::ObjectState evidence (
+                "schemaVersion", "native-crud-test-fault-evidence/v1",
+                "firstAppliedItemIndex", 0,
+                "firstItemChangeSucceeded", true,
+                "hostRollbackReported", true);
+            response.Add ("testFaultEvidence", evidence);
+        }
+#endif
     }
     return response;
 }
@@ -1365,7 +2434,19 @@ GS::ObjectState ExecuteUpdate (
             GS::Array<GS::ObjectState> items;
             if (!parameters.Get (fieldName, items))
                 return CreateErrorResponse (APIERR_BADPARS, "Drafting update items are missing.");
-            return ExecuteDraftingUpdate (typeID, items);
+            bool faultAfterFirstApplied = false;
+            parameters.Get ("nativeCrudTestFaultAfterFirstApplied", faultAfterFirstApplied);
+            if (faultAfterFirstApplied && typeID != API_LineID && typeID != API_ArcID)
+                return CreateErrorResponse (APIERR_BADPARS, "First-applied fault seam is available only for Line or Arc UPDATE in the drafting executor.");
+            return ExecuteDraftingUpdate (typeID, items, faultAfterFirstApplied);
+        }
+        case API_HatchID: {
+            GS::Array<GS::ObjectState> items;
+            if (!parameters.Get ("hatchesWithDetails", items))
+                return CreateErrorResponse (APIERR_BADPARS, "Hatch update items are missing.");
+            bool faultAfterFirstApplied = false;
+            parameters.Get ("nativeCrudTestFaultAfterFirstApplied", faultAfterFirstApplied);
+            return ExecuteHatchUpdate (items, faultAfterFirstApplied);
         }
         default:           return CreateErrorResponse (APIERR_BADID, "Unsupported element type for update.");
     }
@@ -1399,7 +2480,7 @@ void ApplyTextPlacement (
         }
     }
     Int32 floorIndex = 0;
-    if (payload.Get ("floorIndex", floorIndex)) {
+    if (deriveFloorFromCoordinate && payload.Get ("floorIndex", floorIndex)) {
         element.header.floorInd = static_cast<short> (floorIndex);
         ACAPI_ELEMENT_MASK_SET (mask, API_Elem_Head, floorInd);
     }
@@ -1673,11 +2754,19 @@ GS::ObjectState ExecuteTextUpdate (
             GSErrCode error = guid == APINULLGuid ? APIERR_BADPARS : ACAPI_Element_Get (&element);
             if (error == NoError && GetElemTypeId (element.header) != API_TextID)
                 error = APIERR_BADID;
+            const short originalStoryIndex = element.header.floorInd;
             double requestedAngle = 0.0;
             if (error == NoError && !item.Get ("angle", requestedAngle))
                 error = APIERR_BADPARS;
             if (error == NoError)
                 error = RotateTextByDelta (element, requestedAngle);
+            if (error == NoError) {
+                API_Elem_Head updatedHeader = {};
+                updatedHeader.guid = guid;
+                error = ACAPI_Element_GetHeader (&updatedHeader);
+                if (error == NoError && updatedHeader.floorInd != originalStoryIndex)
+                    error = APIERR_COMMANDFAILED;
+            }
             if (error == NoError)
                 results (CreateSuccessfulExecutionResult ());
             else
@@ -1701,6 +2790,7 @@ GS::ObjectState ExecuteTextUpdate (
             NativeMemoGuard memoGuard (memo);
             element.header.guid = guid;
             GSErrCode error = guid == APINULLGuid ? APIERR_BADPARS : ACAPI_Element_Get (&element);
+            const short originalStoryIndex = element.header.floorInd;
             if (error == NoError) {
                 const GS::ObjectState* richText = item.Get ("richText");
                 GS::UniString richTextError;
@@ -1718,6 +2808,13 @@ GS::ObjectState ExecuteTextUpdate (
                         error = ACAPI_Element_Change (&element, &mask, &memo, TextRichMemoMask, true);
                     } else {
                         error = ACAPI_Element_Change (&element, &mask, nullptr, 0, true);
+                    }
+                    if (error == NoError) {
+                        API_Elem_Head updatedHeader = {};
+                        updatedHeader.guid = guid;
+                        error = ACAPI_Element_GetHeader (&updatedHeader);
+                        if (error == NoError && updatedHeader.floorInd != originalStoryIndex)
+                            error = APIERR_COMMANDFAILED;
                     }
                     if (error == NoError)
                         results (CreateSuccessfulExecutionResult ());
@@ -1954,6 +3051,36 @@ GS::Optional<GS::UniString> ValidateEnvelopeItem (
         }
         auto error = ValidatePayload (*payload, typeID, true);
         if (error.HasValue ()) return error;
+        if (typeID == API_DoorID) {
+            const GS::ObjectState* cloneSource = item.Get ("cloneSourceElementId");
+            if (cloneSource == nullptr || GetGuidFromObjectState (*cloneSource) == APINULLGuid)
+                return "Door CREATE requires an exact cloneSourceElementId from the same file.";
+            API_Elem_Head sourceHeader = {};
+            sourceHeader.guid = GetGuidFromObjectState (*cloneSource);
+            const GSErrCode sourceError = ACAPI_Element_GetHeader (&sourceHeader);
+            if (sourceError != NoError || GetElemTypeId (sourceHeader) != API_DoorID)
+                return "Door cloneSourceElementId must resolve to an exact same-file Door.";
+            GS::ObjectState normalized;
+            normalized.Add ("cloneSourceElementId", *cloneSource);
+            normalized.Add ("payload", *payload);
+            normalizedItems.Push (normalized);
+            return {};
+        }
+        if (typeID == API_WindowID) {
+            const GS::ObjectState* cloneSource = item.Get ("cloneSourceElementId");
+            if (cloneSource == nullptr || GetGuidFromObjectState (*cloneSource) == APINULLGuid)
+                return "Window CREATE requires an exact cloneSourceElementId from the same file.";
+            API_Elem_Head sourceHeader = {};
+            sourceHeader.guid = GetGuidFromObjectState (*cloneSource);
+            const GSErrCode sourceError = ACAPI_Element_GetHeader (&sourceHeader);
+            if (sourceError != NoError || GetElemTypeId (sourceHeader) != API_WindowID)
+                return "Window cloneSourceElementId must resolve to an exact same-file Window.";
+            GS::ObjectState normalized;
+            normalized.Add ("cloneSourceElementId", *cloneSource);
+            normalized.Add ("payload", *payload);
+            normalizedItems.Push (normalized);
+            return {};
+        }
         normalizedItems.Push (*payload);
         return {};
     }
@@ -2154,7 +3281,18 @@ GS::Optional<GS::UniString> MutateElementsCommand::GetInputParametersSchema () c
             },
             "elementType": {
                 "type": "string",
-                "enum": ["Wall", "Slab", "Column", "Beam", "Text", "Line", "Arc"]
+                "enum": ["Wall", "Slab", "Column", "Beam", "Text", "Line", "Arc", "Hatch", "Door"]
+            },
+            "nativeCandidateColumnTemplateSection": {
+                "type": "object",
+                "description": "Internal candidate-only factual section readback for the exact same-file Column template."
+            },
+            "nativeCandidateDoorFields": {
+                "type": "array",
+                "description": "Internal candidate authorization derived by NativeCrudCommands' exact public-to-native Door field mapping.",
+                "items": { "type": "string", "enum": ["ownerWallId", "centerOffset", "sillHeight", "width", "height", "reflected", "refSide", "oSide"] },
+                "minItems": 1,
+                "uniqueItems": true
             },
             "items": {
                 "type": "array",
@@ -2164,6 +3302,7 @@ GS::Optional<GS::UniString> MutateElementsCommand::GetInputParametersSchema () c
                     "type": "object",
                     "properties": {
                         "elementId": { "$ref": "#/ElementId" },
+                        "cloneSourceElementId": { "$ref": "#/ElementId" },
                         "payload": {
                             "type": "object",
                             "properties": {
@@ -2206,6 +3345,17 @@ GS::Optional<GS::UniString> MutateElementsCommand::GetInputParametersSchema () c
                                     "items": { "$ref": "#/Coordinate2D" },
                                     "minItems": 3
                                 },
+                                "hatchCoordinates": {
+                                    "type": "array",
+                                    "items": { "$ref": "#/Coordinate2D" },
+                                    "minItems": 3,
+                                    "maxItems": 64
+                                },
+                                "floorInd": { "type": "integer" },
+                                "contourPenIndex": { "type": "integer", "minimum": 1, "maximum": 32767 },
+                                "fillPenIndex": { "type": "integer", "minimum": 1, "maximum": 32767 },
+                                "fillBackgroundPenIndex": { "type": "integer", "minimum": 1, "maximum": 32767 },
+                                "fillAttributeIndex": { "type": "integer", "minimum": 1 },
                                 "polygonArcs": {
                                     "type": "array",
                                     "items": { "$ref": "#/PolyArc" }
@@ -2308,6 +3458,11 @@ GS::Optional<GS::UniString> MutateElementsCommand::GetInputParametersSchema () c
                                 "beginAngle": { "type": "number" },
                                 "endAngle": { "type": "number" },
                                 "reflected": { "type": "boolean" }
+                                ,"ownerWallId": { "$ref": "#/ElementId" }
+                                ,"centerOffset": { "type": "number" }
+                                ,"sillHeight": { "type": "number" }
+                                ,"refSide": { "type": "boolean" }
+                                ,"oSide": { "type": "boolean" }
                             },
                             "additionalProperties": false
                         }
@@ -2340,7 +3495,7 @@ GS::Optional<GS::UniString> MutateElementsCommand::GetRawResponseSchema () const
         "type": "object",
         "properties": {
             "operation": { "type": "string", "enum": ["create", "update", "delete"] },
-            "elementType": { "type": "string", "enum": ["Wall", "Slab", "Column", "Beam", "Text", "Line", "Arc"] },
+            "elementType": { "type": "string", "enum": ["Wall", "Slab", "Column", "Beam", "Text", "Line", "Arc", "Hatch"] },
             "requestedCount": { "type": "integer", "minimum": 0 },
             "appliedCount": { "type": "integer", "minimum": 0 },
             "mutationComplete": { "type": "boolean" },
@@ -2372,9 +3527,112 @@ GS::ObjectState MutateElementsCommand::Execute (
     }
     const API_ElemTypeID typeID = GetElementTypeFromNonLocalizedName (elementTypeName);
     const bool isText = typeID == API_TextID;
-    const ElementTypeSpec* typeSpec = isText ? nullptr : GetElementTypeSpec (typeID);
-    if (!isText && typeSpec == nullptr) {
-        return CreateErrorResponse (APIERR_BADPARS, "'elementType' must be Wall, Slab, Column, Beam, Text, Line or Arc.");
+    bool nativeCrudAtomic = false;
+    parameters.Get ("nativeCrudAtomic", nativeCrudAtomic);
+    bool nativeCrudHatchWriter = false;
+    parameters.Get ("nativeCrudHatchWriter", nativeCrudHatchWriter);
+    bool nativeCandidateHatchWriter = false;
+    const bool hasNativeCandidateHatchWriter = parameters.Get ("nativeCandidateHatchWriter", nativeCandidateHatchWriter);
+    if (parameters.Contains ("nativeCandidateHatchWriter") && !hasNativeCandidateHatchWriter)
+        return CreateErrorResponse (APIERR_BADPARS, "Candidate Hatch diagnostics marker must be a boolean.");
+    if (nativeCrudHatchWriter && (typeID != API_HatchID || (operation != "create" && operation != "update")))
+        return CreateErrorResponse (APIERR_BADPARS, "Hatch typed writer marker is valid only for Hatch CREATE or UPDATE.");
+    bool nativeCrudDoorWriter = false;
+    const bool hasNativeCrudDoorWriter = parameters.Get ("nativeCrudDoorWriter", nativeCrudDoorWriter);
+    if (parameters.Contains ("nativeCrudDoorWriter") && !hasNativeCrudDoorWriter)
+        return CreateErrorResponse (APIERR_BADPARS, "Door typed writer marker must be a boolean.");
+    bool nativeCandidateDoorWriter = false;
+    const bool hasNativeCandidateDoorWriter = parameters.Get ("nativeCandidateDoorWriter", nativeCandidateDoorWriter);
+    if (parameters.Contains ("nativeCandidateDoorWriter") && !hasNativeCandidateDoorWriter)
+        return CreateErrorResponse (APIERR_BADPARS, "Door candidate writer marker must be a boolean.");
+    GS::Array<GS::UniString> nativeCandidateDoorFields;
+    const bool hasNativeCandidateDoorFields = parameters.Get ("nativeCandidateDoorFields", nativeCandidateDoorFields);
+    if (parameters.Contains ("nativeCandidateDoorFields") && !hasNativeCandidateDoorFields)
+        return CreateErrorResponse (APIERR_BADPARS, "Door candidate native field authorization must be a string array.");
+    if (nativeCrudDoorWriter && (typeID != API_DoorID || (operation != "create" && operation != "update")))
+        return CreateErrorResponse (APIERR_BADPARS, "Door typed writer marker is valid only for Door CREATE or UPDATE.");
+    if (typeID == API_DoorID && (operation == "create" || operation == "update")
+        && !nativeCrudDoorWriter)
+        return CreateErrorResponse (APIERR_BADPARS, "Door CREATE/UPDATE requires the typed Native CRUD writer route.");
+    if (nativeCandidateDoorWriter && (!nativeCrudDoorWriter || typeID != API_DoorID || operation != "create" && operation != "update"))
+        return CreateErrorResponse (APIERR_BADPARS, "Candidate Door marker is valid only for Door CREATE or UPDATE through its typed writer.");
+    if (nativeCandidateDoorWriter != hasNativeCandidateDoorFields || (nativeCandidateDoorWriter && nativeCandidateDoorFields.IsEmpty ()))
+        return CreateErrorResponse (APIERR_BADPARS, "Candidate Door writes require the exact flattened native field authorization derived at the Native CRUD boundary.");
+    if (!nativeCandidateDoorWriter && hasNativeCandidateDoorFields)
+        return CreateErrorResponse (APIERR_BADPARS, "Door candidate field authorization is invalid without the guarded candidate writer.");
+    bool nativeCrudWindowWriter = false;
+    const bool hasNativeCrudWindowWriter = parameters.Get ("nativeCrudWindowWriter", nativeCrudWindowWriter);
+    if (parameters.Contains ("nativeCrudWindowWriter") && !hasNativeCrudWindowWriter)
+        return CreateErrorResponse (APIERR_BADPARS, "Window typed writer marker must be a boolean.");
+    bool nativeCandidateWindowWriter = false;
+    const bool hasNativeCandidateWindowWriter = parameters.Get ("nativeCandidateWindowWriter", nativeCandidateWindowWriter);
+    if (parameters.Contains ("nativeCandidateWindowWriter") && !hasNativeCandidateWindowWriter)
+        return CreateErrorResponse (APIERR_BADPARS, "Window candidate writer marker must be a boolean.");
+    GS::Array<GS::UniString> nativeCandidateWindowFields;
+    const bool hasNativeCandidateWindowFields = parameters.Get ("nativeCandidateWindowFields", nativeCandidateWindowFields);
+    if (parameters.Contains ("nativeCandidateWindowFields") && !hasNativeCandidateWindowFields)
+        return CreateErrorResponse (APIERR_BADPARS, "Window candidate native field authorization must be a string array.");
+    if (nativeCrudWindowWriter && (typeID != API_WindowID || (operation != "create" && operation != "update")))
+        return CreateErrorResponse (APIERR_BADPARS, "Window typed writer marker is valid only for Window CREATE or UPDATE.");
+    if (typeID == API_WindowID && (operation == "create" || operation == "update") && !nativeCrudWindowWriter)
+        return CreateErrorResponse (APIERR_BADPARS, "Window CREATE/UPDATE requires its typed Native CRUD writer route.");
+    if (nativeCandidateWindowWriter && (!nativeCrudWindowWriter || typeID != API_WindowID || (operation != "create" && operation != "update")))
+        return CreateErrorResponse (APIERR_BADPARS, "Candidate Window marker is valid only for Window CREATE/UPDATE through its typed writer.");
+    if (nativeCandidateWindowWriter != hasNativeCandidateWindowFields || (nativeCandidateWindowWriter && nativeCandidateWindowFields.IsEmpty ()))
+        return CreateErrorResponse (APIERR_BADPARS, "Candidate Window writes require exact flattened native field authorization.");
+    if (!nativeCandidateWindowWriter && hasNativeCandidateWindowFields)
+        return CreateErrorResponse (APIERR_BADPARS, "Window candidate field authorization is invalid without its guarded writer.");
+#if !TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS
+    if (hasNativeCandidateWindowWriter || hasNativeCandidateWindowFields)
+        return CreateErrorResponse (APIERR_BADPARS, "Window candidate writer is unavailable in this ordinary APX build.");
+#endif
+    if (typeID == API_WindowID && (operation == "create" || operation == "update")) {
+#if TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS
+        if (!nativeCandidateWindowWriter)
+            return CreateErrorResponse (APIERR_BADPARS, "Window candidate build requires its exact guarded candidate writer marker.");
+#else
+        // Ordinary requests have already rejected candidate-only metadata;
+        // they use the same typed writer and factual host/story postconditions.
+#endif
+    }
+#if !TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS
+    if (hasNativeCandidateDoorWriter || hasNativeCandidateDoorFields)
+        return CreateErrorResponse (APIERR_BADPARS, "Door candidate writer is unavailable in this ordinary APX build.");
+#endif
+    if (nativeCandidateHatchWriter && (!nativeCrudHatchWriter || typeID != API_HatchID || operation != "create"))
+        return CreateErrorResponse (APIERR_BADPARS, "Candidate Hatch diagnostics are valid only for Hatch CREATE through its typed writer.");
+#if !TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS
+    if (nativeCandidateHatchWriter)
+        return CreateErrorResponse (APIERR_BADPARS, "Candidate Hatch diagnostics are unavailable in this ordinary APX build.");
+#endif
+    if (typeID == API_HatchID && (operation == "create" || operation == "update") && !nativeCrudHatchWriter)
+        return CreateErrorResponse (APIERR_BADPARS, "Hatch CREATE/UPDATE requires the validated typed Native CRUD writer route.");
+    bool nativeCrudTestFaultAfterFirstApplied = false;
+    const bool hasNativeCrudTestFaultAfterFirstApplied = parameters.Get ("nativeCrudTestFaultAfterFirstApplied", nativeCrudTestFaultAfterFirstApplied);
+    if (parameters.Contains ("nativeCrudTestFaultAfterFirstApplied") && !hasNativeCrudTestFaultAfterFirstApplied)
+        return CreateErrorResponse (APIERR_BADPARS, "Native CRUD first-applied fault metadata must be a boolean.");
+#if !defined(TAPIR_NATIVE_CRUD_TEST_FAULT_AFTER_FIRST_APPLIED)
+    if (hasNativeCrudTestFaultAfterFirstApplied)
+        return CreateErrorResponse (APIERR_BADPARS, "Native CRUD first-applied fault metadata is unavailable in this ordinary APX build.");
+#else
+    if (nativeCrudTestFaultAfterFirstApplied && ((typeID != API_ColumnID && typeID != API_LineID && typeID != API_ArcID && typeID != API_HatchID && typeID != API_DoorID && typeID != API_WindowID) || operation != "update"))
+        return CreateErrorResponse (APIERR_BADPARS, "First-applied fault seam is valid only for Column, Line, Arc, Hatch, Door or Window UPDATE.");
+#endif
+    GS::ObjectState candidateColumnTemplateSection;
+    const bool hasCandidateColumnTemplateSection = parameters.Get ("nativeCandidateColumnTemplateSection", candidateColumnTemplateSection);
+    if (parameters.Contains ("nativeCandidateColumnTemplateSection") && !hasCandidateColumnTemplateSection)
+        return CreateErrorResponse (APIERR_BADPARS, "Column candidate template section is malformed.");
+    if (hasCandidateColumnTemplateSection && (operation != "create" || typeID != API_ColumnID))
+        return CreateErrorResponse (APIERR_BADPARS, "Column candidate template section is valid only for Column CREATE.");
+#if !TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS
+    if (hasCandidateColumnTemplateSection)
+        return CreateErrorResponse (APIERR_BADPARS, "Column candidate template section is unavailable in this APX build.");
+#endif
+    const bool isDoor = typeID == API_DoorID;
+    const bool isWindow = typeID == API_WindowID;
+    const ElementTypeSpec* typeSpec = (isText || isDoor || isWindow) ? nullptr : GetElementTypeSpec (typeID);
+    if (!isText && !isDoor && !isWindow && typeSpec == nullptr) {
+        return CreateErrorResponse (APIERR_BADPARS, "'elementType' must be Wall, Slab, Column, Beam, Text, Line, Arc, Hatch or guarded Door/Window.");
     }
 
     GS::Array<GS::ObjectState> items;
@@ -2384,6 +3642,10 @@ GS::ObjectState MutateElementsCommand::Execute (
     if (items.IsEmpty () || items.GetSize () > MaxMutationItems) {
         return CreateErrorResponse (APIERR_BADPARS, "'items' must contain between 1 and 256 entries.");
     }
+#if defined(TAPIR_NATIVE_CRUD_TEST_FAULT_AFTER_FIRST_APPLIED)
+    if (nativeCrudTestFaultAfterFirstApplied && items.GetSize () != 2)
+        return CreateErrorResponse (APIERR_BADPARS, "First-applied fault seam requires exactly two UPDATE items.");
+#endif
 
     GS::Array<GS::ObjectState> normalizedItems;
     GS::Array<API_Guid> requestedElementGuids;
@@ -2394,6 +3656,55 @@ GS::ObjectState MutateElementsCommand::Execute (
             // called.  Invalid enum/range/reference/conflict input therefore
             // cannot result in a native mutation.
             return CreateErrorResponse (APIERR_BADPARS, error.Get ());
+        }
+    }
+    if (nativeCandidateDoorWriter) {
+        GS::HashSet<GS::UniString> authorized;
+        for (const GS::UniString& field : nativeCandidateDoorFields) {
+            if (authorized.Contains (field)) return CreateErrorResponse (APIERR_BADPARS, "Door candidate native field authorization contains duplicates.");
+            authorized.Add (field);
+        }
+        for (const GS::ObjectState& item : normalizedItems) {
+            // CREATE keeps its nested payload; UPDATE is flattened by
+            // ValidateEnvelopeItem and carries the target GUID at top level.
+            // Validate exactly the corresponding normalized writable fields.
+            const GS::ObjectState* shape = operation == "create" ? item.Get ("payload") : &item;
+            if (shape == nullptr) return CreateErrorResponse (APIERR_BADPARS, "Door candidate normalized item is missing its payload/patch.");
+            GS::HashSet<GS::UniString> actual;
+            for (const GS::String& name : shape->GetFieldNames ()) {
+                const GS::UniString field (name);
+                if (operation == "create" && field == "floorIndex") continue;
+                if (operation == "update" && field == "elementId") continue;
+                actual.Add (field);
+            }
+            if (actual.GetSize () != authorized.GetSize ())
+                return CreateErrorResponse (APIERR_BADPARS, "Door candidate flattened field authorization does not match the normalized native item.");
+            for (const GS::UniString& field : actual)
+                if (!authorized.Contains (field)) return CreateErrorResponse (APIERR_BADPARS, "Door candidate flattened field authorization does not match the normalized native item.");
+        }
+    }
+    if (nativeCandidateWindowWriter) {
+        GS::HashSet<GS::UniString> authorized;
+        const std::initializer_list<const char*> allowedFields = { "ownerWallId", "centerOffset", "sillHeight", "width", "height", "reflected", "refSide", "oSide" };
+        for (const GS::UniString& field : nativeCandidateWindowFields) {
+            if (authorized.Contains (field)) return CreateErrorResponse (APIERR_BADPARS, "Window candidate native field authorization contains duplicates.");
+            bool allowed = false;
+            for (const char* allowedField : allowedFields) allowed = allowed || field == allowedField;
+            if (!allowed) return CreateErrorResponse (APIERR_BADPARS, "Window candidate native field authorization contains an unsupported field.");
+            authorized.Add (field);
+        }
+        for (const GS::ObjectState& item : normalizedItems) {
+            const GS::ObjectState* shape = operation == "create" ? item.Get ("payload") : &item;
+            if (shape == nullptr) return CreateErrorResponse (APIERR_BADPARS, "Window candidate normalized item is missing its payload/patch.");
+            GS::HashSet<GS::UniString> actual;
+            for (const GS::String& name : shape->GetFieldNames ()) {
+                const GS::UniString field (name);
+                if (operation == "create" && field == "floorIndex") continue;
+                if (operation == "update" && field == "elementId") continue;
+                actual.Add (field);
+            }
+            if (actual.GetSize () != authorized.GetSize ()) return CreateErrorResponse (APIERR_BADPARS, "Window candidate flattened field authorization differs from its normalized native item.");
+            for (const GS::UniString& field : actual) if (!authorized.Contains (field)) return CreateErrorResponse (APIERR_BADPARS, "Window candidate flattened field authorization differs from its normalized native item.");
         }
     }
 
@@ -2432,10 +3743,50 @@ GS::ObjectState MutateElementsCommand::Execute (
     });
 
     GS::ObjectState mutationParameters;
-    if (!isText && operation == "create") {
+    if ((isDoor || isWindow) && operation == "create") {
+        mutationParameters = BuildArrayParameters ("items", normalizedItems);
+        if (nativeCandidateDoorWriter) {
+            mutationParameters.Add ("nativeCandidateDoorWriter", true);
+            mutationParameters.Add ("nativeCandidateDoorFields", nativeCandidateDoorFields);
+        }
+        if (nativeCandidateWindowWriter) {
+            mutationParameters.Add ("nativeCandidateWindowWriter", true);
+            mutationParameters.Add ("nativeCandidateWindowFields", nativeCandidateWindowFields);
+        }
+    } else if (!isText && !isDoor && !isWindow && operation == "create") {
         mutationParameters = BuildArrayParameters (typeSpec->createArrayName, normalizedItems);
-    } else if (!isText && operation == "update") {
+        if (hasCandidateColumnTemplateSection)
+            mutationParameters.Add ("nativeCandidateColumnTemplateSection", candidateColumnTemplateSection);
+        if (nativeCrudHatchWriter)
+            mutationParameters.Add ("nativeCrudHatchWriter", true);
+        if (nativeCandidateHatchWriter)
+            mutationParameters.Add ("nativeCandidateHatchWriter", true);
+    } else if ((isDoor || isWindow) && operation == "update") {
+        mutationParameters = BuildArrayParameters ("items", normalizedItems);
+        mutationParameters.Add ("nativeCrudAtomic", true);
+        if (nativeCandidateDoorWriter) {
+            mutationParameters.Add ("nativeCandidateDoorWriter", true);
+            mutationParameters.Add ("nativeCandidateDoorFields", nativeCandidateDoorFields);
+        }
+        if (nativeCandidateWindowWriter) {
+            mutationParameters.Add ("nativeCandidateWindowWriter", true);
+            mutationParameters.Add ("nativeCandidateWindowFields", nativeCandidateWindowFields);
+        }
+#if defined(TAPIR_NATIVE_CRUD_TEST_FAULT_AFTER_FIRST_APPLIED)
+        if (nativeCrudTestFaultAfterFirstApplied) mutationParameters.Add ("nativeCrudTestFaultAfterFirstApplied", true);
+#endif
+    } else if (!isText && !isDoor && !isWindow && operation == "update") {
         mutationParameters = BuildArrayParameters (typeSpec->updateArrayName, normalizedItems);
+        if (nativeCrudAtomic)
+            mutationParameters.Add ("nativeCrudAtomic", true);
+#if defined(TAPIR_NATIVE_CRUD_TEST_FAULT_AFTER_FIRST_APPLIED)
+        // This top-level internal key is not part of the MutateElements input
+        // schema. NativeCrudCommands adds it only after exact candidate
+        // manifest validation; copy it solely into existing atomic typed
+        // executors that implement the first-applied rollback seam.
+        if ((typeID == API_ColumnID || typeID == API_LineID || typeID == API_ArcID || typeID == API_HatchID) && nativeCrudTestFaultAfterFirstApplied)
+            mutationParameters.Add ("nativeCrudTestFaultAfterFirstApplied", true);
+#endif
     }
 
     GS::ObjectState mutationResult;
@@ -2443,6 +3794,14 @@ GS::ObjectState MutateElementsCommand::Execute (
         mutationResult = ExecuteTextCreate (normalizedItems, processControl);
     } else if (isText && operation == "update") {
         mutationResult = ExecuteTextUpdate (normalizedItems, processControl);
+    } else if (isWindow && operation == "create") {
+        mutationResult = ExecuteWindowCreate (normalizedItems, processControl);
+    } else if (isWindow && operation == "update") {
+        mutationResult = ExecuteWindowUpdate (normalizedItems, nativeCrudTestFaultAfterFirstApplied, processControl);
+    } else if (isDoor && operation == "create") {
+        mutationResult = ExecuteDoorCreate (normalizedItems, processControl);
+    } else if (isDoor && operation == "update") {
+        mutationResult = ExecuteDoorUpdate (normalizedItems, nativeCrudTestFaultAfterFirstApplied, processControl);
     } else if (operation == "create") {
         mutationResult = ExecuteCreate (typeID, mutationParameters, processControl);
     } else if (operation == "update") {

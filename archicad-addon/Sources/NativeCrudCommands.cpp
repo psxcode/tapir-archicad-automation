@@ -33,12 +33,12 @@
 
 namespace {
 
-constexpr const char* ContractVersion = "native-crud-v1";
+constexpr const char* ContractVersion = "native-crud-v2";
 constexpr const char* SnapshotVersion = "native-element-snapshot-v1";
 constexpr const char* ReceiptVersion = "native-mutation-receipt-v1";
 constexpr const char* HistoryVersion = "native-mutation-history-v1";
-constexpr const char* CapabilitySchemaVersion = "native-crud-capabilities-v1";
-constexpr const char* CapabilitySchemaHash = "0040a843c2ef78687412f3080405da3900c37ac780abbbb450534f6723ecb7fc";
+constexpr const char* CapabilitySchemaVersion = "native-crud-capabilities-v2";
+constexpr const char* CapabilitySchemaHash = "3eee0c6ffe9f006ec6ddfa65faefd45d80cfc246e5b7a4da2aa0fdd3125b7f7b";
 constexpr const char* ImpactEnvelopeVersion = "native-impact-envelope-v1";
 constexpr const char* ImpactEvidenceVersion = "native-impact-evidence-v1";
 constexpr const char* ImpactMetadataKey = "nativeImpact";
@@ -46,6 +46,7 @@ constexpr const char* ImpactScope = "wall-zone-pair-v1";
 constexpr const char* ImpactEvidenceSource = "native-impact-coordinator-v1";
 constexpr GSSize MaxMutationItems = 25;
 constexpr GSSize MaxDiscoveryReferences = 100;
+constexpr GSSize MaxDiscoveryCandidates = 4096;
 constexpr GSSize MaxImpactElements = 256;
 
 std::atomic<Int64>& SequenceCounter ()
@@ -235,6 +236,18 @@ GS::ObjectState CoordinateBounds (const API_Box3D& bounds)
         "maxY", bounds.yMax);
 }
 
+bool IsFiniteOrderedDiscoveryBounds (double minX, double minY, double maxX, double maxY)
+{
+    return std::isfinite (minX) && std::isfinite (minY) && std::isfinite (maxX) && std::isfinite (maxY)
+        && minX <= maxX && minY <= maxY;
+}
+
+bool DiscoveryBoundsIntersect (double minX, double minY, double maxX, double maxY,
+    double queryMinX, double queryMinY, double queryMaxX, double queryMaxY)
+{
+    return maxX >= queryMinX && minX <= queryMaxX && maxY >= queryMinY && minY <= queryMaxY;
+}
+
 // Internal snapshot/readback collections carry the public element-id shape
 // (`elementId: { guid }`), while a few lower-level helpers historically
 // received a bare `{ guid }` object. Accept both forms at this boundary so
@@ -246,7 +259,7 @@ API_Guid GetRequestedElementGuid (const GS::ObjectState& value)
 }
 
 // DetailsOfElements is a stable native read DTO, but its historical field
-// names are not the public native-crud-v1 writable schema.  Keep the wire
+// names are not the public native-crud-v2 writable schema.  Keep the wire
 // snapshot canonical so an agent can copy a `beforeState.writableState` value
 // into a sparse UPDATE without learning a second Archicad vocabulary.  Only
 // the allowlisted fields are projected; raw DevKit/detail objects are not
@@ -294,6 +307,14 @@ void CopyArrayField (const GS::ObjectState& source, const char* sourceName, GS::
     if (!source.Get (sourceName, values)) return;
     const auto& output = target.AddList<GS::ObjectState> (targetName);
     for (const GS::ObjectState& value : values) output (value);
+}
+
+void CopyIntArrayField (const GS::ObjectState& source, const char* sourceName, GS::ObjectState& target, const char* targetName)
+{
+    GS::Array<Int32> values;
+    if (!source.Get (sourceName, values)) return;
+    const auto& output = target.AddList<Int32> (targetName);
+    for (const Int32 value : values) output (value);
 }
 
 void CopyPolygonField (const GS::ObjectState& source, GS::ObjectState& target)
@@ -348,7 +369,34 @@ GS::ObjectState CanonicalWritableState (
         CopyDoubleField (details, "zCoordinate", state, "elevation");
         CopyDoubleField (details, "height", state, "height");
         CopyDoubleField (details, "bottomOffset", state, "offset");
+        CopyDoubleField (details, "axisRotationAngle", state, "rotation");
         CopyDoubleField (details, "slantAngle", state, "slant");
+        // Column fingerprints always include factual memo topology and
+        // linkage. Expose writable dimensions only for the exact supported
+        // one-segment, vertical, rectangular Basic section; never synthesize
+        // dimensions when memo evidence is missing or outside that shape.
+        const GS::ObjectState* section = details.Get ("columnSectionReadback");
+        if (section != nullptr) {
+            state.Add ("section", *section);
+            GS::UniString sectionStatus;
+            GS::Array<GS::ObjectState> segments;
+            bool simple = false;
+            Int32 segmentCount = 0;
+            if (section->Get ("status", sectionStatus) && sectionStatus == "available"
+                && section->Get ("simpleVerticalSingleSegment", simple) && simple
+                && section->Get ("segmentCount", segmentCount) && segmentCount == 1
+                && section->Get ("segments", segments) && segments.GetSize () == 1) {
+                GS::UniString shape;
+                GS::UniString structure;
+                GS::ObjectState dimensions;
+                bool circleBased = true;
+                if (segments[0].Get ("shape", shape) && shape == "rectangular"
+                    && segments[0].Get ("structure", structure) && structure == "Basic"
+                    && segments[0].Get ("circleBased", circleBased) && !circleBased
+                    && segments[0].Get ("dimensions", dimensions))
+                    state.Add ("dimensions", dimensions);
+            }
+        }
     } else if (typeName == "Text") {
         CopyObjectField (details, "richText", state, "richText");
         CopyObjectField (details, "anchorCoordinate", state, "coordinate");
@@ -387,9 +435,23 @@ GS::ObjectState CanonicalWritableState (
         CopyIntField (details, "contourPen", state, "contourPen");
         CopyIntField (details, "fillBackgroundPen", state, "backgroundPen");
         CopyIntField (details, "fillPen", state, "foregroundPen");
+        CopyIntArrayField (details, "memoVertexIds", state, "memoVertexIds");
+        CopyStringField (details, "memoVertexIdsStatus", state, "memoVertexIdsStatus");
         GS::ObjectState hatch;
         CopyStringField (details, "hatchType", hatch, "type");
         CopyStringField (details, "determination", hatch, "determination");
+        CopyIntField (details, "contourPenBase", hatch, "contourPenBase");
+        CopyIntField (details, "contourPenOverride", hatch, "contourPenOverride");
+        CopyIntField (details, "fillPenBase", hatch, "fillPenBase");
+        CopyIntField (details, "fillPenOverride", hatch, "fillPenOverride");
+        CopyIntField (details, "buildingMaterialIndex", hatch, "buildingMaterialIndex");
+        CopyIntField (details, "hatchFlags", hatch, "hatchFlags");
+        CopyBoolField (details, "contourPenOverridden", hatch, "contourPenOverridden");
+        CopyBoolField (details, "fillPenOverridden", hatch, "fillPenOverridden");
+        CopyBoolField (details, "hasForegroundRGB", hatch, "hasForegroundRGB");
+        CopyBoolField (details, "hasBackgroundRGB", hatch, "hasBackgroundRGB");
+        CopyIntField (details, "hatchOrientationType", hatch, "orientationType");
+        CopyIntField (details, "hatchOrientationFlags", hatch, "orientationFlags");
         if (!hatch.IsEmpty ()) state.Add ("hatch", hatch);
     } else if (typeName == "Door" || typeName == "Window") {
         CopyObjectField (details, "ownerElementId", state, "ownerWallId");
@@ -398,6 +460,8 @@ GS::ObjectState CanonicalWritableState (
         CopyDoubleField (details, "width", state, "width");
         CopyDoubleField (details, "height", state, "height");
         CopyObjectField (details, "libPart", state, "libraryPart");
+        CopyObjectField (details, "stamp", state, "stamp");
+        CopyObjectField (details, "openingTopology", state, "openingTopology");
         GS::ObjectState orientation;
         CopyBoolField (details, "reflected", orientation, "reflected");
         CopyBoolField (details, "refSide", orientation, "refSide");
@@ -419,6 +483,7 @@ GS::ObjectState FactualColumnReadbackState (const GS::ObjectState& details, cons
     CopyDoubleField (details, "bottomOffset", readback, "bottomOffset");
     CopyDoubleField (details, "height", readback, "height");
     CopyDoubleField (details, "axisRotationAngle", readback, "rotation");
+    CopyIntField (details, "relativeTopStory", readback, "relativeTopStory");
     CopyBoolField (details, "isSlanted", readback, "isSlanted");
     CopyObjectField (details, "columnSectionReadback", readback, "section");
 
@@ -492,13 +557,22 @@ GS::ObjectState SnapshotFromDetailRow (const GS::ObjectState& row, const GS::Uni
     } else {
         snapshot.Add ("recreateState", writableState);
     }
-    snapshot.Add ("fingerprintAlgorithm", "native-json-fnv1a-64-v1");
+    const bool columnSnapshot = canonicalTypeName == "Column";
+    snapshot.Add ("fingerprintAlgorithm", columnSnapshot ? "native-json-fnv1a-64-column-factual-v2" : "native-json-fnv1a-64-v1");
     // The TypeScript adapter treats this as an opaque precondition.  The
     // deterministic FNV value is intentionally derived from the serialized
     // canonical detail object; a future APX can upcast it to SHA-256 without
     // changing the surrounding snapshot shape.
+    GS::ObjectState fingerprintState = writableState;
+    if (columnSnapshot) {
+        GS::ObjectState columnFingerprint;
+        columnFingerprint.Add ("writableState", writableState);
+        const GS::ObjectState* factualState = snapshot.Get ("factualState");
+        if (factualState != nullptr) columnFingerprint.Add ("factualState", *factualState);
+        fingerprintState = columnFingerprint;
+    }
     GS::UniString serialized;
-    JSON::CreateFromObjectState (writableState, serialized);
+    JSON::CreateFromObjectState (fingerprintState, serialized);
     const std::string bytes (serialized.ToCStr (CC_UTF8).Get ());
     std::uint64_t hash = 1469598103934665603ULL;
     for (const unsigned char byte : bytes) {
@@ -693,54 +767,71 @@ GS::Optional<GS::UniString> ReadTypeName (const GS::ObjectState& parameters, API
 void AddCanonicalWritableFields (GS::ObjectState& target, const GS::UniString& typeName)
 {
     const char* fields[16] = {};
+    const char* createFields[16] = {};
+    GSSize createCount = 0;
     GSSize count = 0;
     if (typeName == "Zone") {
-        const char* values[] = { "name", "number", "category", "storyIndex", "polygon", "referencePosition", "stampPlacement" };
+        const char* values[] = { "name", "number", "category", "polygon", "stampPlacement" };
         count = sizeof (values) / sizeof (values[0]);
         for (GSSize i = 0; i < count; ++i) fields[i] = values[i];
     } else if (typeName == "Wall") {
-        const char* values[] = { "begCoordinate", "endCoordinate", "storyIndex", "elevation", "height", "thickness", "offset", "structure", "composite", "referenceLine" };
+        const char* values[] = { "begCoordinate", "endCoordinate", "elevation", "height", "thickness", "offset", "structure", "composite", "referenceLine" };
         count = sizeof (values) / sizeof (values[0]);
         for (GSSize i = 0; i < count; ++i) fields[i] = values[i];
     } else if (typeName == "Column") {
-        // The typed Column create/update commands use different native field
-        // vocabularies.  `height` is the only canonical field accepted by
-        // both routes; keep the shared APX/TS allowlist fail-closed rather
-        // than advertising operation-specific fields.
-        const char* values[] = { "height" };
+        // The typed Column commands use operation-specific vocabularies.
+        const char* values[] = { "origin", "offset", "height", "rotation", "dimensions" };
         count = sizeof (values) / sizeof (values[0]);
         for (GSSize i = 0; i < count; ++i) fields[i] = values[i];
+        const char* createValues[] = { "coordinates", "height", "rotation", "dimensions" };
+        createCount = sizeof (createValues) / sizeof (createValues[0]);
+        for (GSSize i = 0; i < createCount; ++i) createFields[i] = createValues[i];
     } else if (typeName == "Text") {
-        const char* values[] = { "richText", "coordinate", "storyIndex", "anchor", "angle", "width", "height", "pen", "fixedSize", "nonBreaking" };
+        const char* values[] = { "richText", "coordinate", "anchor", "angle", "width", "height", "pen", "fixedSize", "nonBreaking" };
         count = sizeof (values) / sizeof (values[0]);
         for (GSSize i = 0; i < count; ++i) fields[i] = values[i];
     } else if (typeName == "Line") {
-        const char* values[] = { "begin", "end", "storyIndex", "lineType", "pen", "roomSeparator" };
+        const char* values[] = { "begin", "end", "lineType", "pen", "roomSeparator" };
         count = sizeof (values) / sizeof (values[0]);
         for (GSSize i = 0; i < count; ++i) fields[i] = values[i];
+        const char* createValues[] = { "begin", "end", "lineType", "pen", "roomSeparator" };
+        createCount = sizeof (createValues) / sizeof (createValues[0]);
+        for (GSSize i = 0; i < createCount; ++i) createFields[i] = createValues[i];
     } else if (typeName == "Arc") {
-        const char* values[] = { "origin", "radius", "ratio", "axisAngle", "beginAngle", "endAngle", "reflected", "storyIndex", "lineType", "pen", "roomSeparator" };
+        const char* values[] = { "origin", "radius", "ratio", "axisAngle", "beginAngle", "endAngle", "reflected", "lineType", "pen", "roomSeparator" };
         count = sizeof (values) / sizeof (values[0]);
         for (GSSize i = 0; i < count; ++i) fields[i] = values[i];
     } else if (typeName == "Hatch") {
-        // The legacy CreateHatches command has no typed Native CRUD update
-        // route or factual CRUD round-trip.  Keep this capability explicitly
-        // read-only until a separate Hatch writer proves the complete memo
-        // and readback contract.
-    } else if (typeName == "Door" || typeName == "Window") {
-        // Door/Window details are factual readback, while the available
-        // CreateObjects/clone and GDL-parameter commands are legacy routes,
-        // not typed Native CRUD writers.  Keep writableFields empty until a
-        // typed create/update path proves the complete native round-trip.
+        const char* values[] = { "polygon", "fill", "contourPen", "foregroundPen", "backgroundPen" };
+        count = sizeof (values) / sizeof (values[0]);
+        for (GSSize i = 0; i < count; ++i) fields[i] = values[i];
+    } else if (typeName == "Door") {
+        const char* values[] = { "offset", "sill", "width", "height", "orientation" };
+        count = sizeof (values) / sizeof (values[0]);
+        for (GSSize i = 0; i < count; ++i) fields[i] = values[i];
+        const char* createValues[] = { "ownerWallId", "offset", "sill", "width", "height", "orientation" };
+        createCount = sizeof (createValues) / sizeof (createValues[0]);
+        for (GSSize i = 0; i < createCount; ++i) createFields[i] = createValues[i];
+    } else if (typeName == "Window") {
+        const char* values[] = { "offset", "sill", "width", "height", "orientation" };
+        count = sizeof (values) / sizeof (values[0]);
+        for (GSSize i = 0; i < count; ++i) fields[i] = values[i];
+        const char* createValues[] = { "ownerWallId", "offset", "sill", "width", "height", "orientation" };
+        createCount = sizeof (createValues) / sizeof (createValues[0]);
+        for (GSSize i = 0; i < createCount; ++i) createFields[i] = createValues[i];
     }
     const auto& writableFields = target.AddList<GS::UniString> ("writableFields");
-    const auto& createFields = target.AddList<GS::UniString> ("createFields");
+    const auto& createFieldList = target.AddList<GS::UniString> ("createFields");
+    const auto& createPlacementFields = target.AddList<GS::UniString> ("createPlacementFields");
     const auto& updateFields = target.AddList<GS::UniString> ("updateFields");
+    createPlacementFields ("storyIndex");
     for (GSSize i = 0; i < count; ++i) {
         writableFields (fields[i]);
-        createFields (fields[i]);
+        if (typeName != "Column" && typeName != "Line" && typeName != "Door" && typeName != "Window") createFieldList (fields[i]);
         updateFields (fields[i]);
     }
+    if (typeName == "Column" || typeName == "Line" || typeName == "Door" || typeName == "Window")
+        for (GSSize i = 0; i < createCount; ++i) createFieldList (createFields[i]);
 }
 
 GS::Optional<GS::UniString> ReadRequestedGuids (
@@ -1415,19 +1506,108 @@ GS::ObjectState BuildReceipt (
     GS::ObjectState transaction (
         "atomic", true,
         "undoable", true,
+        "dispatchAttempted", true,
         "dispatchComplete", dispatchComplete,
         "evidenceComplete", complete,
         "outcome", status);
     if (mutationDiagnostics != nullptr) {
+        bool transactionRolledBack = false;
+        if (mutationDiagnostics->Get ("transactionRolledBack", transactionRolledBack))
+            transaction.Add ("transactionRolledBack", transactionRolledBack);
+        Int32 transactionError = 0;
+        if (mutationDiagnostics->Get ("transactionError", transactionError))
+            transaction.Add ("transactionError", transactionError);
+        GS::UniString failureStage;
+        if (mutationDiagnostics->Get ("failureStage", failureStage))
+            transaction.Add ("failureStage", failureStage);
+        bool nativeApiErrorCodeRecorded = false;
+        bool nativeFailureMessageRecorded = false;
+        bool nativeCommandFailureObserved = false;
+        const GS::ObjectState* nativeCommandError = mutationDiagnostics->Get ("error");
+        if (nativeCommandError != nullptr) {
+            Int32 nativeApiErrorCode = 0;
+            if (nativeCommandError->Get ("code", nativeApiErrorCode)) {
+                transaction.Add ("nativeApiErrorCode", nativeApiErrorCode);
+                nativeApiErrorCodeRecorded = true;
+                nativeCommandFailureObserved = true;
+            }
+            GS::UniString nativeFailureMessage;
+            if (nativeCommandError->Get ("message", nativeFailureMessage)) {
+                transaction.Add ("nativeFailureMessage", nativeFailureMessage);
+                nativeFailureMessageRecorded = true;
+                nativeCommandFailureObserved = true;
+            }
+        }
+        // Typed writers keep the API failure beside the failed execution row.
+        // Preserve that exact diagnostic in the terminal receipt even when
+        // the host did not return an undo-command error; equal snapshots alone
+        // do not prove that Archicad rolled back the attempted change.
+        GS::Array<GS::ObjectState> executionResults;
+        if (mutationDiagnostics->Get ("executionResults", executionResults)) {
+            for (const GS::ObjectState& executionResult : executionResults) {
+                bool success = false;
+                if (!executionResult.Get ("success", success) || success)
+                    continue;
+                if (failureStage.IsEmpty () && executionResult.Get ("failureStage", failureStage))
+                    transaction.Add ("failureStage", failureStage);
+                const GS::ObjectState* nativeError = executionResult.Get ("error");
+                Int32 nativeApiErrorCode = 0;
+                if (!nativeApiErrorCodeRecorded && nativeError != nullptr && nativeError->Get ("code", nativeApiErrorCode))
+                    transaction.Add ("nativeApiErrorCode", nativeApiErrorCode);
+                GS::UniString nativeFailureMessage;
+                if (!nativeFailureMessageRecorded && nativeError != nullptr && nativeError->Get ("message", nativeFailureMessage))
+                    transaction.Add ("nativeFailureMessage", nativeFailureMessage);
+                const GS::ObjectState* nativeFailureDetails = executionResult.Get ("nativeFailureDetails");
+                if (nativeFailureDetails != nullptr)
+                    transaction.Add ("nativeFailureDetails", *nativeFailureDetails);
+                break;
+            }
+        }
+        if (failureStage.IsEmpty () && nativeCommandFailureObserved)
+            transaction.Add ("failureStage", "native-mutation-command");
         bool groupModeRestored = false;
         if (mutationDiagnostics->Get ("groupModeRestored", groupModeRestored))
             transaction.Add ("groupModeRestored", groupModeRestored);
         Int32 groupModeRestoreError = 0;
         if (mutationDiagnostics->Get ("groupModeRestoreError", groupModeRestoreError))
             transaction.Add ("groupModeRestoreError", groupModeRestoreError);
+#if defined(TAPIR_NATIVE_CRUD_TEST_FAULT_AFTER_FIRST_APPLIED)
+        const GS::ObjectState* testFaultEvidence = mutationDiagnostics->Get ("testFaultEvidence");
+        if (testFaultEvidence != nullptr)
+            transaction.Add ("testFaultEvidence", *testFaultEvidence);
+#endif
+        GS::UniString candidateWriter;
+        const bool isCandidateColumnCreate = operation == "create"
+            && typeName == "Column"
+            && semanticMetadata != nullptr
+            && semanticMetadata->Get ("nativeCandidateWriter", candidateWriter)
+            && candidateWriter == "column-native-v1";
+        const GS::ObjectState* candidateFailure = mutationDiagnostics->Get ("nativeCandidateFailure");
+        if (isCandidateColumnCreate && GS::UniString (status) == "failed" && candidateFailure != nullptr)
+            transaction.Add ("candidateColumnCreateFailure", *candidateFailure);
+        const bool isCandidateHatchCreate = operation == "create"
+            && typeName == "Hatch"
+            && semanticMetadata != nullptr
+            && semanticMetadata->Get ("nativeCandidateWriter", candidateWriter)
+            && candidateWriter == "hatch-native-v1";
+        if (isCandidateHatchCreate && GS::UniString (status) == "failed" && candidateFailure != nullptr)
+            transaction.Add ("candidateHatchCreateFailure", *candidateFailure);
     }
     receipt.Add ("transaction", transaction);
     return receipt;
+}
+
+double NormalizeNativeArcCreateAngle (double angle)
+{
+    constexpr double twoPi = 6.283185307179586476925286766559;
+    double normalized = std::fmod (angle, twoPi);
+    if (normalized < 0.0)
+        normalized += twoPi;
+    // Adding 2pi to a tiny negative remainder can round to 2pi; keep the
+    // adapter's output in the promised half-open interval [0, 2pi).
+    if (normalized >= twoPi || normalized == 0.0)
+        return 0.0;
+    return normalized;
 }
 
 GS::ObjectState BuildNativeMutationParameters (
@@ -1441,19 +1621,26 @@ GS::ObjectState BuildNativeMutationParameters (
         GS::ObjectState copy;
         const GS::ObjectState* id = item.Get ("elementId");
         if (id != nullptr) copy.Add ("elementId", *id);
+        const GS::ObjectState* cloneSource = item.Get ("cloneSourceElementId");
+        if (cloneSource != nullptr) copy.Add ("cloneSourceElementId", *cloneSource);
         const GS::ObjectState* payload = item.Get ("payload");
         if (payload == nullptr) payload = item.Get ("patch");
         if (payload != nullptr) {
             GS::ObjectState mapped;
+            if (operation == "create") {
+                const GS::ObjectState* placement = item.Get ("placement");
+                Int32 storyIndex = 0;
+                if (placement != nullptr && placement->Get ("storyIndex", storyIndex))
+                    mapped.Add (typeName == "Hatch" ? "floorInd" : "floorIndex", storyIndex);
+            }
             // Coordinates and scalar fields retain their native units.  The
             // Project-owned typed executors use their own field names; this
             // adapter is the one and only place where that vocabulary is
-            // translated from native-crud-v1.
+            // translated from native-crud-v2.
             if (typeName == "Wall") {
                 CopyObjectField (*payload, "begCoordinate", mapped, "begCoordinate");
                 CopyObjectField (*payload, "endCoordinate", mapped, "endCoordinate");
                 if (operation == "create") {
-                    CopyIntField (*payload, "storyIndex", mapped, "floorIndex");
                     CopyDoubleField (*payload, "elevation", mapped, "zCoordinate");
                 } else {
                     // Wall UPDATE has a different native mask contract from
@@ -1461,7 +1648,6 @@ GS::ObjectState BuildNativeMutationParameters (
                     // to the narrow adapter; the update helper converts
                     // them to floorInd/bottomOffset without ever forwarding
                     // rejected floorIndex/zCoordinate fields.
-                    CopyIntField (*payload, "storyIndex", mapped, "storyIndex");
                     CopyDoubleField (*payload, "elevation", mapped, "elevation");
                 }
                 CopyDoubleField (*payload, "height", mapped, "height");
@@ -1475,7 +1661,6 @@ GS::ObjectState BuildNativeMutationParameters (
             } else if (typeName == "Column") {
                 if (operation == "create") {
                     CopyColumnCreateCoordinates (*payload, mapped);
-                    CopyIntField (*payload, "storyIndex", mapped, "floorIndex");
                 } else {
                     // ModifyColumns consumes the 2D update placement field
                     // `origin`; CREATE must never receive this field and
@@ -1497,7 +1682,6 @@ GS::ObjectState BuildNativeMutationParameters (
             } else if (typeName == "Text") {
                 CopyObjectField (*payload, "richText", mapped, "richText");
                 CopyObjectField (*payload, "coordinate", mapped, "coordinate");
-                CopyIntField (*payload, "storyIndex", mapped, "floorIndex");
                 CopyIntField (*payload, "anchor", mapped, "anchor");
                 CopyDoubleField (*payload, "angle", mapped, "angle");
                 CopyDoubleField (*payload, "width", mapped, "width");
@@ -1509,27 +1693,27 @@ GS::ObjectState BuildNativeMutationParameters (
                 CopyStringField (*payload, "name", mapped, "name");
                 CopyStringField (*payload, "number", mapped, "numberStr");
                 CopyObjectField (*payload, "category", mapped, "categoryAttributeId");
-                CopyIntField (*payload, "storyIndex", mapped, "floorIndex");
                 const GS::ObjectState* stamp = payload->Get ("stampPlacement");
                 if (stamp != nullptr) {
-                    CopyObjectField (*stamp, "position", mapped, "stampPosition");
+                CopyObjectField (*stamp, "position", mapped, "stampPosition");
                     CopyDoubleField (*stamp, "angle", mapped, "stampAngle");
                     CopyBoolField (*stamp, "fixedAngle", mapped, "fixedStampAngle");
                 }
                 const GS::ObjectState* polygon = payload->Get ("polygon");
+                GS::ObjectState geometry;
                 if (polygon != nullptr) {
-                    CopyArrayField (*polygon, "coordinates", mapped, "polygonCoordinates");
-                    CopyArrayField (*polygon, "arcs", mapped, "polygonArcs");
-                    CopyArrayField (*polygon, "holes", mapped, "holes");
-                    GS::ObjectState geometry;
                     CopyArrayField (*polygon, "coordinates", geometry, "polygonCoordinates");
                     CopyArrayField (*polygon, "arcs", geometry, "polygonArcs");
                     CopyArrayField (*polygon, "holes", geometry, "holes");
+                }
+                if (operation == "create") {
+                    if (!geometry.IsEmpty ()) mapped.Add ("geometry", geometry);
+                } else {
                     if (!geometry.IsEmpty ()) mapped.Add ("geometry", geometry);
                 }
-                CopyObjectField (*payload, "referencePosition", mapped, "referencePosition");
             } else if (typeName == "Door" || typeName == "Window") {
                 CopyObjectField (*payload, "ownerWallId", mapped, "ownerWallId");
+                if (operation == "create") CopyIntField (*payload, "floorIndex", mapped, "floorIndex");
                 CopyDoubleField (*payload, "offset", mapped, "centerOffset");
                 CopyDoubleField (*payload, "sill", mapped, "sillHeight");
                 CopyDoubleField (*payload, "width", mapped, "width");
@@ -1543,10 +1727,6 @@ GS::ObjectState BuildNativeMutationParameters (
             } else if (typeName == "Line") {
                 CopyObjectField (*payload, "begin", mapped, "begCoordinate");
                 CopyObjectField (*payload, "end", mapped, "endCoordinate");
-                // MutateElements validates the public story field as
-                // `floorIndex`; keep the adapter on that validated name so a
-                // native one-step patch cannot silently lose story scope.
-                CopyIntField (*payload, "storyIndex", mapped, "floorIndex");
                 CopyIntField (*payload, "pen", mapped, "linePenIndex");
                 CopyIntField (*payload, "lineType", mapped, "lineTypeIndex");
                 CopyBoolField (*payload, "roomSeparator", mapped, "roomSeparator");
@@ -1555,17 +1735,37 @@ GS::ObjectState BuildNativeMutationParameters (
                 CopyDoubleField (*payload, "radius", mapped, "radius");
                 CopyDoubleField (*payload, "axisAngle", mapped, "axisAngle");
                 CopyDoubleField (*payload, "ratio", mapped, "ratio");
-                // The typed Arc command calls the first sweep angle
-                // `begAngle`; map the canonical native field explicitly.
-                // Without this translation CREATE passes validation but the
-                // typed command rejects the required angle.
-                CopyDoubleField (*payload, "beginAngle", mapped, "begAngle");
-                CopyDoubleField (*payload, "endAngle", mapped, "endAngle");
+                // This shared Native CRUD adapter is used by candidate and
+                // future ordinary requests, and is separate from legacy Arc
+                // commands. CREATE input angles are local to the ellipse
+                // axis; the factual API_ArcType readback includes axisAngle.
+                // Keep sparse UPDATE inputs direct until independently proven.
+                double axisAngle = 0.0;
+                payload->Get ("axisAngle", axisAngle);
+                double beginAngle = 0.0;
+                if (payload->Get ("beginAngle", beginAngle)) {
+                    mapped.Add ("begAngle", operation == "create" && std::isfinite (axisAngle) && std::isfinite (beginAngle)
+                        ? NormalizeNativeArcCreateAngle (beginAngle - axisAngle)
+                        : beginAngle);
+                }
+                double endAngle = 0.0;
+                if (payload->Get ("endAngle", endAngle)) {
+                    mapped.Add ("endAngle", operation == "create" && std::isfinite (axisAngle) && std::isfinite (endAngle)
+                        ? NormalizeNativeArcCreateAngle (endAngle - axisAngle)
+                        : endAngle);
+                }
                 CopyBoolField (*payload, "reflected", mapped, "reflected");
-                CopyIntField (*payload, "storyIndex", mapped, "floorIndex");
                 CopyIntField (*payload, "pen", mapped, "linePenIndex");
                 CopyIntField (*payload, "lineType", mapped, "lineTypeIndex");
                 CopyBoolField (*payload, "roomSeparator", mapped, "roomSeparator");
+            } else if (typeName == "Hatch") {
+                const GS::ObjectState* polygon = payload->Get ("polygon");
+                if (polygon != nullptr)
+                    CopyArrayField (*polygon, "coordinates", mapped, operation == "create" ? "hatchCoordinates" : "polygonOutline");
+                CopyIntField (*payload, "fill", mapped, "fillAttributeIndex");
+                CopyIntField (*payload, "contourPen", mapped, "contourPenIndex");
+                CopyIntField (*payload, "foregroundPen", mapped, "fillPenIndex");
+                CopyIntField (*payload, "backgroundPen", mapped, "fillBackgroundPenIndex");
             } else {
                 mapped = *payload;
             }
@@ -1579,6 +1779,37 @@ GS::ObjectState BuildNativeMutationParameters (
 
 constexpr const char* ZoneMemoWriterGate = "disposable-ac25-manual-polygon-v1";
 constexpr const char* AutomaticZonePolygonProbeGate = "disposable-automatic-zone-polygon-v1";
+constexpr const char* ZoneCandidateWriter = "zone-native-v1";
+constexpr const char* ArcCandidateWriter = "arc-native-v1";
+constexpr const char* HatchCandidateWriter = "hatch-native-v1";
+constexpr const char* DoorCandidateWriter = "door-native-v1";
+constexpr const char* WindowCandidateWriter = "window-native-v1";
+
+bool HasHatchCandidateOnlyMetadata (const GS::ObjectState* semanticMetadata)
+{
+    if (semanticMetadata == nullptr) return false;
+    for (const char* field : { "nativeCandidateWriter", "nativeCandidateCaseId", "nativeCandidateOperationId",
+                               "nativeCandidateScopeKey", "nativeCandidateFields", "nativeCandidateGuids",
+                               "nativeCrudTestFaultAfterFirstApplied" }) {
+        if (semanticMetadata->Contains (field)) return true;
+    }
+    return false;
+}
+
+bool HasDoorCandidateMetadata (const GS::ObjectState* semanticMetadata)
+{
+    if (semanticMetadata == nullptr) return false;
+    for (const char* field : { "nativeCandidateWriter", "nativeCandidateCaseId", "nativeCandidateOperationId",
+                               "nativeCandidateScopeKey", "nativeCandidateFields", "nativeCandidateGuids",
+                               "nativeCrudTestFaultAfterFirstApplied" })
+        if (semanticMetadata->Contains (field)) return true;
+    return false;
+}
+
+bool HasWindowCandidateMetadata (const GS::ObjectState* semanticMetadata)
+{
+    return HasDoorCandidateMetadata (semanticMetadata);
+}
 
 bool HasOnlyObjectStateFields (const GS::ObjectState& value, const std::initializer_list<const char*>& allowedFields)
 {
@@ -1595,6 +1826,77 @@ bool HasOnlyObjectStateFields (const GS::ObjectState& value, const std::initiali
             return false;
     }
     return true;
+}
+
+bool IsExactFinitePoint (const GS::ObjectState& point)
+{
+    const GS::HashSet<GS::String> fieldNames = point.GetFieldNames ();
+    double x = 0.0;
+    double y = 0.0;
+    return fieldNames.GetSize () == 2 && point.Contains ("x") && point.Contains ("y")
+        && point.Get ("x", x) && point.Get ("y", y)
+        && std::isfinite (x) && std::isfinite (y);
+}
+
+GS::Optional<GS::UniString> ValidateZoneCandidatePlacement (const GS::ObjectState& shape)
+{
+    if (shape.Contains ("referencePosition"))
+        return "Zone referencePosition is read-only in Native CRUD.";
+
+    const GS::ObjectState* stampPlacement = shape.Get ("stampPlacement");
+    if (stampPlacement == nullptr)
+        return {};
+    const GS::HashSet<GS::String> stampFields = stampPlacement->GetFieldNames ();
+    if (!HasOnlyObjectStateFields (*stampPlacement, { "position", "angle", "fixedAngle" }) || stampFields.IsEmpty ())
+        return "Zone stampPlacement accepts only position, angle and fixedAngle fields.";
+    const GS::ObjectState* position = stampPlacement->Get ("position");
+    if (position != nullptr && !IsExactFinitePoint (*position))
+        return "Zone stampPlacement.position must contain exactly finite x and y coordinates.";
+    if (stampPlacement->Contains ("angle")) {
+        double angle = 0.0;
+        if (!stampPlacement->Get ("angle", angle) || !std::isfinite (angle))
+            return "Zone stampPlacement.angle must be a finite number.";
+    }
+    if (stampPlacement->Contains ("fixedAngle")) {
+        bool fixedAngle = false;
+        if (!stampPlacement->Get ("fixedAngle", fixedAngle))
+            return "Zone stampPlacement.fixedAngle must be a boolean.";
+    }
+    return {};
+}
+
+GS::Optional<GS::UniString> ValidateZoneTypedWriter (
+    const GS::UniString& operation,
+    const GS::Array<GS::ObjectState>& items)
+{
+    if (operation != "create" && operation != "update")
+        return "The validated Zone typed writer only supports CREATE and UPDATE.";
+    if (items.IsEmpty () || items.GetSize () > MaxMutationItems)
+        return "The validated Zone typed writer requires a bounded non-empty item list.";
+
+    const std::initializer_list<const char*> fields = {
+        "name", "number", "category", "polygon", "stampPlacement"
+    };
+    for (const GS::ObjectState& item : items) {
+        const GS::ObjectState* shape = nullptr;
+        if (operation == "create") {
+            shape = item.Get ("payload");
+            if (shape == nullptr || !HasOnlyObjectStateFields (*shape, fields))
+                return "Zone CREATE accepts only the declared typed Zone fields.";
+            if (!shape->Contains ("polygon"))
+                return "Zone CREATE requires a manual polygon.";
+        } else {
+            shape = item.Get ("patch");
+            if (shape == nullptr || !HasOnlyObjectStateFields (*shape, fields))
+                return "Zone UPDATE accepts only the declared typed Zone fields.";
+            if (shape->GetFieldNames ().IsEmpty ())
+                return "Zone UPDATE requires a non-empty typed patch.";
+        }
+        const GS::Optional<GS::UniString> placementError = ValidateZoneCandidatePlacement (*shape);
+        if (placementError.HasValue ())
+            return placementError.Get ();
+    }
+    return {};
 }
 
 bool HasZoneMemoWriterGate (const GS::ObjectState* semanticMetadata)
@@ -1629,6 +1931,658 @@ bool HasAutomaticZonePolygonProbeGate (const GS::ObjectState* semanticMetadata)
 bool HasAnyZoneMemoWriterGate (const GS::ObjectState* semanticMetadata)
 {
     return HasZoneMemoWriterGate (semanticMetadata) || HasAutomaticZonePolygonProbeGate (semanticMetadata);
+}
+
+bool HasZoneCandidateWriterGate (const GS::ObjectState* semanticMetadata)
+{
+#if TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS
+    GS::UniString writer;
+    return semanticMetadata != nullptr
+        && semanticMetadata->Get ("nativeCandidateWriter", writer)
+        && writer == ZoneCandidateWriter;
+#else
+    (void) semanticMetadata;
+    return false;
+#endif
+}
+
+bool HasColumnCandidateWriterGate (const GS::ObjectState* semanticMetadata)
+{
+#if TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS
+    GS::UniString writer;
+    return semanticMetadata != nullptr
+        && semanticMetadata->Get ("nativeCandidateWriter", writer)
+        && writer == "column-native-v1";
+#else
+    (void) semanticMetadata;
+    return false;
+#endif
+}
+
+bool HasZoneCandidateWriterMetadataMarker (const GS::ObjectState* semanticMetadata)
+{
+    GS::UniString writer;
+    return semanticMetadata != nullptr && semanticMetadata->Get ("nativeCandidateWriter", writer);
+}
+
+GS::Optional<GS::UniString> ValidateZoneCandidateWriter (
+    const GS::UniString& operation,
+    const GS::UniString& operationId,
+    const GS::UniString& expectedScope,
+    const GS::Array<GS::ObjectState>& items,
+    const GS::ObjectState* semanticMetadata)
+{
+    if (!HasZoneCandidateWriterGate (semanticMetadata))
+        return "Zone candidate writer is unavailable in this APX build.";
+    if (operation != "create" && operation != "update")
+        return "Zone candidate writer only supports CREATE and UPDATE; DELETE uses the ordinary exact delete route.";
+    if (items.IsEmpty () || items.GetSize () > MaxMutationItems)
+        return "Zone candidate writer requires a bounded non-empty item list.";
+    const GS::Optional<GS::UniString> typedError = ValidateZoneTypedWriter (operation, items);
+    if (typedError.HasValue ())
+        return typedError.Get ();
+    GS::UniString candidateOperationId;
+    GS::UniString candidateScope;
+    GS::UniString candidateCaseId;
+    GS::Array<GS::UniString> candidateFields;
+    GS::Array<GS::UniString> candidateGuids;
+    if (semanticMetadata == nullptr
+        || !semanticMetadata->Get ("nativeCandidateOperationId", candidateOperationId)
+        || candidateOperationId != operationId
+        || !semanticMetadata->Get ("nativeCandidateScopeKey", candidateScope)
+        || candidateScope != expectedScope
+        || !semanticMetadata->Get ("nativeCandidateCaseId", candidateCaseId)
+        || candidateCaseId.IsEmpty ()
+        || !semanticMetadata->Get ("nativeCandidateFields", candidateFields)
+        || !semanticMetadata->Get ("nativeCandidateGuids", candidateGuids))
+        return "Zone candidate writer request is not bound to its exact case, operation, disposable file, field set and target list.";
+    GS::HashSet<GS::UniString> uniqueCandidateFields;
+    for (const GS::UniString& field : candidateFields)
+        uniqueCandidateFields.Add (field);
+    GS::HashSet<GS::UniString> uniqueCandidateGuids;
+    for (const GS::UniString& guid : candidateGuids)
+        uniqueCandidateGuids.Add (guid.ToLowerCase ());
+    if (uniqueCandidateFields.GetSize () != candidateFields.GetSize ()
+        || uniqueCandidateGuids.GetSize () != candidateGuids.GetSize ())
+        return "Zone candidate field and GUID bindings must contain unique exact values.";
+    bool faultAfterFirstApplied = false;
+    if (semanticMetadata != nullptr)
+        semanticMetadata->Get ("nativeCrudTestFaultAfterFirstApplied", faultAfterFirstApplied);
+#if defined(TAPIR_NATIVE_CRUD_TEST_FAULT_AFTER_FIRST_APPLIED)
+    if (faultAfterFirstApplied && (operation != "update" || items.GetSize () != 2))
+        return "Zone first-applied fault test requires exactly two UPDATE items.";
+#else
+    if (faultAfterFirstApplied)
+        return "Zone first-applied fault seam is unavailable in this APX build.";
+#endif
+    const std::initializer_list<const char*> fields = {
+        "name", "number", "category", "polygon", "stampPlacement"
+    };
+    if (operation == "update" && candidateFields.GetSize () != 1)
+        return "Zone candidate UPDATE requires exactly one declared field per operation.";
+    for (const GS::ObjectState& item : items) {
+        const GS::ObjectState* candidateShape = nullptr;
+        if (operation == "create") {
+            const GS::ObjectState* payload = item.Get ("payload");
+            if (payload != nullptr && payload->Contains ("referencePosition"))
+                return "Zone referencePosition is read-only in Native CRUD.";
+            if (payload == nullptr || !HasOnlyObjectStateFields (*payload, fields))
+                return "Zone candidate CREATE accepts only the declared typed Zone fields.";
+            const bool hasPolygon = payload->Contains ("polygon");
+            if (!hasPolygon)
+                return "Zone candidate CREATE requires a manual polygon.";
+            candidateShape = payload;
+        } else {
+            const GS::ObjectState* patch = item.Get ("patch");
+            if (patch != nullptr && patch->Contains ("referencePosition"))
+                return "Zone referencePosition is read-only in Native CRUD.";
+            if (patch == nullptr || !HasOnlyObjectStateFields (*patch, fields))
+                return "Zone candidate UPDATE accepts only the declared typed Zone fields.";
+            if (patch->GetFieldNames ().IsEmpty ())
+                return "Zone candidate UPDATE requires a non-empty typed patch.";
+            candidateShape = patch;
+        }
+        if (candidateShape == nullptr || candidateShape->GetFieldNames ().GetSize () != candidateFields.GetSize ())
+            return "Zone candidate metadata fields do not exactly match the typed mutation fields.";
+        const GS::Optional<GS::UniString> placementError = ValidateZoneCandidatePlacement (*candidateShape);
+        if (placementError.HasValue ())
+            return placementError.Get ();
+        for (const GS::String& field : candidateShape->GetFieldNames ()) {
+            bool declared = false;
+            for (const GS::UniString& candidateField : candidateFields)
+                declared = declared || field == candidateField.ToCStr (CC_UTF8).Get ();
+            if (!declared) return "Zone candidate metadata omits a changed field or declares a different field.";
+        }
+    }
+    if (operation == "update") {
+        if (candidateGuids.GetSize () != items.GetSize ())
+            return "Zone candidate GUID authorization does not match the exact update target count.";
+        GS::HashSet<GS::UniString> authorized;
+        for (const GS::UniString& guid : candidateGuids) authorized.Add (guid.ToLowerCase ());
+        GS::HashSet<GS::UniString> requested;
+        for (const GS::ObjectState& item : items) {
+            const GS::ObjectState* id = item.Get ("elementId");
+            if (id == nullptr) return "Zone candidate UPDATE is missing an exact elementId.";
+            const API_Guid guid = GetGuidFromObjectState (*id);
+            if (guid == APINULLGuid) return "Zone candidate UPDATE contains an invalid elementId.";
+            GS::UniString guidText;
+            id->Get ("guid", guidText);
+            requested.Add (guidText.ToLowerCase ());
+        }
+        if (requested.GetSize () != authorized.GetSize ())
+            return "Zone candidate UPDATE GUIDs do not match its exact authorization set.";
+        for (const GS::UniString& guid : requested)
+            if (!authorized.Contains (guid)) return "Zone candidate UPDATE GUIDs do not match its exact authorization set.";
+    } else if (candidateGuids.IsEmpty ()) {
+        return "Zone candidate CREATE requires exact prequalified template GUIDs in its manifest binding.";
+    }
+    return {};
+}
+
+GS::Optional<GS::UniString> ValidateColumnCandidateWriter (
+    const GS::UniString& operation,
+    const GS::UniString& operationId,
+    const GS::UniString& expectedScope,
+    const GS::Array<GS::ObjectState>& items,
+    const GS::ObjectState* semanticMetadata)
+{
+#if !TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS
+    (void) operation; (void) operationId; (void) expectedScope; (void) items; (void) semanticMetadata;
+    return "Column candidate writer is unavailable in this APX build.";
+#else
+    GS::UniString writer;
+    if (semanticMetadata == nullptr || !semanticMetadata->Get ("nativeCandidateWriter", writer) || writer != "column-native-v1")
+        return "Column candidate writer marker is invalid.";
+    if (operation != "create" && operation != "update")
+        return "Column candidate writer supports only CREATE and UPDATE.";
+    if (items.IsEmpty () || items.GetSize () > MaxMutationItems)
+        return "Column candidate writer requires a bounded non-empty item list.";
+
+    GS::UniString candidateOperationId, candidateScope, candidateCaseId;
+    GS::Array<GS::UniString> candidateFields, candidateGuids;
+    if (!semanticMetadata->Get ("nativeCandidateOperationId", candidateOperationId)
+        || candidateOperationId != operationId
+        || !semanticMetadata->Get ("nativeCandidateScopeKey", candidateScope)
+        || candidateScope != expectedScope
+        || !semanticMetadata->Get ("nativeCandidateCaseId", candidateCaseId)
+        || candidateCaseId.IsEmpty ()
+        || !semanticMetadata->Get ("nativeCandidateFields", candidateFields)
+        || !semanticMetadata->Get ("nativeCandidateGuids", candidateGuids)
+        || candidateFields.IsEmpty () || candidateGuids.IsEmpty ())
+        return "Column candidate request is not bound to its exact case, operation, disposable file, fields and GUIDs.";
+
+    const std::initializer_list<const char*> createFields = { "coordinates", "height", "rotation", "dimensions" };
+    const std::initializer_list<const char*> updateFields = { "origin", "offset", "height", "rotation", "dimensions" };
+    const std::initializer_list<const char*> expectedFields = operation == "create" ? createFields : updateFields;
+    const std::initializer_list<const char*> forbiddenCreate = { "origin", "offset", "bottomOffset", "elevation", "slant", "taper", "profile", "material", "section" };
+    const std::initializer_list<const char*> forbiddenUpdate = { "coordinates", "storyIndex", "bottomOffset", "elevation", "slant", "taper", "profile", "material", "section" };
+    const auto& forbidden = operation == "create" ? forbiddenCreate : forbiddenUpdate;
+    GS::HashSet<GS::UniString> uniqueFields;
+    for (const GS::UniString& field : candidateFields) uniqueFields.Add (field);
+    if (uniqueFields.GetSize () != candidateFields.GetSize ()) return "Column candidate fields must be unique.";
+    if (operation == "create" && candidateFields.GetSize () != 4)
+        return "Column candidate CREATE requires coordinates, height, rotation and dimensions; story placement is separate.";
+    for (const GS::UniString& field : candidateFields) {
+        bool allowed = false;
+        for (const char* expected : expectedFields) allowed = allowed || field == expected;
+        for (const char* rejected : forbidden) if (field == rejected) return "Column candidate contains an explicitly unsupported field.";
+        if (!allowed) return "Column candidate field list exceeds the exact operation vocabulary.";
+    }
+    if (operation == "create") {
+        if (items.GetSize () != 1 || candidateGuids.GetSize () != 1)
+            return "Column candidate CREATE requires one payload and one exact same-file template GUID.";
+        GS::ObjectState templateSection;
+        if (!semanticMetadata->Get ("nativeCandidateTemplateSection", templateSection))
+            return "Column candidate CREATE requires factual section readback for its exact qualified template.";
+        const API_Guid templateGuid = APIGuidFromString (candidateGuids[0].ToCStr ());
+        API_Element templateElement = {};
+        templateElement.header.guid = templateGuid;
+        if (templateGuid == APINULLGuid || ACAPI_Element_Get (&templateElement) != NoError || GetElemTypeId (templateElement.header) != API_ColumnID)
+            return "Column candidate CREATE template must be an existing exact Column in this project.";
+    }
+    bool faultAfterFirstApplied = false;
+    semanticMetadata->Get ("nativeCrudTestFaultAfterFirstApplied", faultAfterFirstApplied);
+    if (faultAfterFirstApplied && (operation != "update" || items.GetSize () != 2 || candidateGuids.GetSize () != 2))
+        return "Column first-applied rollback test requires exactly two UPDATE targets.";
+#if !defined(TAPIR_NATIVE_CRUD_TEST_FAULT_AFTER_FIRST_APPLIED)
+    if (faultAfterFirstApplied) return "Column first-applied rollback fault seam is unavailable in this APX build.";
+#endif
+    GS::HashSet<GS::UniString> uniqueGuids;
+    for (const GS::UniString& guidText : candidateGuids) {
+        const API_Guid guid = APIGuidFromString (guidText.ToCStr ());
+        if (guid == APINULLGuid || uniqueGuids.Contains (guidText.ToLowerCase ())) return "Column candidate GUIDs must be valid and unique.";
+        uniqueGuids.Add (guidText.ToLowerCase ());
+    }
+    if (operation == "update") {
+        if (candidateGuids.GetSize () != items.GetSize ()) return "Column candidate UPDATE GUID binding does not match its exact item count.";
+        const GSSize candidateGuidCount = static_cast<GSSize> (candidateGuids.GetSize ());
+        for (GSSize index = 0; index < candidateGuidCount; ++index) {
+            const GS::ObjectState* id = items[index].Get ("elementId");
+            if (id == nullptr || GetGuidFromObjectState (*id) != APIGuidFromString (candidateGuids[index].ToCStr ()))
+                return "Column candidate UPDATE GUIDs differ from their exact authorization order.";
+        }
+    }
+    for (const GS::ObjectState& item : items) {
+        const GS::ObjectState* shape = item.Get (operation == "create" ? "payload" : "patch");
+        if (shape == nullptr || !HasOnlyObjectStateFields (*shape, expectedFields)) return "Column candidate payload contains unsupported or missing operation fields.";
+        if (shape->GetFieldNames ().GetSize () != candidateFields.GetSize ()) return "Column candidate payload fields differ from the exact authorization list.";
+        for (const GS::String& fieldName : shape->GetFieldNames ()) {
+            bool declared = false;
+            const GS::UniString fieldNameUniString (fieldName);
+            for (const GS::UniString& field : candidateFields) declared = declared || field == fieldNameUniString;
+            if (!declared) return "Column candidate payload changes a field outside the exact authorization list.";
+        }
+    }
+    return {};
+#endif
+}
+
+GS::Optional<GS::UniString> ValidateLineCandidateWriter (
+    const GS::UniString& operation,
+    const GS::UniString& operationId,
+    const GS::UniString& expectedScope,
+    const GS::Array<GS::ObjectState>& items,
+    const GS::ObjectState* semanticMetadata)
+{
+#if !TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS
+    (void) operation; (void) operationId; (void) expectedScope; (void) items; (void) semanticMetadata;
+    return "Line candidate writer is unavailable in this APX build.";
+#else
+    GS::UniString writer;
+    if (semanticMetadata == nullptr || !semanticMetadata->Get ("nativeCandidateWriter", writer) || writer != "line-native-v1")
+        return "Line candidate writer marker is invalid.";
+    if (operation != "create" && operation != "update") return "Line candidate writer supports only CREATE and UPDATE.";
+    if (items.IsEmpty () || items.GetSize () > MaxMutationItems) return "Line candidate writer requires a bounded non-empty item list.";
+
+    GS::UniString candidateOperationId, candidateScope, candidateCaseId;
+    GS::Array<GS::UniString> candidateFields, candidateGuids;
+    if (!semanticMetadata->Get ("nativeCandidateOperationId", candidateOperationId) || candidateOperationId != operationId
+        || !semanticMetadata->Get ("nativeCandidateScopeKey", candidateScope) || candidateScope != expectedScope
+        || !semanticMetadata->Get ("nativeCandidateCaseId", candidateCaseId) || candidateCaseId.IsEmpty ()
+        || !semanticMetadata->Get ("nativeCandidateFields", candidateFields)
+        || !semanticMetadata->Get ("nativeCandidateGuids", candidateGuids))
+        return "Line candidate request is not bound to its exact case, operation, disposable file, fields and GUIDs.";
+
+    const std::initializer_list<const char*> createFields = { "begin", "end", "lineType", "pen", "roomSeparator" };
+    const std::initializer_list<const char*> updateFields = { "begin", "end", "lineType", "pen", "roomSeparator" };
+    const auto& allowedFields = operation == "create" ? createFields : updateFields;
+    GS::HashSet<GS::UniString> uniqueFields;
+    for (const GS::UniString& field : candidateFields) {
+        uniqueFields.Add (field);
+        bool allowed = false;
+        for (const char* candidate : allowedFields) allowed = allowed || field == candidate;
+        if (!allowed) return "Line candidate fields exceed its exact typed writer vocabulary.";
+    }
+    if (candidateFields.IsEmpty () || uniqueFields.GetSize () != candidateFields.GetSize ())
+        return "Line candidate fields must be non-empty and unique.";
+    if (operation == "create" && (items.GetSize () != 1 || candidateGuids.GetSize () != 1))
+        return "Line candidate CREATE requires one exact payload and one qualified same-file Line authorization anchor.";
+    if (operation == "update" && (candidateGuids.GetSize () != items.GetSize () || candidateGuids.IsEmpty ()))
+        return "Line candidate UPDATE GUID binding must match its exact target count.";
+    bool faultAfterFirstApplied = false;
+    semanticMetadata->Get ("nativeCrudTestFaultAfterFirstApplied", faultAfterFirstApplied);
+    if (faultAfterFirstApplied && (operation != "update" || items.GetSize () != 2 || candidateGuids.GetSize () != 2))
+        return "Line first-applied rollback test requires exactly two UPDATE targets.";
+#if !defined(TAPIR_NATIVE_CRUD_TEST_FAULT_AFTER_FIRST_APPLIED)
+    if (faultAfterFirstApplied) return "Line first-applied rollback fault seam is unavailable in this APX build.";
+#endif
+
+    GS::HashSet<GS::UniString> uniqueGuids;
+    for (const GS::UniString& guidText : candidateGuids) {
+        const API_Guid guid = APIGuidFromString (guidText.ToCStr ());
+        if (guid == APINULLGuid || uniqueGuids.Contains (guidText.ToLowerCase ())) return "Line candidate GUIDs must be valid and unique.";
+        uniqueGuids.Add (guidText.ToLowerCase ());
+    }
+    if (operation == "create") {
+        const API_Guid templateGuid = APIGuidFromString (candidateGuids[0].ToCStr ());
+        API_Element templateElement = {};
+        templateElement.header.guid = templateGuid;
+        if (ACAPI_Element_Get (&templateElement) != NoError || GetElemTypeId (templateElement.header) != API_LineID)
+            return "Line candidate CREATE authorization anchor must be an existing exact Line in this project.";
+    }
+    const GSSize itemCount = static_cast<GSSize> (items.GetSize ());
+    for (GSSize index = 0; index < itemCount; ++index) {
+        const GS::ObjectState* shape = items[index].Get (operation == "create" ? "payload" : "patch");
+        if (shape == nullptr || !HasOnlyObjectStateFields (*shape, allowedFields) || shape->GetFieldNames ().GetSize () != candidateFields.GetSize ())
+            return "Line candidate payload contains unsupported, missing or unauthorized fields.";
+        if (operation == "create" && (!shape->Contains ("begin") || !shape->Contains ("end")))
+            return "Line candidate CREATE requires both endpoints.";
+        for (const GS::String& fieldName : shape->GetFieldNames ()) {
+            bool declared = false;
+            for (const GS::UniString& field : candidateFields) declared = declared || field == GS::UniString (fieldName);
+            if (!declared) return "Line candidate payload differs from its exact field authorization.";
+        }
+        for (const char* endpoint : { "begin", "end" }) {
+            const GS::ObjectState* point = shape->Get (endpoint);
+            if (point == nullptr) continue;
+            double x = 0.0, y = 0.0;
+            if (!HasOnlyObjectStateFields (*point, { "x", "y" }) || !point->Get ("x", x) || !point->Get ("y", y) || !std::isfinite (x) || !std::isfinite (y))
+                return "Line candidate endpoints must contain finite x and y coordinates only.";
+        }
+        const GS::ObjectState* begin = shape->Get ("begin");
+        const GS::ObjectState* end = shape->Get ("end");
+        if (begin != nullptr && end != nullptr) {
+            double beginX = 0.0, beginY = 0.0, endX = 0.0, endY = 0.0;
+            begin->Get ("x", beginX); begin->Get ("y", beginY); end->Get ("x", endX); end->Get ("y", endY);
+            if (beginX == endX && beginY == endY) return "Line candidate endpoints must not be identical.";
+        }
+        Int32 lineType = 0, pen = 0;
+        if (shape->Contains ("lineType") && (!shape->Get ("lineType", lineType) || lineType < 0)) return "Line candidate lineType must be a non-negative integer.";
+        if (shape->Contains ("pen") && (!shape->Get ("pen", pen) || pen < 0)) return "Line candidate pen must be a non-negative integer.";
+        bool roomSeparator = false;
+        if (shape->Contains ("roomSeparator") && !shape->Get ("roomSeparator", roomSeparator)) return "Line candidate roomSeparator must be boolean.";
+        if (operation == "update") {
+            const GS::ObjectState* id = items[index].Get ("elementId");
+            if (id == nullptr || GetGuidFromObjectState (*id) != APIGuidFromString (candidateGuids[index].ToCStr ()))
+                return "Line candidate UPDATE targets differ from their exact authorization order.";
+        }
+    }
+    return {};
+#endif
+}
+
+GS::Optional<GS::UniString> ValidateArcTypedPayloads (
+    const GS::UniString& operation,
+    const GS::Array<GS::ObjectState>& items,
+    const GS::Array<GS::UniString>* authorizedFields,
+    const GS::Array<GS::UniString>* authorizedGuids)
+{
+    const std::initializer_list<const char*> allowedFields = {
+        "origin", "radius", "ratio", "axisAngle", "beginAngle", "endAngle", "reflected", "lineType", "pen", "roomSeparator"
+    };
+    for (GSSize index = 0; index < static_cast<GSSize> (items.GetSize ()); ++index) {
+        const GS::ObjectState* shape = items[index].Get (operation == "create" ? "payload" : "patch");
+        if (shape == nullptr || shape->GetFieldNames ().IsEmpty () || !HasOnlyObjectStateFields (*shape, allowedFields))
+            return "Arc typed payload must contain a non-empty patch with only declared Arc fields.";
+        if (operation == "create" && shape->GetFieldNames ().GetSize () != 10)
+            return "Arc CREATE must provide all ten typed element fields; placement is separate.";
+        if (authorizedFields != nullptr) {
+            if (shape->GetFieldNames ().GetSize () != authorizedFields->GetSize ())
+                return "Arc candidate payload must contain exactly its authorized typed fields.";
+            for (const GS::String& name : shape->GetFieldNames ()) {
+                bool declared = false;
+                for (const GS::UniString& field : *authorizedFields) declared = declared || field == GS::UniString (name);
+                if (!declared) return "Arc candidate payload changes a field outside its exact authorization.";
+            }
+        }
+        const GS::ObjectState* origin = shape->Get ("origin");
+        if (origin != nullptr) {
+            double x = 0.0, y = 0.0;
+            if (!HasOnlyObjectStateFields (*origin, { "x", "y" }) || !origin->Get ("x", x) || !origin->Get ("y", y) || !std::isfinite (x) || !std::isfinite (y))
+                return "Arc origin must contain finite x and y coordinates only.";
+        }
+        double radius = 0.0, ratio = 0.0, axisAngle = 0.0, beginAngle = 0.0, endAngle = 0.0;
+        if (shape->Contains ("radius") && (!shape->Get ("radius", radius) || !std::isfinite (radius) || radius <= 0.0)) return "Arc radius must be finite and positive.";
+        if (shape->Contains ("ratio") && (!shape->Get ("ratio", ratio) || !std::isfinite (ratio) || ratio <= 0.0)) return "Arc ratio must be finite and positive.";
+        if (shape->Contains ("axisAngle") && (!shape->Get ("axisAngle", axisAngle) || !std::isfinite (axisAngle))) return "Arc axisAngle must be finite.";
+        if (shape->Contains ("beginAngle") && (!shape->Get ("beginAngle", beginAngle) || !std::isfinite (beginAngle))) return "Arc beginAngle must be finite.";
+        if (shape->Contains ("endAngle") && (!shape->Get ("endAngle", endAngle) || !std::isfinite (endAngle))) return "Arc endAngle must be finite.";
+        if (operation == "create" && beginAngle == endAngle) return "Arc CREATE requires a non-full open arc.";
+        Int32 lineType = 0, pen = 0;
+        if (shape->Contains ("lineType") && (!shape->Get ("lineType", lineType) || lineType <= 0)) return "Arc lineType must be positive.";
+        if (shape->Contains ("pen") && (!shape->Get ("pen", pen) || pen <= 0)) return "Arc pen must be positive.";
+        bool booleanValue = false;
+        if (shape->Contains ("reflected") && !shape->Get ("reflected", booleanValue)) return "Arc reflected must be boolean.";
+        if (shape->Contains ("roomSeparator") && !shape->Get ("roomSeparator", booleanValue)) return "Arc roomSeparator must be boolean.";
+        if (authorizedGuids != nullptr && operation == "update") {
+            const GS::ObjectState* id = items[index].Get ("elementId");
+            if (id == nullptr || GetGuidFromObjectState (*id) != APIGuidFromString ((*authorizedGuids)[index].ToCStr ()))
+                return "Arc candidate UPDATE targets differ from their exact authorization order.";
+        }
+    }
+    return {};
+}
+
+GS::Optional<GS::UniString> ValidateArcCandidateWriter (
+    const GS::UniString& operation,
+    const GS::UniString& operationId,
+    const GS::UniString& expectedScope,
+    const GS::Array<GS::ObjectState>& items,
+    const GS::ObjectState* semanticMetadata)
+{
+#if !TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS
+    (void) operation; (void) operationId; (void) expectedScope; (void) items; (void) semanticMetadata;
+    return "Arc candidate writer is unavailable in this APX build.";
+#else
+    GS::UniString writer;
+    if (semanticMetadata == nullptr || !semanticMetadata->Get ("nativeCandidateWriter", writer) || writer != ArcCandidateWriter)
+        return "Arc candidate writer marker is invalid.";
+    if (operation != "create" && operation != "update") return "Arc candidate writer supports only CREATE and UPDATE.";
+    if (items.IsEmpty () || items.GetSize () > 2) return "Arc candidate writer is bounded to one or two items.";
+
+    GS::UniString candidateOperationId, candidateScope, candidateCaseId;
+    GS::Array<GS::UniString> candidateFields, candidateGuids;
+    if (!semanticMetadata->Get ("nativeCandidateOperationId", candidateOperationId) || candidateOperationId != operationId
+        || !semanticMetadata->Get ("nativeCandidateScopeKey", candidateScope) || candidateScope != expectedScope
+        || !semanticMetadata->Get ("nativeCandidateCaseId", candidateCaseId) || candidateCaseId.IsEmpty ()
+        || !semanticMetadata->Get ("nativeCandidateFields", candidateFields)
+        || !semanticMetadata->Get ("nativeCandidateGuids", candidateGuids))
+        return "Arc candidate request is not bound to its exact case, operation, disposable file, fields and GUIDs.";
+
+    const std::initializer_list<const char*> allowedFields = {
+        "origin", "radius", "ratio", "axisAngle", "beginAngle", "endAngle", "reflected", "lineType", "pen", "roomSeparator"
+    };
+    GS::HashSet<GS::UniString> uniqueFields;
+    for (const GS::UniString& field : candidateFields) {
+        bool allowed = false;
+        for (const char* candidate : allowedFields) allowed = allowed || field == candidate;
+        if (!allowed || uniqueFields.Contains (field)) return "Arc candidate fields must be unique members of the exact typed writer vocabulary.";
+        uniqueFields.Add (field);
+    }
+    if (candidateFields.IsEmpty ()) return "Arc candidate field authorization must not be empty.";
+    if (operation == "create" && (items.GetSize () != 1 || candidateGuids.GetSize () != 1 || candidateFields.GetSize () != 10))
+        return "Arc candidate CREATE requires one payload, one same-file Arc authorization anchor and ten element fields; story placement is separate.";
+    if (operation == "update" && (candidateGuids.GetSize () != items.GetSize () || candidateGuids.IsEmpty ()))
+        return "Arc candidate UPDATE GUID binding must match its exact target count.";
+
+    bool faultAfterFirstApplied = false;
+    semanticMetadata->Get ("nativeCrudTestFaultAfterFirstApplied", faultAfterFirstApplied);
+    if (faultAfterFirstApplied && (operation != "update" || items.GetSize () != 2 || candidateGuids.GetSize () != 2))
+        return "Arc first-applied rollback test requires exactly two UPDATE targets.";
+#if !defined(TAPIR_NATIVE_CRUD_TEST_FAULT_AFTER_FIRST_APPLIED)
+    if (faultAfterFirstApplied) return "Arc first-applied rollback fault seam is unavailable in this APX build.";
+#endif
+
+    GS::HashSet<GS::UniString> uniqueGuids;
+    for (const GS::UniString& guidText : candidateGuids) {
+        const API_Guid guid = APIGuidFromString (guidText.ToCStr ());
+        if (guid == APINULLGuid || uniqueGuids.Contains (guidText.ToLowerCase ())) return "Arc candidate GUIDs must be valid and unique.";
+        uniqueGuids.Add (guidText.ToLowerCase ());
+    }
+    if (operation == "create") {
+        API_Element templateElement = {};
+        templateElement.header.guid = APIGuidFromString (candidateGuids[0].ToCStr ());
+        if (ACAPI_Element_Get (&templateElement) != NoError || GetElemTypeId (templateElement.header) != API_ArcID)
+            return "Arc candidate CREATE authorization anchor must be an existing exact Arc in this project.";
+    }
+    return ValidateArcTypedPayloads (operation, items, &candidateFields, &candidateGuids);
+#endif
+}
+
+bool HatchPointOnSegment (const API_Coord& point, const API_Coord& begin, const API_Coord& end)
+{
+    return point.x >= std::min (begin.x, end.x) && point.x <= std::max (begin.x, end.x)
+        && point.y >= std::min (begin.y, end.y) && point.y <= std::max (begin.y, end.y);
+}
+
+double HatchOrientation (const API_Coord& first, const API_Coord& second, const API_Coord& third)
+{
+    return (second.x - first.x) * (third.y - first.y) - (second.y - first.y) * (third.x - first.x);
+}
+
+bool HatchSegmentsIntersect (const API_Coord& a, const API_Coord& b, const API_Coord& c, const API_Coord& d)
+{
+    const double o1 = HatchOrientation (a, b, c);
+    const double o2 = HatchOrientation (a, b, d);
+    const double o3 = HatchOrientation (c, d, a);
+    const double o4 = HatchOrientation (c, d, b);
+    if (((o1 > 0.0 && o2 < 0.0) || (o1 < 0.0 && o2 > 0.0))
+        && ((o3 > 0.0 && o4 < 0.0) || (o3 < 0.0 && o4 > 0.0))) return true;
+    return (o1 == 0.0 && HatchPointOnSegment (c, a, b)) || (o2 == 0.0 && HatchPointOnSegment (d, a, b))
+        || (o3 == 0.0 && HatchPointOnSegment (a, c, d)) || (o4 == 0.0 && HatchPointOnSegment (b, c, d));
+}
+
+GS::Optional<GS::UniString> ValidateHatchTypedShape (const GS::ObjectState& shape, const GS::UniString& operation)
+{
+    const std::initializer_list<const char*> allowedFields = { "polygon", "fill", "contourPen", "foregroundPen", "backgroundPen" };
+    if (shape.GetFieldNames ().IsEmpty () || !HasOnlyObjectStateFields (shape, allowedFields))
+        return "Hatch payload must contain only its typed simple-polygon and style fields.";
+    if (operation == "create" && shape.GetFieldNames ().GetSize () != 5)
+        return "Hatch CREATE requires polygon and all four style fields; story placement is separate.";
+    const GS::ObjectState* polygon = shape.Get ("polygon");
+    if (polygon != nullptr) {
+        if (!HasOnlyObjectStateFields (*polygon, { "coordinates" })) return "Hatch polygon accepts only one external coordinates ring; holes and arcs are unsupported.";
+        GS::Array<GS::ObjectState> points;
+        if (!polygon->Get ("coordinates", points) || points.GetSize () < 3 || points.GetSize () > 64)
+            return "Hatch polygon requires between 3 and 64 unclosed vertices.";
+        std::vector<API_Coord> ring;
+        ring.reserve (static_cast<GSSize> (points.GetSize ()));
+        for (const GS::ObjectState& point : points) {
+            if (!IsExactFinitePoint (point)) return "Hatch vertices must contain finite x and y only.";
+            ring.push_back (Get2DCoordinateFromObjectState (point));
+        }
+        double twiceArea = 0.0;
+        for (GSSize index = 0; index < ring.size (); ++index) {
+            const API_Coord& point = ring[index];
+            const API_Coord& next = ring[(index + 1) % ring.size ()];
+            if (IsSame2DCoordinate (point, next)) return "Hatch polygon cannot contain a zero-length edge or duplicated closing vertex.";
+            for (GSSize prior = 0; prior < index; ++prior)
+                if (IsSame2DCoordinate (point, ring[prior])) return "Hatch polygon vertices must be unique.";
+            twiceArea += point.x * next.y - next.x * point.y;
+        }
+        if (!std::isfinite (twiceArea) || twiceArea == 0.0) return "Hatch polygon must have finite nonzero area.";
+        for (GSSize first = 0; first < ring.size (); ++first) {
+            const GSSize firstNext = (first + 1) % ring.size ();
+            for (GSSize second = first + 1; second < ring.size (); ++second) {
+                const GSSize secondNext = (second + 1) % ring.size ();
+                if (first == second || firstNext == second || secondNext == first) continue;
+                if (HatchSegmentsIntersect (ring[first], ring[firstNext], ring[second], ring[secondNext]))
+                    return "Hatch polygon must be a simple non-self-intersecting ring.";
+            }
+        }
+    }
+    for (const char* fieldName : { "fill", "contourPen", "foregroundPen", "backgroundPen" }) {
+        if (!shape.Contains (fieldName)) {
+            if (operation == "create") return GS::UniString::Printf ("Hatch CREATE is missing '%s'.", fieldName);
+            continue;
+        }
+        Int32 value = 0;
+        if (!shape.Get (fieldName, value) || value <= 0) return GS::UniString::Printf ("Hatch '%s' must be a positive integer index.", fieldName);
+    }
+    if (operation == "create" && polygon == nullptr) return "Hatch CREATE requires a polygon.";
+    return {};
+}
+
+GS::Optional<GS::UniString> ValidateHatchTypedPayloads (
+    const GS::UniString& operation,
+    const GS::Array<GS::ObjectState>& items)
+{
+    if (operation != "create" && operation != "update") return "Hatch typed writer supports only CREATE and UPDATE.";
+    if (items.IsEmpty () || items.GetSize () > MaxMutationItems) return "Hatch typed writer requires one to twenty-five items.";
+    for (const GS::ObjectState& item : items) {
+        const GS::ObjectState* shape = item.Get (operation == "create" ? "payload" : "patch");
+        if (shape == nullptr) return "Hatch item is missing its typed payload or patch.";
+        const GS::Optional<GS::UniString> shapeError = ValidateHatchTypedShape (*shape, operation);
+        if (shapeError.HasValue ()) return shapeError;
+        if (operation == "create") {
+            const GS::ObjectState* placement = item.Get ("placement");
+            Int32 storyIndex = 0;
+            if (placement == nullptr || !HasOnlyObjectStateFields (*placement, { "storyIndex" }) || !placement->Get ("storyIndex", storyIndex))
+                return "Hatch CREATE requires exact separate placement.storyIndex.";
+        }
+    }
+    return {};
+}
+
+GS::Optional<GS::UniString> ValidateHatchCandidateWriter (
+    const GS::UniString& operation,
+    const GS::UniString& operationId,
+    const GS::UniString& expectedScope,
+    const GS::Array<GS::ObjectState>& items,
+    const GS::ObjectState* semanticMetadata)
+{
+#if !TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS
+    (void) operation; (void) operationId; (void) expectedScope; (void) items; (void) semanticMetadata;
+    return "Hatch candidate writer is unavailable in this ordinary APX build.";
+#else
+    GS::UniString writer;
+    if (semanticMetadata == nullptr || !semanticMetadata->Get ("nativeCandidateWriter", writer) || writer != HatchCandidateWriter)
+        return "Hatch candidate writer marker is invalid.";
+    if (operation != "create" && operation != "update") return "Hatch candidate writer supports only CREATE and UPDATE.";
+    if (items.IsEmpty () || items.GetSize () > 2) return "Hatch candidate writer is bounded to one or two items.";
+
+    GS::UniString candidateOperationId, candidateScope, candidateCaseId;
+    GS::Array<GS::UniString> candidateFields, candidateGuids;
+    if (!semanticMetadata->Get ("nativeCandidateOperationId", candidateOperationId) || candidateOperationId != operationId
+        || !semanticMetadata->Get ("nativeCandidateScopeKey", candidateScope) || candidateScope != expectedScope
+        || !semanticMetadata->Get ("nativeCandidateCaseId", candidateCaseId) || candidateCaseId.IsEmpty ()
+        || !semanticMetadata->Get ("nativeCandidateFields", candidateFields)
+        || !semanticMetadata->Get ("nativeCandidateGuids", candidateGuids))
+        return "Hatch candidate request is not bound to its exact case, operation, disposable file, fields and GUIDs.";
+
+    const std::initializer_list<const char*> allowedFields = { "polygon", "fill", "contourPen", "foregroundPen", "backgroundPen" };
+    GS::HashSet<GS::UniString> uniqueFields;
+    for (const GS::UniString& field : candidateFields) {
+        bool allowed = false;
+        for (const char* candidate : allowedFields) allowed = allowed || field == candidate;
+        if (!allowed || uniqueFields.Contains (field)) return "Hatch candidate fields must be unique members of the exact typed writer vocabulary.";
+        uniqueFields.Add (field);
+    }
+    if (candidateFields.IsEmpty ()) return "Hatch candidate field authorization must not be empty.";
+    if (operation == "create" && (items.GetSize () != 1 || candidateGuids.GetSize () != 1 || candidateFields.GetSize () != 5))
+        return "Hatch candidate CREATE requires one payload, one same-file Hatch authorization anchor and five element fields.";
+    if (operation == "update" && (candidateGuids.GetSize () != items.GetSize () || candidateGuids.IsEmpty ()))
+        return "Hatch candidate UPDATE GUID binding must match its exact target count.";
+
+    bool faultAfterFirstApplied = false;
+    semanticMetadata->Get ("nativeCrudTestFaultAfterFirstApplied", faultAfterFirstApplied);
+    if (faultAfterFirstApplied && (operation != "update" || items.GetSize () != 2 || candidateGuids.GetSize () != 2))
+        return "Hatch first-applied rollback test requires exactly two UPDATE targets.";
+#if !defined(TAPIR_NATIVE_CRUD_TEST_FAULT_AFTER_FIRST_APPLIED)
+    if (faultAfterFirstApplied) return "Hatch first-applied rollback fault seam is unavailable in this APX build.";
+#endif
+
+    GS::HashSet<GS::UniString> uniqueGuids;
+    for (const GS::UniString& guidText : candidateGuids) {
+        const API_Guid guid = APIGuidFromString (guidText.ToCStr ());
+        if (guid == APINULLGuid || uniqueGuids.Contains (guidText.ToLowerCase ())) return "Hatch candidate GUIDs must be valid and unique.";
+        uniqueGuids.Add (guidText.ToLowerCase ());
+    }
+    if (operation == "create") {
+        API_Element templateElement = {};
+        templateElement.header.guid = APIGuidFromString (candidateGuids[0].ToCStr ());
+        if (ACAPI_Element_Get (&templateElement) != NoError || GetElemTypeId (templateElement.header) != API_HatchID
+            || templateElement.hatch.hatchType != API_FillHatch || templateElement.hatch.determination != APIHatch_DraftingFills)
+            return "Hatch candidate CREATE authorization anchor must be an existing drafting Fill Hatch in this project.";
+    }
+    for (GSSize index = 0; index < static_cast<GSSize> (items.GetSize ()); ++index) {
+        const GS::ObjectState* shape = items[index].Get (operation == "create" ? "payload" : "patch");
+        if (shape == nullptr) return "Hatch candidate item is missing its exact payload or patch.";
+        const GS::Optional<GS::UniString> shapeError = ValidateHatchTypedShape (*shape, operation);
+        if (shapeError.HasValue ()) return shapeError;
+        if (shape->GetFieldNames ().GetSize () != candidateFields.GetSize ()) return "Hatch candidate payload fields do not match the exact authorization list.";
+        for (const GS::String& field : shape->GetFieldNames ()) {
+            bool authorized = false;
+            for (const GS::UniString& candidate : candidateFields) authorized = authorized || candidate == GS::UniString (field);
+            if (!authorized) return "Hatch candidate payload changes a field outside its exact authorization.";
+        }
+        if (operation == "create") {
+            const GS::ObjectState* placement = items[index].Get ("placement");
+            Int32 storyIndex = 0;
+            if (placement == nullptr || !HasOnlyObjectStateFields (*placement, { "storyIndex" }) || !placement->Get ("storyIndex", storyIndex))
+                return "Hatch candidate CREATE requires exact separate placement.storyIndex.";
+        } else {
+            const GS::ObjectState* id = items[index].Get ("elementId");
+            if (id == nullptr || GetGuidFromObjectState (*id) != APIGuidFromString (candidateGuids[index].ToCStr ()))
+                return "Hatch candidate UPDATE targets differ from their exact authorization order.";
+            API_Element target = {};
+            target.header.guid = GetGuidFromObjectState (*id);
+            if (ACAPI_Element_Get (&target) != NoError || GetElemTypeId (target.header) != API_HatchID)
+                return "Hatch candidate UPDATE target must be an existing exact Hatch GUID.";
+        }
+    }
+    return {};
+#endif
 }
 
 GS::Optional<GS::UniString> ValidateZoneMemoWriterCandidate (
@@ -1690,6 +2644,7 @@ GS::ObjectState ExecuteZoneMemoUpdate (
         return CreateErrorResponse (APIERR_BADPARS, "The disposable Zone memo writer mapped a non-polygon field.");
 
     GS::ObjectState setParameters;
+    setParameters.Add ("nativeCrudZoneWriter", true);
     const auto& elementsWithDetails = setParameters.AddList<GS::ObjectState> ("elementsWithDetails");
     GS::ObjectState details;
     GS::ObjectState typeSpecificDetails = *mappedPayload;
@@ -1720,14 +2675,415 @@ GS::ObjectState ExecuteZoneMemoUpdate (
     return result;
 }
 
+GS::ObjectState ExecuteZoneTypedUpdate (
+    const GS::Array<GS::ObjectState>& items,
+    GS::ProcessControl& processControl,
+    const bool faultAfterFirstApplied)
+{
+    const GS::ObjectState nativeParameters = BuildNativeMutationParameters ("update", "Zone", items);
+    GS::Array<GS::ObjectState> mappedItems;
+    if (!nativeParameters.Get ("items", mappedItems) || mappedItems.GetSize () != items.GetSize ())
+        return CreateErrorResponse (APIERR_BADPARS, "Zone typed UPDATE could not map its exact items.");
+
+    GS::ObjectState setParameters;
+    setParameters.Add ("nativeCrudAtomic", true);
+    setParameters.Add ("nativeCrudZoneWriter", true);
+    if (faultAfterFirstApplied) setParameters.Add ("nativeCrudTestFaultAfterFirstApplied", true);
+    const auto& elementsWithDetails = setParameters.AddList<GS::ObjectState> ("elementsWithDetails");
+    for (const GS::ObjectState& mappedItem : mappedItems) {
+        const GS::ObjectState* elementId = mappedItem.Get ("elementId");
+        const GS::ObjectState* mappedPayload = mappedItem.Get ("payload");
+        if (elementId == nullptr || mappedPayload == nullptr)
+            return CreateErrorResponse (APIERR_BADPARS, "Zone typed UPDATE is missing elementId or sparse payload.");
+        GS::ObjectState details;
+        GS::ObjectState typeSpecificDetails = *mappedPayload;
+        Int32 floorIndex = 0;
+        if (typeSpecificDetails.Get ("floorIndex", floorIndex)) {
+            details.Add ("floorIndex", floorIndex);
+        }
+        // D-264 permits a direct persisted polygon write on automatic Zones only
+        // for the memo helper's exact topology checks.  This remains a direct
+        // write and does not request Archicad recalculation/regeneration.
+        if (typeSpecificDetails.Contains ("geometry"))
+            typeSpecificDetails.Add ("allowAutomaticZonePolygonProbe", true);
+        details.Add ("typeSpecificDetails", typeSpecificDetails);
+        elementsWithDetails (GS::ObjectState (
+            "elementId", *elementId,
+            "details", details));
+    }
+    GS::ObjectState result = SetDetailsOfElementsCommand ().Execute (setParameters, processControl);
+    GS::Array<GS::ObjectState> executionResults;
+    bool complete = false;
+    if (result.Get ("executionResults", executionResults) && executionResults.GetSize () == items.GetSize ()) {
+        complete = true;
+        for (const GS::ObjectState& executionResult : executionResults) {
+            bool success = false;
+            complete = complete && executionResult.Get ("success", success) && success;
+        }
+    }
+    result.Add ("mutationComplete", complete);
+    result.Add ("partial", !complete);
+    return result;
+}
+
+GS::Optional<GS::UniString> ValidateDoorTypedPayloads (
+    const GS::UniString& operation,
+    const GS::Array<GS::ObjectState>& items)
+{
+    const bool create = operation == "create";
+    if (!create && operation != "update") return "Door typed writer supports only CREATE and UPDATE.";
+    for (const GS::ObjectState& item : items) {
+        const GS::ObjectState* payload = item.Get (create ? "payload" : "patch");
+        if (payload == nullptr) return "Door typed writer requires its exact payload or sparse patch.";
+        const GS::HashSet<GS::String> names = payload->GetFieldNames ();
+        if (names.IsEmpty ()) return "Door typed writer payload/patch must not be empty.";
+        if (create
+            ? !HasOnlyObjectStateFields (*payload, { "ownerWallId", "offset", "sill", "width", "height", "orientation" })
+            : !HasOnlyObjectStateFields (*payload, { "offset", "sill", "width", "height", "orientation" }))
+            return "Door typed writer received a field outside its declared contract.";
+        if (create && names.GetSize () != 6)
+            return "Door CREATE requires ownerWallId, offset, sill, width, height and orientation.";
+        for (const char* field : { "offset", "sill", "width", "height" }) {
+            if (!payload->Contains (field)) continue;
+            double value = 0.0;
+            if (!payload->Get (field, value) || !std::isfinite (value)
+                || ((GS::UniString (field) == "width" || GS::UniString (field) == "height") && value <= 0.0))
+                return GS::UniString::Printf ("Door '%s' must be a finite%s number.", field,
+                    (GS::UniString (field) == "width" || GS::UniString (field) == "height") ? " positive" : "");
+        }
+        if (create) {
+            const GS::ObjectState* owner = payload->Get ("ownerWallId");
+            if (owner == nullptr || GetGuidFromObjectState (*owner) == APINULLGuid)
+                return "Door CREATE requires an exact ownerWallId GUID.";
+        }
+        const GS::ObjectState* orientation = payload->Get ("orientation");
+        if (orientation != nullptr) {
+            const GS::HashSet<GS::String> orientationNames = orientation->GetFieldNames ();
+            if (orientationNames.IsEmpty () || !HasOnlyObjectStateFields (*orientation, { "reflected", "refSide", "oSide" }))
+                return "Door orientation accepts one or more of reflected, refSide and oSide.";
+            for (const GS::String& name : orientationNames) {
+                bool value = false;
+                if (!orientation->Get (name, value)) return "Door orientation values must be boolean.";
+            }
+        }
+    }
+    return {};
+}
+
+GS::Optional<GS::UniString> ValidateWindowTypedPayloads (const GS::UniString& operation, const GS::Array<GS::ObjectState>& items)
+{
+    const bool create = operation == "create";
+    if (!create && operation != "update") return "Window typed writer supports only CREATE and UPDATE.";
+    for (const GS::ObjectState& item : items) {
+        const GS::ObjectState* payload = item.Get (create ? "payload" : "patch");
+        if (payload == nullptr || payload->GetFieldNames ().IsEmpty ()) return "Window typed writer requires a non-empty exact payload or sparse patch.";
+        if (create ? !HasOnlyObjectStateFields (*payload, { "ownerWallId", "offset", "sill", "width", "height", "orientation" })
+                   : !HasOnlyObjectStateFields (*payload, { "offset", "sill", "width", "height", "orientation" }))
+            return "Window typed writer received a field outside its declared contract.";
+        if (create && payload->GetFieldNames ().GetSize () != 6) return "Window CREATE requires ownerWallId, offset, sill, width, height and orientation.";
+        for (const char* field : { "offset", "sill", "width", "height" }) {
+            if (!payload->Contains (field)) continue;
+            double value = 0.0;
+            if (!payload->Get (field, value) || !std::isfinite (value)
+                || ((GS::UniString (field) == "width" || GS::UniString (field) == "height") && value <= 0.0))
+                return GS::UniString::Printf ("Window '%s' must be a finite%s number.", field,
+                    (GS::UniString (field) == "width" || GS::UniString (field) == "height") ? " positive" : "");
+        }
+        if (create) {
+            const GS::ObjectState* owner = payload->Get ("ownerWallId");
+            if (owner == nullptr || GetGuidFromObjectState (*owner) == APINULLGuid) return "Window CREATE requires an exact ownerWallId GUID.";
+        }
+        const GS::ObjectState* orientation = payload->Get ("orientation");
+        if (orientation != nullptr) {
+            if (orientation->GetFieldNames ().IsEmpty () || !HasOnlyObjectStateFields (*orientation, { "reflected", "refSide", "oSide" })) return "Window orientation accepts reflected, refSide and oSide only.";
+            for (const GS::String& name : orientation->GetFieldNames ()) { bool value = false; if (!orientation->Get (name, value)) return "Window orientation values must be boolean."; }
+        }
+    }
+    return {};
+}
+
+GS::Optional<GS::UniString> ValidateDoorCloneSource (const API_Guid& sourceGuid)
+{
+    if (sourceGuid == APINULLGuid) return "Door clone source GUID is missing.";
+    API_Element source = {};
+    source.header.guid = sourceGuid;
+    if (ACAPI_Element_Get (&source) != NoError || GetElemTypeId (source.header) != API_DoorID || source.header.guid != sourceGuid)
+        return "Door clone source must resolve to the exact same-file Door element.";
+    if (source.door.openingBase.libInd <= 0)
+        return "Door clone source has no valid same-file opening library part.";
+    API_LibPart doorPart = {};
+    LibraryPartLocationGuard doorPartLocationGuard (doorPart);
+    doorPart.index = source.door.openingBase.libInd;
+    if (ACAPI_LibraryPart_Get (&doorPart) != NoError || doorPart.missingDef || doorPart.version <= 0
+        || doorPart.ownUnID[0] == '\0' || doorPart.file_UName[0] == '\0')
+        return "Door clone source opening library identity/revision is incomplete.";
+    const API_Guid stampGuid = source.door.openingBase.markGuid;
+    if (stampGuid == APINULLGuid) return {};
+    // Marker-bearing copying is supplemental under D-272. Non-null identities,
+    // including identities that might be unresolved, fail closed here.
+    return "Door clone source is marker-bearing; this candidate packet accepts only factual markerless templates.";
+}
+
+bool WindowCandidateNativeTopologySupported (const API_Element& element)
+{
+    return GetElemTypeId (element.header) == API_WindowID
+        && element.window.openingBase.libInd > 0
+        && element.window.fixPoint == APIHoleAnchor_CenterFix
+        && element.window.openingBase.verticalLink.linkType == API_LinkSillToWallBottom
+        && element.window.directionType == API_WDAssociativeToWall;
+}
+
+GS::Optional<GS::UniString> ValidateWindowCloneSource (const API_Guid& sourceGuid)
+{
+    if (sourceGuid == APINULLGuid) return "Window clone source GUID is missing.";
+    API_Element source = {};
+    source.header.guid = sourceGuid;
+    if (ACAPI_Element_Get (&source) != NoError || GetElemTypeId (source.header) != API_WindowID || source.header.guid != sourceGuid)
+        return "Window clone source must resolve to the exact same-file native Window.";
+    if (source.window.openingBase.markGuid != APINULLGuid) return "Window clone source is marker-bearing; only factual markerless templates are admitted.";
+    if (!WindowCandidateNativeTopologySupported (source))
+        return "Window clone source is outside the directly observable centered, sill-linked, wall-associative native subset.";
+    API_LibPart part = {};
+    LibraryPartLocationGuard partGuard (part);
+    part.index = source.window.openingBase.libInd;
+    if (ACAPI_LibraryPart_Get (&part) != NoError || part.missingDef || part.version <= 0 || part.ownUnID[0] == '\0' || part.file_UName[0] == '\0')
+        return "Window clone source library identity/revision is incomplete.";
+    return {};
+}
+
 GS::ObjectState DispatchMutation (
     const GS::UniString& operation,
+    const GS::UniString& operationId,
     const GS::UniString& typeName,
     const GS::Array<GS::ObjectState>& items,
     GS::ProcessControl& processControl,
     const GS::ObjectState* semanticMetadata)
 {
+#if !TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS
+    (void) operationId;
+#endif
     const API_ElemTypeID typeID = GetElementTypeFromNonLocalizedName (typeName);
+    GS::UniString candidateMarker;
+    const bool hasCandidateMarker = semanticMetadata != nullptr && semanticMetadata->Get ("nativeCandidateWriter", candidateMarker);
+    if (hasCandidateMarker && candidateMarker != "zone-native-v1" && candidateMarker != "column-native-v1" && candidateMarker != "line-native-v1" && candidateMarker != ArcCandidateWriter && candidateMarker != HatchCandidateWriter && candidateMarker != DoorCandidateWriter && candidateMarker != WindowCandidateWriter)
+        return CreateErrorResponse (APIERR_BADPARS, "Unsupported native candidate writer marker.");
+    if (hasCandidateMarker && candidateMarker == HatchCandidateWriter
+        && (typeID != API_HatchID || (operation != "create" && operation != "update")))
+        return CreateErrorResponse (APIERR_BADPARS, "Hatch candidate metadata is valid only for Hatch CREATE or UPDATE.");
+    if (hasCandidateMarker && candidateMarker == DoorCandidateWriter
+        && (typeID != API_DoorID || (operation != "create" && operation != "update")))
+        return CreateErrorResponse (APIERR_BADPARS, "Door candidate metadata is valid only for Door CREATE or UPDATE.");
+    if (hasCandidateMarker && candidateMarker == WindowCandidateWriter
+        && (typeID != API_WindowID || (operation != "create" && operation != "update")))
+        return CreateErrorResponse (APIERR_BADPARS, "Window candidate metadata is valid only for Window CREATE or UPDATE.");
+    if (typeID == API_DoorID && HasDoorCandidateMetadata (semanticMetadata)) {
+#if TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS
+        GS::UniString writer, candidateOperationId, candidateScope, candidateCaseId;
+        GS::Array<GS::UniString> candidateFields, candidateGuids;
+        if (!semanticMetadata->Get ("nativeCandidateWriter", writer) || writer != DoorCandidateWriter
+            || !semanticMetadata->Get ("nativeCandidateOperationId", candidateOperationId) || candidateOperationId != operationId
+            || !semanticMetadata->Get ("nativeCandidateScopeKey", candidateScope) || candidateScope != CurrentSoloFileScope ().Get ()
+            || !semanticMetadata->Get ("nativeCandidateCaseId", candidateCaseId) || candidateCaseId.IsEmpty ()
+            || !semanticMetadata->Get ("nativeCandidateFields", candidateFields)
+            || !semanticMetadata->Get ("nativeCandidateGuids", candidateGuids))
+            return CreateErrorResponse (APIERR_BADPARS, "Door candidate request is not bound to its exact case, operation, file, fields and GUIDs.");
+        const std::initializer_list<const char*> allowedFields = { "ownerWallId", "offset", "sill", "width", "height", "orientation" };
+        GS::HashSet<GS::UniString> fields;
+        for (const GS::UniString& field : candidateFields) {
+            bool allowed = false;
+            for (const char* name : allowedFields) allowed = allowed || field == name;
+            if (!allowed || fields.Contains (field)) return CreateErrorResponse (APIERR_BADPARS, "Door candidate field authorization contains an unknown or repeated field.");
+            fields.Add (field);
+        }
+        const GSSize requiredFields = operation == "create" ? static_cast<GSSize> (6) : candidateFields.GetSize ();
+        if (candidateFields.IsEmpty () || static_cast<GSSize> (candidateFields.GetSize ()) != requiredFields || candidateGuids.IsEmpty ()
+            || (operation == "create" && (items.GetSize () != 1 || candidateGuids.GetSize () != 1))
+            || (operation == "update" && candidateGuids.GetSize () != items.GetSize ()))
+            return CreateErrorResponse (APIERR_BADPARS, "Door candidate item/field/GUID binding is incomplete.");
+        const GS::Optional<GS::UniString> writerError = ValidateDoorTypedPayloads (operation, items);
+        if (writerError.HasValue ()) return CreateErrorResponse (APIERR_BADPARS, writerError.Get ());
+        GS::HashSet<GS::UniString> uniqueGuids;
+        for (const GS::UniString& text : candidateGuids) {
+            const API_Guid guid = APIGuidFromString (text.ToCStr ());
+            const GS::UniString normalized = text.ToLowerCase ();
+            if (guid == APINULLGuid || uniqueGuids.Contains (normalized)) return CreateErrorResponse (APIERR_BADPARS, "Door candidate GUIDs must be valid and unique.");
+            uniqueGuids.Add (normalized);
+        }
+        bool injectFault = false;
+        semanticMetadata->Get ("nativeCrudTestFaultAfterFirstApplied", injectFault);
+        if (injectFault && (operation != "update" || items.GetSize () != 2 || candidateGuids.GetSize () != 2))
+            return CreateErrorResponse (APIERR_BADPARS, "Door first-applied rollback requires exactly two UPDATE targets.");
+#if !defined(TAPIR_NATIVE_CRUD_TEST_FAULT_AFTER_FIRST_APPLIED)
+        if (injectFault) return CreateErrorResponse (APIERR_BADPARS, "Door first-applied fault seam is unavailable in this APX build.");
+#endif
+        for (GSSize index = 0; index < static_cast<GSSize> (items.GetSize ()); ++index) {
+            const GS::ObjectState* shape = items[index].Get (operation == "create" ? "payload" : "patch");
+            if (shape == nullptr || shape->GetFieldNames ().GetSize () != candidateFields.GetSize ())
+                return CreateErrorResponse (APIERR_BADPARS, "Door candidate payload/patch fields do not match the exact declared field set.");
+            for (const GS::String& name : shape->GetFieldNames ())
+                if (!fields.Contains (GS::UniString (name))) return CreateErrorResponse (APIERR_BADPARS, "Door candidate payload/patch contains an undeclared field.");
+            const GS::ObjectState* idValue = operation == "create" ? items[index].Get ("cloneSourceElementId") : items[index].Get ("elementId");
+            if (idValue == nullptr || GetGuidFromObjectState (*idValue) != APIGuidFromString (candidateGuids[index].ToCStr ()))
+                return CreateErrorResponse (APIERR_BADPARS, "Door candidate target/template GUID differs from its exact authorization order.");
+            if (operation == "create") {
+                const GS::Optional<GS::UniString> cloneError = ValidateDoorCloneSource (GetGuidFromObjectState (*idValue));
+                if (cloneError.HasValue ()) return CreateErrorResponse (APIERR_BADPARS, cloneError.Get ());
+            }
+        }
+#else
+        return CreateErrorResponse (APIERR_BADPARS, "Door candidate metadata is unavailable in an ordinary APX build.");
+#endif
+    }
+    if (typeID == API_WindowID && HasWindowCandidateMetadata (semanticMetadata)) {
+#if TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS
+        GS::UniString writer, candidateOperationId, candidateScope, candidateCaseId;
+        GS::Array<GS::UniString> candidateFields, candidateGuids;
+        if (!HasOnlyObjectStateFields (*semanticMetadata, { "nativeCandidateWriter", "nativeCandidateOperationId", "nativeCandidateScopeKey", "nativeCandidateCaseId", "nativeCandidateFields", "nativeCandidateGuids", "nativeCrudTestFaultAfterFirstApplied" }))
+            return CreateErrorResponse (APIERR_BADPARS, "Window candidate metadata contains an unrecognized field.");
+        if (!semanticMetadata->Get ("nativeCandidateWriter", writer) || writer != WindowCandidateWriter
+            || !semanticMetadata->Get ("nativeCandidateOperationId", candidateOperationId) || candidateOperationId != operationId
+            || !semanticMetadata->Get ("nativeCandidateScopeKey", candidateScope) || candidateScope != CurrentSoloFileScope ().Get ()
+            || !semanticMetadata->Get ("nativeCandidateCaseId", candidateCaseId) || candidateCaseId.IsEmpty ()
+            || !semanticMetadata->Get ("nativeCandidateFields", candidateFields)
+            || !semanticMetadata->Get ("nativeCandidateGuids", candidateGuids))
+            return CreateErrorResponse (APIERR_BADPARS, "Window candidate request is not bound to its exact case, operation, file, fields and GUIDs.");
+        const std::initializer_list<const char*> allowedFields = { "ownerWallId", "offset", "sill", "width", "height", "orientation" };
+        GS::HashSet<GS::UniString> fields;
+        for (const GS::UniString& field : candidateFields) {
+            bool allowed = false;
+            for (const char* name : allowedFields) allowed = allowed || field == name;
+            if (!allowed || fields.Contains (field)) return CreateErrorResponse (APIERR_BADPARS, "Window candidate field authorization contains an unknown or repeated field.");
+            fields.Add (field);
+        }
+        if (candidateFields.IsEmpty () || (operation == "create" && candidateFields.GetSize () != 6) || candidateGuids.IsEmpty ()
+            || (operation == "create" && (items.GetSize () != 1 || candidateGuids.GetSize () != 1))
+            || (operation == "update" && candidateGuids.GetSize () != items.GetSize ()))
+            return CreateErrorResponse (APIERR_BADPARS, "Window candidate item/field/GUID binding is incomplete.");
+        const GS::Optional<GS::UniString> writerError = ValidateWindowTypedPayloads (operation, items);
+        if (writerError.HasValue ()) return CreateErrorResponse (APIERR_BADPARS, writerError.Get ());
+        GS::HashSet<GS::UniString> uniqueGuids;
+        for (const GS::UniString& text : candidateGuids) {
+            const API_Guid guid = APIGuidFromString (text.ToCStr ());
+            const GS::UniString normalized = text.ToLowerCase ();
+            if (guid == APINULLGuid || uniqueGuids.Contains (normalized)) return CreateErrorResponse (APIERR_BADPARS, "Window candidate GUIDs must be valid and unique.");
+            uniqueGuids.Add (normalized);
+        }
+        bool injectFault = false;
+        semanticMetadata->Get ("nativeCrudTestFaultAfterFirstApplied", injectFault);
+        if (injectFault && (operation != "update" || items.GetSize () != 2 || candidateGuids.GetSize () != 2))
+            return CreateErrorResponse (APIERR_BADPARS, "Window first-applied rollback requires exactly two UPDATE targets.");
+#if !defined(TAPIR_NATIVE_CRUD_TEST_FAULT_AFTER_FIRST_APPLIED)
+        if (injectFault) return CreateErrorResponse (APIERR_BADPARS, "Window first-applied fault seam is unavailable in this APX build.");
+#endif
+        GS::HashSet<GS::UniString> faultHosts;
+        for (GSSize index = 0; index < static_cast<GSSize> (items.GetSize ()); ++index) {
+            const GS::ObjectState* shape = items[index].Get (operation == "create" ? "payload" : "patch");
+            if (shape == nullptr || shape->GetFieldNames ().GetSize () != candidateFields.GetSize ())
+                return CreateErrorResponse (APIERR_BADPARS, "Window candidate payload/patch fields do not match the exact declared field set.");
+            for (const GS::String& name : shape->GetFieldNames ())
+                if (!fields.Contains (GS::UniString (name))) return CreateErrorResponse (APIERR_BADPARS, "Window candidate payload/patch contains an undeclared field.");
+            const GS::ObjectState* idValue = operation == "create" ? items[index].Get ("cloneSourceElementId") : items[index].Get ("elementId");
+            const API_Guid expectedGuid = APIGuidFromString (candidateGuids[index].ToCStr ());
+            if (idValue == nullptr || GetGuidFromObjectState (*idValue) != expectedGuid)
+                return CreateErrorResponse (APIERR_BADPARS, "Window candidate target/template GUID differs from its exact authorization order.");
+            if (operation == "create") {
+                const GS::Optional<GS::UniString> cloneError = ValidateWindowCloneSource (expectedGuid);
+                if (cloneError.HasValue ()) return CreateErrorResponse (APIERR_BADPARS, cloneError.Get ());
+            } else if (injectFault) {
+                API_Element target = {};
+                target.header.guid = expectedGuid;
+                if (ACAPI_Element_Get (&target) != NoError || GetElemTypeId (target.header) != API_WindowID
+                    || target.header.guid != expectedGuid || target.window.openingBase.markGuid != APINULLGuid
+                    || !WindowCandidateNativeTopologySupported (target))
+                    return CreateErrorResponse (APIERR_BADID, "Window fault target must freshly resolve as an exact markerless native Window.");
+                const GS::UniString owner = APIGuidToString (target.window.owner);
+                if (owner.IsEmpty () || faultHosts.Contains (owner))
+                    return CreateErrorResponse (APIERR_BADPARS, "Window first-applied fault targets must have distinct freshly read Wall hosts.");
+                faultHosts.Add (owner);
+            }
+        }
+#else
+        return CreateErrorResponse (APIERR_BADPARS, "Window candidate metadata is unavailable in an ordinary APX build.");
+#endif
+    }
+    if (typeID == API_HatchID && HasHatchCandidateOnlyMetadata (semanticMetadata)) {
+#if TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS
+        if (!hasCandidateMarker || candidateMarker != HatchCandidateWriter
+            || (operation != "create" && operation != "update"))
+            return CreateErrorResponse (APIERR_BADPARS, "Hatch candidate-only metadata requires the exact candidate CREATE/UPDATE route.");
+#else
+        return CreateErrorResponse (APIERR_BADPARS, "Hatch candidate-only metadata is unavailable in this ordinary APX build.");
+#endif
+    }
+    if (typeID == API_DoorID && (operation == "create" || operation == "update")) {
+#if TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS
+        if (!HasDoorCandidateMetadata (semanticMetadata))
+            return CreateErrorResponse (APIERR_BADPARS, "Door candidate builds require the exact guarded candidate writer route.");
+#else
+        // Ordinary builds admit only the same markerless typed writer. Any
+        // candidate/fault metadata was rejected above; the ordinary request
+        // must still use the narrow Door payload contract and exact source.
+        const GS::Optional<GS::UniString> writerError = ValidateDoorTypedPayloads (operation, items);
+        if (writerError.HasValue ()) return CreateErrorResponse (APIERR_BADPARS, writerError.Get ());
+        if (operation == "create") {
+            for (const GS::ObjectState& item : items) {
+                const GS::ObjectState* source = item.Get ("cloneSourceElementId");
+                if (source == nullptr) return CreateErrorResponse (APIERR_BADPARS, "Door CREATE requires an exact markerless source template.");
+                const GS::Optional<GS::UniString> cloneError = ValidateDoorCloneSource (GetGuidFromObjectState (*source));
+                if (cloneError.HasValue ()) return CreateErrorResponse (APIERR_BADPARS, cloneError.Get ());
+            }
+        }
+#endif
+    }
+    if (typeID == API_WindowID && (operation == "create" || operation == "update")) {
+#if TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS
+        if (!HasWindowCandidateMetadata (semanticMetadata))
+            return CreateErrorResponse (APIERR_BADPARS, "Window candidate builds require the exact guarded candidate writer route.");
+#else
+        const GS::Optional<GS::UniString> writerError = ValidateWindowTypedPayloads (operation, items);
+        if (writerError.HasValue ()) return CreateErrorResponse (APIERR_BADPARS, writerError.Get ());
+        if (operation == "create") {
+            for (const GS::ObjectState& item : items) {
+                const GS::ObjectState* source = item.Get ("cloneSourceElementId");
+                if (source == nullptr) return CreateErrorResponse (APIERR_BADPARS, "Window CREATE requires an exact markerless source template.");
+                const GS::Optional<GS::UniString> cloneError = ValidateWindowCloneSource (GetGuidFromObjectState (*source));
+                if (cloneError.HasValue ()) return CreateErrorResponse (APIERR_BADPARS, cloneError.Get ());
+            }
+        }
+#endif
+    }
+    if (typeID == API_ZoneID && HasAnyZoneMemoWriterGate (semanticMetadata) && HasZoneCandidateWriterMetadataMarker (semanticMetadata))
+        return CreateErrorResponse (APIERR_BADPARS, "Zone memo and typed candidate writer gates cannot be combined in one request.");
+    if (operation == "delete" && typeID == API_DoorID) {
+        // Door DELETE is markerless-only even for direct APX callers. Read
+        // every requested target immediately before entering the generic
+        // delete writer so the TypeScript preflight is not the only guard.
+        for (const GS::ObjectState& item : items) {
+            const GS::ObjectState* id = item.Get ("elementId");
+            const API_Guid requestedGuid = id == nullptr ? APINULLGuid : GetGuidFromObjectState (*id);
+            if (requestedGuid == APINULLGuid)
+                return CreateErrorResponse (APIERR_BADPARS, "Door DELETE requires an exact elementId GUID.");
+            API_Element target = {};
+            target.header.guid = requestedGuid;
+            if (ACAPI_Element_Get (&target) != NoError
+                || target.header.guid != requestedGuid
+                || GetElemTypeId (target.header) != API_DoorID
+                || target.door.openingBase.markGuid != APINULLGuid)
+                return CreateErrorResponse (APIERR_BADID, "Door DELETE requires a freshly resolved exact markerless target.");
+        }
+    }
+    if (operation == "delete" && typeID == API_WindowID) {
+        for (const GS::ObjectState& item : items) {
+            const GS::ObjectState* id = item.Get ("elementId");
+            const API_Guid requestedGuid = id == nullptr ? APINULLGuid : GetGuidFromObjectState (*id);
+            if (requestedGuid == APINULLGuid) return CreateErrorResponse (APIERR_BADPARS, "Window DELETE requires an exact elementId GUID.");
+            API_Element target = {};
+            target.header.guid = requestedGuid;
+            if (ACAPI_Element_Get (&target) != NoError || target.header.guid != requestedGuid
+                || GetElemTypeId (target.header) != API_WindowID || target.window.openingBase.markGuid != APINULLGuid)
+                return CreateErrorResponse (APIERR_BADID, "Window DELETE requires a freshly resolved exact markerless target.");
+        }
+    }
     if (operation == "delete")
         return DeleteElementsCommand ().Execute ([&]() {
             GS::ObjectState parameters;
@@ -1743,15 +3099,145 @@ GS::ObjectState DispatchMutation (
             }
             return parameters;
         } (), processControl);
-    // The existing project-owned executor already provides undoable typed
-    // operations for these three types.  Keep the adapter narrow until the
-    // remaining element-specific memo writers have their own atomic tests;
-    // returning a capability error is safer than treating a partial command as
-    // factual native CRUD.
-    if (typeID == API_WallID || typeID == API_ColumnID || typeID == API_TextID ||
-        typeID == API_LineID || typeID == API_ArcID) {
+    // Reuse existing undoable typed routes for verified types and the
+    // markerless Door writer. Candidate builds retain their exact disposable
+    // guard before this same typed Door path.
+    if (typeID == API_WallID || typeID == API_ColumnID || typeID == API_TextID || typeID == API_DoorID || typeID == API_WindowID ||
+        typeID == API_LineID || typeID == API_ArcID || typeID == API_HatchID) {
         GS::ObjectState nativeParameters = BuildNativeMutationParameters (operation, typeName, items);
         nativeParameters.Add ("elementType", typeName);
+        if (operation == "update")
+            nativeParameters.Add ("nativeCrudAtomic", true);
+        if (typeID == API_HatchID && (operation == "create" || operation == "update"))
+            nativeParameters.Add ("nativeCrudHatchWriter", true);
+        if (typeID == API_DoorID && (operation == "create" || operation == "update"))
+            nativeParameters.Add ("nativeCrudDoorWriter", true);
+        if (typeID == API_WindowID && (operation == "create" || operation == "update"))
+            nativeParameters.Add ("nativeCrudWindowWriter", true);
+        if (typeID == API_WindowID && semanticMetadata != nullptr) {
+            GS::UniString candidateWriter;
+            if (semanticMetadata->Get ("nativeCandidateWriter", candidateWriter) && candidateWriter == WindowCandidateWriter) {
+                nativeParameters.Add ("nativeCandidateWindowWriter", true);
+                GS::Array<GS::UniString> publicFields;
+                if (!semanticMetadata->Get ("nativeCandidateFields", publicFields)) return CreateErrorResponse (APIERR_BADPARS, "Window candidate public field authorization is missing.");
+                GS::Array<GS::ObjectState> mappedItems;
+                if (!nativeParameters.Get ("items", mappedItems) || mappedItems.GetSize () != items.GetSize ()) return CreateErrorResponse (APIERR_BADPARS, "Window candidate field mapping has no exact native items.");
+                GS::HashSet<GS::UniString> authorizedNativeFields;
+                for (GSSize index = 0; index < static_cast<GSSize> (mappedItems.GetSize ()); ++index) {
+                    const GS::ObjectState* shape = mappedItems[index].Get ("payload");
+                    const GS::ObjectState* publicShape = items[index].Get (operation == "create" ? "payload" : "patch");
+                    if (shape == nullptr || publicShape == nullptr) return CreateErrorResponse (APIERR_BADPARS, "Window candidate public or native payload is missing.");
+                    GS::HashSet<GS::UniString> actual;
+                    for (const GS::String& name : shape->GetFieldNames ()) {
+                        const GS::UniString field (name);
+                        if (operation == "create" && field == "floorIndex") continue;
+                        actual.Add (field);
+                    }
+                    GS::HashSet<GS::UniString> expected;
+                    for (const GS::UniString& field : publicFields) {
+                        if (field == "ownerWallId") expected.Add ("ownerWallId");
+                        else if (field == "offset") expected.Add ("centerOffset");
+                        else if (field == "sill") expected.Add ("sillHeight");
+                        else if (field == "width" || field == "height") expected.Add (field);
+                        else if (field == "orientation") {
+                            const GS::ObjectState* orientation = publicShape->Get ("orientation");
+                            if (orientation == nullptr) return CreateErrorResponse (APIERR_BADPARS, "Window orientation mapping requires exact public subfields.");
+                            for (const char* flag : { "reflected", "refSide", "oSide" }) if (orientation->Contains (flag)) expected.Add (flag);
+                        } else return CreateErrorResponse (APIERR_BADPARS, "Window candidate public field has no exact native mapping.");
+                    }
+                    if (actual.GetSize () != expected.GetSize ()) return CreateErrorResponse (APIERR_BADPARS, "Window candidate public-to-native flattened field set differs.");
+                    for (const GS::UniString& field : actual) if (!expected.Contains (field)) return CreateErrorResponse (APIERR_BADPARS, "Window candidate contains an unauthorized native field.");
+                    if (index == 0) authorizedNativeFields = expected;
+                    else if (expected.GetSize () != authorizedNativeFields.GetSize ()) return CreateErrorResponse (APIERR_BADPARS, "Window batch field sets differ.");
+                    else for (const GS::UniString& field : expected) if (!authorizedNativeFields.Contains (field)) return CreateErrorResponse (APIERR_BADPARS, "Window batch field sets differ.");
+                }
+                const auto& nativeFields = nativeParameters.AddList<GS::UniString> ("nativeCandidateWindowFields");
+                for (const GS::UniString& field : authorizedNativeFields) nativeFields (field);
+            }
+        }
+        if (typeID == API_DoorID && (operation == "create" || operation == "update") && semanticMetadata != nullptr) {
+            GS::UniString candidateWriter;
+            if (semanticMetadata->Get ("nativeCandidateWriter", candidateWriter) && candidateWriter == DoorCandidateWriter) {
+                nativeParameters.Add ("nativeCandidateDoorWriter", true);
+                GS::Array<GS::ObjectState> normalizedItems;
+                if (!nativeParameters.Get ("items", normalizedItems) || normalizedItems.IsEmpty ())
+                    return CreateErrorResponse (APIERR_BADPARS, "Door candidate mapping did not produce native items for its second-boundary field guard.");
+                GS::Array<GS::UniString> publicFields;
+                if (!semanticMetadata->Get ("nativeCandidateFields", publicFields))
+                    return CreateErrorResponse (APIERR_BADPARS, "Door candidate public field authorization is missing.");
+                GS::HashSet<GS::UniString> authorizedNativeFields;
+                for (GSSize index = 0; index < static_cast<GSSize> (normalizedItems.GetSize ()); ++index) {
+                    // The public UPDATE envelope is named `patch`, but
+                    // BuildNativeMutationParameters translates it into the
+                    // typed writer's internal `payload` shape.  Validate
+                    // that mapped representation here; the exact public
+                    // patch is checked independently below.
+                    const GS::ObjectState* shape = normalizedItems[index].Get ("payload");
+                    if (shape == nullptr) return CreateErrorResponse (APIERR_BADPARS, "Door candidate mapping omitted the native payload/patch.");
+                    GS::HashSet<GS::UniString> itemFields;
+                    for (const GS::String& name : shape->GetFieldNames ()) {
+                        const GS::UniString field (name);
+                        // Placement is execution context, never a writable
+                        // element field or candidate authorization.
+                        if (operation == "create" && field == "floorIndex") continue;
+                        itemFields.Add (field);
+                    }
+                    const GS::ObjectState* publicShape = items[index].Get (operation == "create" ? "payload" : "patch");
+                    if (publicShape == nullptr) return CreateErrorResponse (APIERR_BADPARS, "Door candidate public payload/patch is missing.");
+                    GS::HashSet<GS::UniString> expectedMappedFields;
+                    for (const GS::UniString& publicField : publicFields) {
+                        const char* nativeField = nullptr;
+                        if (publicField == "ownerWallId") nativeField = "ownerWallId";
+                        else if (publicField == "offset") nativeField = "centerOffset";
+                        else if (publicField == "sill") nativeField = "sillHeight";
+                        else if (publicField == "width") nativeField = "width";
+                        else if (publicField == "height") nativeField = "height";
+                        else if (publicField == "orientation") {
+                            const GS::ObjectState* orientation = publicShape->Get ("orientation");
+                            if (orientation == nullptr) return CreateErrorResponse (APIERR_BADPARS, "Door orientation authorization lacks its exact public subfields.");
+                            for (const char* flag : { "reflected", "refSide", "oSide" })
+                                if (orientation->Contains (flag)) expectedMappedFields.Add (flag);
+                        } else return CreateErrorResponse (APIERR_BADPARS, "Door candidate public field has no allowlisted native mapping.");
+                        if (nativeField != nullptr) expectedMappedFields.Add (nativeField);
+                    }
+                    if (expectedMappedFields.GetSize () != itemFields.GetSize ())
+                        return CreateErrorResponse (APIERR_BADPARS, "Door candidate public-to-native field mapping is not one-to-one with its flattened payload.");
+                    for (const GS::UniString& field : itemFields)
+                        if (!expectedMappedFields.Contains (field)) return CreateErrorResponse (APIERR_BADPARS, "Door candidate public-to-native field mapping differs from its flattened payload.");
+                    if (index == 0) authorizedNativeFields = expectedMappedFields;
+                    else if (expectedMappedFields.GetSize () != authorizedNativeFields.GetSize ())
+                        return CreateErrorResponse (APIERR_BADPARS, "Door candidate batch does not use one exact flattened native field set.");
+                    else for (const GS::UniString& field : expectedMappedFields)
+                        if (!authorizedNativeFields.Contains (field)) return CreateErrorResponse (APIERR_BADPARS, "Door candidate batch does not use one exact flattened native field set.");
+                }
+                const std::initializer_list<const char*> allowedNativeFields = {
+                    "ownerWallId", "centerOffset", "sillHeight", "width", "height", "reflected", "refSide", "oSide"
+                };
+                for (const GS::UniString& field : authorizedNativeFields) {
+                    bool allowed = false;
+                    for (const char* name : allowedNativeFields) allowed = allowed || field == name;
+                    if (!allowed) return CreateErrorResponse (APIERR_BADPARS, "Door candidate flattened field mapping contains an unauthorized native field.");
+                }
+                const auto& nativeFields = nativeParameters.AddList<GS::UniString> ("nativeCandidateDoorFields");
+                for (const GS::UniString& field : authorizedNativeFields) nativeFields (field);
+            }
+        }
+        if (typeID == API_HatchID && operation == "create" && semanticMetadata != nullptr) {
+            GS::UniString candidateWriter;
+            if (semanticMetadata->Get ("nativeCandidateWriter", candidateWriter) && candidateWriter == HatchCandidateWriter)
+                nativeParameters.Add ("nativeCandidateHatchWriter", true);
+        }
+        if (typeID == API_ColumnID && operation == "create" && HasColumnCandidateWriterGate (semanticMetadata)) {
+            GS::ObjectState templateSection;
+            if (semanticMetadata == nullptr || !semanticMetadata->Get ("nativeCandidateTemplateSection", templateSection))
+                return CreateErrorResponse (APIERR_BADPARS, "Column candidate CREATE is missing the qualified template section readback.");
+            nativeParameters.Add ("nativeCandidateColumnTemplateSection", templateSection);
+        }
+        bool draftingCandidateFault = false;
+        if ((typeID == API_ColumnID || typeID == API_LineID || typeID == API_ArcID || typeID == API_HatchID || typeID == API_DoorID || typeID == API_WindowID) && semanticMetadata != nullptr
+            && semanticMetadata->Get ("nativeCrudTestFaultAfterFirstApplied", draftingCandidateFault)
+            && draftingCandidateFault)
+            nativeParameters.Add ("nativeCrudTestFaultAfterFirstApplied", true);
         const GS::ObjectState nativeEnvelope = MutateElementsCommand ().Execute (nativeParameters, processControl);
         // MutateElements is itself an envelope: its actual typed command
         // result lives under `mutationResult`, while transaction/readback
@@ -1786,6 +3272,9 @@ GS::ObjectState DispatchMutation (
         Int32 groupModeRestoreError = 0;
         if (typedResult->Get ("groupModeRestoreError", groupModeRestoreError))
             normalized.Add ("groupModeRestoreError", groupModeRestoreError);
+        const GS::ObjectState* testFaultEvidence = typedResult->Get ("testFaultEvidence");
+        if (testFaultEvidence != nullptr)
+            normalized.Add ("testFaultEvidence", *testFaultEvidence);
         return normalized;
     }
     if (typeID == API_ZoneID && HasAnyZoneMemoWriterGate (semanticMetadata)) {
@@ -1794,7 +3283,83 @@ GS::ObjectState DispatchMutation (
             return CreateErrorResponse (APIERR_BADPARS, candidateError.Get ());
         return ExecuteZoneMemoUpdate (items, processControl, HasAutomaticZonePolygonProbeGate (semanticMetadata));
     }
+    if (typeID == API_ZoneID && (operation == "create" || operation == "update")) {
+        // Candidate and ordinary builds use the same typed executor. Candidate
+        // metadata is validated earlier and remains available only behind the
+        // developer compile gate; the proven fields are now ordinary internal
+        // Native CRUD capability on AC25/AC28.
+        if (operation == "create") {
+            GS::ObjectState nativeParameters = BuildNativeMutationParameters (operation, typeName, items);
+            GS::Array<GS::ObjectState> mappedItems;
+            if (!nativeParameters.Get ("items", mappedItems) || mappedItems.GetSize () != items.GetSize ())
+                return CreateErrorResponse (APIERR_BADPARS, "Zone typed CREATE could not map its exact items.");
+            GS::ObjectState createParameters;
+            createParameters.Add ("nativeCrudAtomic", true);
+            const auto& zoneData = createParameters.AddList<GS::ObjectState> ("zonesData");
+            for (const GS::ObjectState& item : mappedItems) {
+                const GS::ObjectState* payload = item.Get ("payload");
+                if (payload == nullptr)
+                    return CreateErrorResponse (APIERR_BADPARS, "Zone typed CREATE is missing its sparse payload.");
+                zoneData (*payload);
+            }
+            GS::ObjectState result = CreateZonesCommand ().Execute (createParameters, processControl);
+            GS::Array<GS::ObjectState> created;
+            bool complete = result.Get ("elements", created) && created.GetSize () == items.GetSize ();
+            if (complete) {
+                for (const GS::ObjectState& row : created) {
+                    const GS::ObjectState* id = row.Get ("elementId");
+                    complete = complete && id != nullptr && GetGuidFromObjectState (*id) != APINULLGuid;
+                }
+            }
+            bool rolledBack = false;
+            result.Get ("transactionRolledBack", rolledBack);
+            complete = complete && !rolledBack && result.Get ("error") == nullptr;
+            result.Add ("mutationComplete", complete);
+            result.Add ("partial", !complete);
+            return result;
+        }
+        bool faultAfterFirstApplied = false;
+        if (HasZoneCandidateWriterGate (semanticMetadata))
+            semanticMetadata->Get ("nativeCrudTestFaultAfterFirstApplied", faultAfterFirstApplied);
+        return ExecuteZoneTypedUpdate (items, processControl, faultAfterFirstApplied);
+    }
     return CreateErrorResponse (APIERR_BADPARS, "This element type has read snapshots but no validated native memo writer in this APX build.");
+}
+
+GS::Optional<GS::UniString> ValidateNativeCreatePlacement (
+    const GS::UniString& typeName,
+    const GS::Array<GS::ObjectState>& items)
+{
+    const Stories stories = GetStories ();
+    if (stories.empty ())
+        return "CREATE story placement cannot be checked because Archicad story settings are unavailable.";
+    for (const GS::ObjectState& item : items) {
+        const GS::ObjectState* placement = item.Get ("placement");
+        Int32 storyIndex = 0;
+        if (placement == nullptr || !HasOnlyObjectStateFields (*placement, { "storyIndex" })
+            || !placement->Get ("storyIndex", storyIndex)
+            || storyIndex < static_cast<Int32> (std::numeric_limits<short>::min ())
+            || storyIndex > static_cast<Int32> (std::numeric_limits<short>::max ()))
+            return "CREATE requires placement.storyIndex as one exact Archicad story index.";
+        const short nativeStoryIndex = static_cast<short> (storyIndex);
+        if (stories.find (nativeStoryIndex) == stories.end ())
+            return "CREATE placement.storyIndex does not identify a current Archicad story.";
+
+        if (typeName == "Door" || typeName == "Window") {
+            const GS::ObjectState* payload = item.Get ("payload");
+            const GS::ObjectState* ownerWallId = payload == nullptr ? nullptr : payload->Get ("ownerWallId");
+            const API_Guid ownerWallGuid = ownerWallId == nullptr ? APINULLGuid : GetGuidFromObjectState (*ownerWallId);
+            if (ownerWallGuid == APINULLGuid)
+                return "Door/Window CREATE requires the exact ownerWallId to validate host story placement.";
+            API_Element hostWall = {};
+            hostWall.header.guid = ownerWallGuid;
+            if (ACAPI_Element_Get (&hostWall) != NoError || GetElemTypeId (hostWall.header) != API_WallID)
+                return "Door/Window CREATE ownerWallId must resolve to an exact current Wall in this file.";
+            if (hostWall.header.floorInd != nativeStoryIndex)
+                return "Door/Window CREATE placement.storyIndex must match the exact host Wall story.";
+        }
+    }
+    return {};
 }
 
 GS::Optional<GS::UniString> ValidateMutationItems (
@@ -1807,8 +3372,13 @@ GS::Optional<GS::UniString> ValidateMutationItems (
     GS::Array<API_Guid> seenGuids;
     for (const GS::ObjectState& item : items) {
         if (operation == "create") {
+            if (!HasOnlyObjectStateFields (item, { "payload", "placement", "cloneSourceElementId", "historySnapshotRef" }))
+                return GS::UniString ("CREATE items accept only payload, placement and one source reference.");
             if (item.Get ("elementId") != nullptr || item.Get ("payload") == nullptr)
                 return GS::UniString ("CREATE items require payload and must not contain elementId.");
+            const GS::ObjectState* payload = item.Get ("payload");
+            if (payload != nullptr && (payload->Contains ("storyIndex") || payload->Contains ("floorIndex") || payload->Contains ("floorInd")))
+                return GS::UniString ("storyIndex is read-only evidence and cannot appear in a CREATE payload.");
             if (item.Get ("patch") != nullptr || item.Get ("expectedFingerprint") != nullptr)
                 return GS::UniString ("CREATE items accept only a typed payload and an optional source.");
             const bool hasClone = item.Get ("cloneSourceElementId") != nullptr;
@@ -1830,6 +3400,10 @@ GS::Optional<GS::UniString> ValidateMutationItems (
                     return GS::UniString ("historySnapshotRef must be a non-empty same-file receipt reference.");
             }
         } else {
+            if (operation == "update" && !HasOnlyObjectStateFields (item, { "elementId", "expectedFingerprint", "patch" }))
+                return GS::UniString ("UPDATE items accept only elementId, expectedFingerprint and patch.");
+            if (operation == "delete" && !HasOnlyObjectStateFields (item, { "elementId", "expectedFingerprint" }))
+                return GS::UniString ("DELETE items accept only elementId and expectedFingerprint.");
             const GS::ObjectState* id = item.Get ("elementId");
             if (id == nullptr || GetGuidFromObjectState (*id) == APINULLGuid)
                 return GS::UniString ("UPDATE/DELETE items require a valid elementId.");
@@ -1844,6 +3418,10 @@ GS::Optional<GS::UniString> ValidateMutationItems (
                 return GS::UniString ("expectedFingerprint must be a 64-hex native fingerprint.");
             if (operation == "update" && item.Get ("patch") == nullptr)
                 return GS::UniString ("UPDATE items require a sparse patch.");
+            const GS::ObjectState* patch = item.Get ("patch");
+            if (operation == "update" && patch != nullptr
+                && (patch->Contains ("storyIndex") || patch->Contains ("floorIndex") || patch->Contains ("floorInd")))
+                return GS::UniString ("storyIndex is read-only evidence and cannot appear in an UPDATE patch.");
             if (operation == "update" && item.Get ("payload") != nullptr)
                 return GS::UniString ("UPDATE items use patch, not payload.");
             if (operation == "delete" && (item.Get ("patch") != nullptr || item.Get ("payload") != nullptr))
@@ -1895,16 +3473,27 @@ GS::ObjectState GetNativeCrudCapabilitiesCommand::Execute (const GS::ObjectState
             "update", true,
             "delete", true));
         type.Add ("read", true);
-        const bool validatedWriter = GS::UniString (typeName) == "Wall" || GS::UniString (typeName) == "Text";
+        const bool columnCandidateWriter = GS::UniString (typeName) == "Column" && TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS;
+        const bool lineCandidateWriter = GS::UniString (typeName) == "Line" && TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS;
+        const bool arcCandidateWriter = GS::UniString (typeName) == "Arc" && TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS;
+        const bool hatchCandidateWriter = GS::UniString (typeName) == "Hatch" && TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS;
+        const bool doorCandidateWriter = GS::UniString (typeName) == "Door" && TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS;
+        const bool windowCandidateWriter = GS::UniString (typeName) == "Window" && TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS;
+        const bool doorVerifiedWriter = GS::UniString (typeName) == "Door" && !TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS;
+        const bool windowVerifiedWriter = GS::UniString (typeName) == "Window" && !TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS;
+        const bool lineVerifiedWriter = GS::UniString (typeName) == "Line" && !TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS;
+        const bool arcVerifiedWriter = GS::UniString (typeName) == "Arc" && !TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS;
+        const bool hatchVerifiedWriter = GS::UniString (typeName) == "Hatch" && !TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS;
+        const bool validatedWriter = GS::UniString (typeName) == "Wall" || GS::UniString (typeName) == "Text" || GS::UniString (typeName) == "Zone" || GS::UniString (typeName) == "Column" || lineVerifiedWriter || arcVerifiedWriter || hatchVerifiedWriter || doorVerifiedWriter || windowVerifiedWriter;
         const bool updateValidatedWriter = validatedWriter || GS::UniString (typeName) == "Column";
-        type.Add ("create", validatedWriter);
-        type.Add ("update", updateValidatedWriter);
+        type.Add ("create", validatedWriter || columnCandidateWriter || lineCandidateWriter || arcCandidateWriter || hatchCandidateWriter || doorCandidateWriter || windowCandidateWriter);
+        type.Add ("update", updateValidatedWriter || columnCandidateWriter || lineCandidateWriter || arcCandidateWriter || hatchCandidateWriter || doorCandidateWriter || windowCandidateWriter);
         type.Add ("delete", true);
-        type.Add ("writerStatus", GS::UniString (typeName) == "Column" ? "update_validated_create_unavailable" : validatedWriter ? "validated" : "read_only_until_memo_writer_gate");
+        type.Add ("writerStatus", columnCandidateWriter ? "column_candidate" : lineCandidateWriter ? "line_candidate" : arcCandidateWriter ? "arc_candidate" : hatchCandidateWriter ? "hatch_candidate" : doorCandidateWriter ? "door_candidate" : windowCandidateWriter ? "window_candidate" : validatedWriter ? "validated" : "read_only_until_memo_writer_gate");
         type.Add ("capabilityState", GS::ObjectState (
-            "create", validatedWriter ? "verified" : "unavailable",
+            "create", (columnCandidateWriter || lineCandidateWriter || arcCandidateWriter || hatchCandidateWriter || doorCandidateWriter || windowCandidateWriter) ? "candidate" : validatedWriter ? "verified" : "unavailable",
             "read", "verified",
-            "update", updateValidatedWriter ? "verified" : "unavailable",
+            "update", (columnCandidateWriter || lineCandidateWriter || arcCandidateWriter || hatchCandidateWriter || doorCandidateWriter || windowCandidateWriter) ? "candidate" : updateValidatedWriter ? "verified" : "unavailable",
             "delete", "verified"));
         AddCanonicalWritableFields (type, GS::UniString (typeName));
         elementTypes (type);
@@ -1992,25 +3581,75 @@ GS::ObjectState DiscoverNativeElementsCommand::Execute (const GS::ObjectState& p
         if (!IsSupportedNativeType (typeID)) return CreateErrorResponse (APIERR_BADPARS, "Unsupported native elementType.");
     }
 
+    double minX = 0.0;
+    double minY = 0.0;
+    double maxX = 0.0;
+    double maxY = 0.0;
     GS::Array<GS::ObjectState> ids;
     if (hasBounds) {
         const GS::ObjectState* bounds = parameters.Get ("bounds");
         if (bounds == nullptr)
             return CreateErrorResponse (APIERR_BADPARS, "bounds is unavailable.");
-        double minX = 0.0;
-        double minY = 0.0;
-        double maxX = 0.0;
-        double maxY = 0.0;
         if (!bounds->Get ("minX", minX) || !bounds->Get ("minY", minY) ||
             !bounds->Get ("maxX", maxX) || !bounds->Get ("maxY", maxY))
             return CreateErrorResponse (APIERR_BADPARS, "bounds requires numeric minX, minY, maxX and maxY.");
+        if (!IsFiniteOrderedDiscoveryBounds (minX, minY, maxX, maxY))
+            return CreateErrorResponse (APIERR_BADPARS, "bounds must be finite and ordered.");
         GS::ObjectState rectParameters;
         rectParameters.Add ("bounds", GS::ObjectState (
             "xMin", minX, "yMin", minY,
             "xMax", maxX, "yMax", maxY));
         rectParameters.Add ("multiStory", true);
+        rectParameters.Add ("pageSize", static_cast<Int32> (MaxDiscoveryCandidates));
         const GS::ObjectState rectResult = GetElementsInRectCommand ().Execute (rectParameters, processControl);
-        rectResult.Get ("elements", ids);
+        if (rectResult.Get ("error") != nullptr)
+            return rectResult;
+        bool rawPageRequired = false;
+        rectResult.Get ("pageRequired", rawPageRequired);
+        if (rawPageRequired)
+            return CreateErrorResponse (APIERR_BADPARS, "NARROW_SCOPE_REQUIRED: bounded discovery exceeded the finite raw-candidate limit.");
+        if (!rectResult.Get ("elements", ids))
+            return CreateErrorResponse (APIERR_BADPARS, "Bounded discovery did not return an element-reference list.");
+        if (ids.GetSize () > MaxDiscoveryCandidates)
+            return CreateErrorResponse (APIERR_BADPARS, "NARROW_SCOPE_REQUIRED: bounded discovery exceeded the finite raw-candidate limit.");
+
+        // GetElementsInRect returns every element type intersecting the
+        // rectangle. Apply exact type/story and native element bounds before
+        // the 100-reference cap or exact snapshot reads, so unrelated types
+        // and marquee false positives cannot crowd out the requested scope.
+        GS::Array<GS::ObjectState> scopedIds;
+        GS::Array<API_Guid> seenGuids;
+        for (const GS::ObjectState& id : ids) {
+            const API_Guid guid = GetRequestedElementGuid (id);
+            if (guid == APINULLGuid)
+                return CreateErrorResponse (APIERR_BADPARS, "Bounded discovery returned an invalid element GUID.");
+            if (seenGuids.Contains (guid))
+                continue;
+
+            API_Elem_Head header = {};
+            header.guid = guid;
+            const GSErrCode headerError = ACAPI_Element_GetHeader (&header);
+            if (headerError != NoError)
+                return CreateErrorResponse (headerError, "Bounded discovery could not verify a candidate element header; coverage is incomplete.");
+            seenGuids.Push (guid);
+
+            if (!typeName.IsEmpty () && GetElemTypeId (header) != typeID)
+                continue;
+            if (hasStory && static_cast<Int32> (header.floorInd) != storyIndex)
+                continue;
+
+            API_Box3D elementBounds = {};
+            const GSErrCode boundsError = ACAPI_Element_CalcBounds (&header, &elementBounds);
+            if (boundsError != NoError || !IsFiniteOrderedDiscoveryBounds (
+                    elementBounds.xMin, elementBounds.yMin, elementBounds.xMax, elementBounds.yMax))
+                return CreateErrorResponse (boundsError != NoError ? boundsError : APIERR_BADPARS,
+                    "Bounded discovery could not verify finite native bounds for a candidate; coverage is incomplete.");
+            if (!DiscoveryBoundsIntersect (elementBounds.xMin, elementBounds.yMin, elementBounds.xMax, elementBounds.yMax,
+                    minX, minY, maxX, maxY))
+                continue;
+            scopedIds.Push (id);
+        }
+        ids = scopedIds;
     } else {
         GS::ObjectState listParameters;
         if (!typeName.IsEmpty ()) listParameters.Add ("elementType", typeName);
@@ -2025,13 +3664,32 @@ GS::ObjectState DiscoverNativeElementsCommand::Execute (const GS::ObjectState& p
     bool complete = false;
     const GS::UniString scope = CurrentSoloFileScope ().Get ();
     GS::ObjectState snapshots = ExactSnapshots (ids, scope, processControl, complete);
+    if (snapshots.Get ("error") != nullptr)
+        return snapshots;
     GS::Array<GS::ObjectState> snapshotRows;
-    snapshots.Get ("elements", snapshotRows);
+    if (!snapshots.Get ("elements", snapshotRows))
+        return CreateErrorResponse (APIERR_BADPARS, "Exact discovery snapshots did not return an element list.");
     GS::ObjectState filtered;
     const auto& elements = filtered.AddList<GS::ObjectState> ("elements");
     for (const GS::ObjectState& snapshot : snapshotRows) {
+        GS::UniString snapshotType;
+        if (!typeName.IsEmpty () && (!snapshot.Get ("elementType", snapshotType) || snapshotType != typeName))
+            return CreateErrorResponse (APIERR_BADID, "An exact discovery snapshot does not match the requested elementType.");
         Int32 snapshotStory = 0;
-        if (hasStory && (!snapshot.Get ("storyIndex", snapshotStory) || snapshotStory != storyIndex)) continue;
+        if (hasStory && (!snapshot.Get ("storyIndex", snapshotStory) || snapshotStory != storyIndex))
+            return CreateErrorResponse (APIERR_BADID, "An exact discovery snapshot does not match the requested storyIndex.");
+        if (hasBounds) {
+            const GS::ObjectState* snapshotBounds = snapshot.Get ("bounds");
+            double snapshotMinX = 0.0;
+            double snapshotMinY = 0.0;
+            double snapshotMaxX = 0.0;
+            double snapshotMaxY = 0.0;
+            if (snapshotBounds == nullptr || !snapshotBounds->Get ("minX", snapshotMinX) || !snapshotBounds->Get ("minY", snapshotMinY) ||
+                !snapshotBounds->Get ("maxX", snapshotMaxX) || !snapshotBounds->Get ("maxY", snapshotMaxY) ||
+                !IsFiniteOrderedDiscoveryBounds (snapshotMinX, snapshotMinY, snapshotMaxX, snapshotMaxY) ||
+                !DiscoveryBoundsIntersect (snapshotMinX, snapshotMinY, snapshotMaxX, snapshotMaxY, minX, minY, maxX, maxY))
+                return CreateErrorResponse (APIERR_BADID, "An exact discovery snapshot is missing finite bounds inside the requested rectangle.");
+        }
         elements (snapshot);
     }
     filtered.Add ("complete", complete);
@@ -2129,7 +3787,7 @@ GS::ObjectState MutateNativeElementsCommand::Execute (const GS::ObjectState& par
     if (scopeError.HasValue ()) return ScopeError (scopeError);
     GS::UniString contract;
     if (!parameters.Get ("contractVersion", contract) || contract != ContractVersion)
-        return CreateErrorResponse (APIERR_BADPARS, "contractVersion must be native-crud-v1.");
+        return CreateErrorResponse (APIERR_BADPARS, "contractVersion must be native-crud-v2.");
     GS::UniString operation;
     GS::UniString typeName;
     GS::UniString operationId;
@@ -2154,7 +3812,7 @@ GS::ObjectState MutateNativeElementsCommand::Execute (const GS::ObjectState& par
     const API_ElemTypeID typeID = GetElementTypeFromNonLocalizedName (typeName);
     if (!IsSupportedNativeType (typeID)) return CreateErrorResponse (APIERR_BADPARS, "Unsupported native elementType.");
     // Keep the wire vocabulary canonical at the native boundary as well.  A
-    // full Circle is exposed as Arc in native-crud-v1; accepting the alias
+    // full Circle is exposed as Arc in native-crud-v2; accepting the alias
     // here would otherwise produce a receipt whose type disagrees with its
     // snapshots and capability row.
     typeName = CanonicalElementTypeName (typeName);
@@ -2163,6 +3821,110 @@ GS::ObjectState MutateNativeElementsCommand::Execute (const GS::ObjectState& par
     if (!parameters.Get ("items", items)) return CreateErrorResponse (APIERR_BADPARS, "items is required.");
     const GS::Optional<GS::UniString> itemError = ValidateMutationItems (operation, typeName, items);
     if (itemError.HasValue ()) return ScopeError (itemError);
+    if (operation == "create") {
+        const GS::Optional<GS::UniString> placementError = ValidateNativeCreatePlacement (typeName, items);
+        if (placementError.HasValue ()) return ScopeError (placementError);
+    }
+    if (typeID == API_ZoneID && semanticMetadata != nullptr) {
+        bool faultRequested = false;
+        if (semanticMetadata->Get ("nativeCrudTestFaultAfterFirstApplied", faultRequested)
+            && faultRequested && !HasZoneCandidateWriterGate (semanticMetadata))
+            return CreateErrorResponse (APIERR_BADPARS, "Zone test fault metadata requires an exact candidate writer request.");
+    }
+    if (typeID == API_ColumnID && semanticMetadata != nullptr) {
+        bool faultRequested = false;
+        if (semanticMetadata->Get ("nativeCrudTestFaultAfterFirstApplied", faultRequested)
+            && faultRequested && !HasZoneCandidateWriterMetadataMarker (semanticMetadata))
+            return CreateErrorResponse (APIERR_BADPARS, "Column test fault metadata requires an exact candidate writer request.");
+    }
+    if (typeID == API_LineID && semanticMetadata != nullptr) {
+        bool faultRequested = false;
+        if (semanticMetadata->Get ("nativeCrudTestFaultAfterFirstApplied", faultRequested)
+            && faultRequested && !HasZoneCandidateWriterMetadataMarker (semanticMetadata))
+            return CreateErrorResponse (APIERR_BADPARS, "Line test fault metadata requires an exact candidate writer request.");
+    }
+    if (typeID == API_ZoneID && (operation == "create" || operation == "update")) {
+        const GS::Optional<GS::UniString> typedError = ValidateZoneTypedWriter (operation, items);
+        if (typedError.HasValue ())
+            return CreateErrorResponse (APIERR_BADPARS, typedError.Get ());
+    }
+    if (typeID == API_ZoneID && HasZoneCandidateWriterMetadataMarker (semanticMetadata)) {
+        const GS::Optional<GS::UniString> candidateError = ValidateZoneCandidateWriter (operation, operationId, CurrentSoloFileScope ().Get (), items, semanticMetadata);
+        if (candidateError.HasValue ())
+            return CreateErrorResponse (APIERR_BADPARS, candidateError.Get ());
+    }
+    if (typeID == API_ColumnID && HasZoneCandidateWriterMetadataMarker (semanticMetadata)) {
+        const GS::Optional<GS::UniString> candidateError = ValidateColumnCandidateWriter (operation, operationId, CurrentSoloFileScope ().Get (), items, semanticMetadata);
+        if (candidateError.HasValue ())
+            return CreateErrorResponse (APIERR_BADPARS, candidateError.Get ());
+    }
+    if (typeID == API_LineID && (operation == "create" || operation == "update")) {
+#if TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS
+        // Candidate APXs must never dispatch an unmarked Line write. Run the
+        // exact case/scope/field/GUID validator even when semanticMetadata or
+        // its writer marker is absent.
+        const GS::Optional<GS::UniString> candidateError = ValidateLineCandidateWriter (operation, operationId, CurrentSoloFileScope ().Get (), items, semanticMetadata);
+        if (candidateError.HasValue ()) return CreateErrorResponse (APIERR_BADPARS, candidateError.Get ());
+#else
+        // Preserve the ordinary route, but do not let candidate metadata make
+        // a developer-only writer available in an ordinary APX.
+        if (HasZoneCandidateWriterMetadataMarker (semanticMetadata)) {
+            const GS::Optional<GS::UniString> candidateError = ValidateLineCandidateWriter (operation, operationId, CurrentSoloFileScope ().Get (), items, semanticMetadata);
+            if (candidateError.HasValue ()) return CreateErrorResponse (APIERR_BADPARS, candidateError.Get ());
+        }
+#endif
+    }
+    if (typeID == API_ArcID && (operation == "create" || operation == "update")) {
+#if TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS
+        // Candidate APXs must reject every unmarked Arc write before it can
+        // enter the shared typed MutateElements executor.
+        const GS::Optional<GS::UniString> candidateError = ValidateArcCandidateWriter (operation, operationId, CurrentSoloFileScope ().Get (), items, semanticMetadata);
+        if (candidateError.HasValue ()) return CreateErrorResponse (APIERR_BADPARS, candidateError.Get ());
+#else
+        // Candidate metadata never opens the writer in an ordinary APX. The
+        // proven Arc fields use the same typed payload validation and native
+        // undoable dispatcher as the candidate profile.
+        if (HasZoneCandidateWriterMetadataMarker (semanticMetadata))
+            return CreateErrorResponse (APIERR_BADPARS, "Arc candidate metadata is unavailable in this ordinary APX build.");
+        const GS::Optional<GS::UniString> typedError = ValidateArcTypedPayloads (operation, items, nullptr, nullptr);
+        if (typedError.HasValue ()) return CreateErrorResponse (APIERR_BADPARS, typedError.Get ());
+#endif
+    }
+    if (typeID == API_ArcID && semanticMetadata != nullptr) {
+        bool faultRequested = false;
+        if (semanticMetadata->Get ("nativeCrudTestFaultAfterFirstApplied", faultRequested) && faultRequested
+            && !HasZoneCandidateWriterMetadataMarker (semanticMetadata))
+            return CreateErrorResponse (APIERR_BADPARS, "Arc test fault metadata requires an exact candidate writer request.");
+    }
+    if (typeID == API_HatchID && (operation == "create" || operation == "update")) {
+#if TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS
+        // Candidate builds enforce exact case metadata before the shared
+        // typed writer. The same writer is ordinary-enabled below the
+        // capability boundary when candidate mode is compiled out.
+        const GS::Optional<GS::UniString> candidateError = ValidateHatchCandidateWriter (
+            operation, operationId, CurrentSoloFileScope ().Get (), items, semanticMetadata);
+        if (candidateError.HasValue ())
+            return CreateErrorResponse (APIERR_BADPARS, candidateError.Get ());
+#else
+        if (semanticMetadata != nullptr
+            && (semanticMetadata->Contains ("nativeCandidateWriter")
+                || semanticMetadata->Contains ("nativeCandidateCaseId")
+                || semanticMetadata->Contains ("nativeCandidateOperationId")
+                || semanticMetadata->Contains ("nativeCandidateScopeKey")
+                || semanticMetadata->Contains ("nativeCandidateFields")
+                || semanticMetadata->Contains ("nativeCandidateGuids")
+                || semanticMetadata->Contains ("nativeCrudTestFaultAfterFirstApplied")))
+            return CreateErrorResponse (APIERR_BADPARS, "Candidate Hatch metadata is unavailable in this ordinary APX build.");
+        const GS::Optional<GS::UniString> typedError = ValidateHatchTypedPayloads (operation, items);
+        if (typedError.HasValue ()) return CreateErrorResponse (APIERR_BADPARS, typedError.Get ());
+#endif
+    }
+    if (typeID == API_HatchID && semanticMetadata != nullptr) {
+        bool faultRequested = false;
+        if (semanticMetadata->Get ("nativeCrudTestFaultAfterFirstApplied", faultRequested) && faultRequested
+            && !HasZoneCandidateWriterMetadataMarker (semanticMetadata))
+            return CreateErrorResponse (APIERR_BADPARS, "Hatch test fault metadata requires an exact candidate writer request.");
+    }
     if (typeID == API_ZoneID && HasAnyZoneMemoWriterGate (semanticMetadata)) {
         const GS::Optional<GS::UniString> candidateError = ValidateZoneMemoWriterCandidate (operation, items, semanticMetadata);
         if (candidateError.HasValue ())
@@ -2251,7 +4013,7 @@ GS::ObjectState MutateNativeElementsCommand::Execute (const GS::ObjectState& par
             return CreateErrorResponse (APIERR_BADID, impactTypeError.Get ());
     }
 
-    const GS::ObjectState mutationResult = DispatchMutation (operation, typeName, items, processControl, semanticMetadata);
+    const GS::ObjectState mutationResult = DispatchMutation (operation, operationId, typeName, items, processControl, semanticMetadata);
     bool dispatchComplete = true;
     mutationResult.Get ("mutationComplete", dispatchComplete);
     if (mutationResult.Get ("error") != nullptr || mutationResult.Get ("transactionRolledBack") != nullptr) dispatchComplete = false;
