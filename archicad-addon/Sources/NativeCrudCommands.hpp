@@ -27,6 +27,19 @@ public:
     virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
 };
 
+// Internal exact ownership query used to close Wall mutation impact over
+// hosted Doors and Windows. This is not registered as an agent-facing MCP
+// tool; the typed TypeScript Native gateway consumes its bounded result.
+class GetNativeHostedOpeningsForWallsCommand : public CommandBase
+{
+public:
+    GetNativeHostedOpeningsForWallsCommand ();
+    virtual GS::String GetName () const override;
+    virtual GS::Optional<GS::UniString> GetInputParametersSchema () const override;
+    virtual GS::Optional<GS::UniString> GetResponseSchema () const override;
+    virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
+};
+
 class DiscoverNativeElementsCommand : public CommandBase
 {
 public:

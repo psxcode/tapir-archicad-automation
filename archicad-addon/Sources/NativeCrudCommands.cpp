@@ -3084,8 +3084,27 @@ GS::ObjectState DispatchMutation (
                 return CreateErrorResponse (APIERR_BADID, "Window DELETE requires a freshly resolved exact markerless target.");
         }
     }
-    if (operation == "delete")
-        return DeleteElementsCommand ().Execute ([&]() {
+    if (operation == "delete") {
+        // ACAPI_Element_Delete expands an exact target to its complete group
+        // when Suspend Groups is off. Native DELETE promises the requested
+        // exact GUID set, so temporarily suspend groups and restore the
+        // operator's prior mode on every exit path.
+        bool groupsWereSuspended = false;
+        GSErrCode groupModeError = TAPIR_View_IsSuspendGroupOn (&groupsWereSuspended);
+        if (groupModeError != NoError)
+            return CreateErrorResponse (groupModeError, "Failed to read the Suspend Groups mode before exact Native DELETE.");
+        bool groupModeNeedsRestore = !groupsWereSuspended;
+        if (groupModeNeedsRestore) {
+            groupModeError = TAPIR_Grouping_ChangeSuspendGroup (true);
+            if (groupModeError != NoError)
+                return CreateErrorResponse (groupModeError, "Failed to suspend groups for exact Native DELETE.");
+        }
+        const GS::OnExit groupModeGuard ([&groupModeNeedsRestore] () {
+            if (groupModeNeedsRestore)
+                TAPIR_Grouping_ChangeSuspendGroup (false);
+        });
+
+        GS::ObjectState mutationResult = DeleteElementsCommand ().Execute ([&]() {
             GS::ObjectState parameters;
             const auto& elements = parameters.AddList<GS::ObjectState> ("elements");
             for (const GS::ObjectState& item : items) {
@@ -3099,6 +3118,20 @@ GS::ObjectState DispatchMutation (
             }
             return parameters;
         } (), processControl);
+
+        // The DELETE may already be applied. Restore only the UI group mode;
+        // never retry the element command if restoration fails.
+        GSErrCode groupModeRestoreError = NoError;
+        if (groupModeNeedsRestore) {
+            groupModeRestoreError = TAPIR_Grouping_ChangeSuspendGroup (false);
+            if (groupModeRestoreError == NoError)
+                groupModeNeedsRestore = false;
+        }
+        mutationResult.Add ("groupModeRestored", groupModeRestoreError == NoError);
+        if (groupModeRestoreError != NoError)
+            mutationResult.Add ("groupModeRestoreError", groupModeRestoreError);
+        return mutationResult;
+    }
     // Reuse existing undoable typed routes for verified types and the
     // markerless Door writer. Candidate builds retain their exact disposable
     // guard before this same typed Door path.
@@ -3542,6 +3575,115 @@ GS::ObjectState GetNativeElementSnapshotsCommand::Execute (const GS::ObjectState
                 return CreateErrorResponse (APIERR_BADID, "An exact snapshot GUID does not match elementType.");
         }
     }
+    return response;
+}
+
+static GSErrCode GetNativeConnectedElements (
+    const API_Guid& ownerGuid,
+    API_ElemTypeID connectedTypeId,
+    GS::Array<API_Guid>& connectedGuids)
+{
+#if TAPIR_AC_VERSION == 25
+    // MigrationHelper maps the Grouping API name to ACAPI_Element on AC25;
+    // its variation argument has a default, so the typed ID and output list suffice.
+    return ACAPI_Grouping_GetConnectedElements (ownerGuid, connectedTypeId, &connectedGuids);
+#else
+    API_ElemType connectedType = {};
+    connectedType.typeID = connectedTypeId;
+    connectedType.variationID = APIVarId_Generic;
+    return ACAPI_Grouping_GetConnectedElements (ownerGuid, connectedType, &connectedGuids);
+#endif
+}
+
+GetNativeHostedOpeningsForWallsCommand::GetNativeHostedOpeningsForWallsCommand () : CommandBase (CommonSchema::NotUsed) {}
+GS::String GetNativeHostedOpeningsForWallsCommand::GetName () const { return "GetNativeHostedOpeningsForWalls"; }
+GS::Optional<GS::UniString> GetNativeHostedOpeningsForWallsCommand::GetInputParametersSchema () const
+{
+    return R"({"type":"object","properties":{"contractVersion":{"type":"string"},"fileScopeKey":{"type":"string"},"guids":{"type":"array","minItems":1,"maxItems":25,"items":{"type":"string"}}},"additionalProperties":false,"required":["contractVersion","fileScopeKey","guids"]})";
+}
+GS::Optional<GS::UniString> GetNativeHostedOpeningsForWallsCommand::GetResponseSchema () const { return {}; }
+GS::ObjectState GetNativeHostedOpeningsForWallsCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl& /*processControl*/) const
+{
+    const GS::Optional<GS::UniString> scopeError = ValidateScope (parameters);
+    if (scopeError.HasValue ()) return ScopeError (scopeError);
+    const GS::Optional<GS::UniString> contractError = ValidateContractVersion (parameters);
+    if (contractError.HasValue ()) return ScopeError (contractError);
+    GS::Array<GS::UniString> guidTexts;
+    const GS::Optional<GS::UniString> guidError = ReadRequestedGuids (parameters, guidTexts);
+    if (guidError.HasValue ()) return ScopeError (guidError);
+
+    GS::Array<API_Guid> requestedWalls;
+    for (const GS::UniString& text : guidTexts) {
+        const API_Guid guid = APIGuidFromString (text.ToCStr ());
+        if (requestedWalls.Contains (guid))
+            return CreateErrorResponse (APIERR_BADPARS, "Wall GUIDs must be unique.");
+        requestedWalls.Push (guid);
+    }
+
+    GS::UniString fileScopeKey;
+    if (!parameters.Get ("fileScopeKey", fileScopeKey) || fileScopeKey.IsEmpty ())
+        return CreateErrorResponse (APIERR_BADPARS, "fileScopeKey is required.");
+
+    GS::ObjectState response;
+    response.Add ("status", "success");
+    response.Add ("contractVersion", ContractVersion);
+    response.Add ("fileScopeKey", fileScopeKey);
+    bool complete = true;
+    GS::HashSet<API_Guid> seenOpenings;
+    const auto& wallOpenings = response.AddList<GS::ObjectState> ("wallOpenings");
+    for (const API_Guid& wallGuid : requestedWalls) {
+        GS::ObjectState row;
+        row.Add ("wallElementId", CreateGuidObjectState (wallGuid));
+        API_Element wall = {};
+        wall.header.guid = wallGuid;
+        GSErrCode error = ACAPI_Element_Get (&wall);
+        if (error != NoError || GetElemTypeId (wall.header) != API_WallID) {
+            row.Add ("status", "error");
+            row.Add ("error", GS::UniString::Printf ("The requested owner GUID is not a readable Wall (error %d).", error != NoError ? error : APIERR_BADID));
+            complete = false;
+            wallOpenings (row);
+            continue;
+        }
+
+        GS::Array<API_Guid> doors;
+        GS::Array<API_Guid> windows;
+        error = GetNativeConnectedElements (wallGuid, API_DoorID, doors);
+        if (error == NoError) error = GetNativeConnectedElements (wallGuid, API_WindowID, windows);
+        if (error != NoError) {
+            row.Add ("status", "error");
+            row.Add ("error", GS::UniString::Printf ("Hosted Door/Window ownership could not be read completely (error %d).", error));
+            complete = false;
+            wallOpenings (row);
+            continue;
+        }
+
+        bool openingGuidsValid = true;
+        for (const API_Guid& guid : doors) {
+            if (guid == APINULLGuid || seenOpenings.Contains (guid)) openingGuidsValid = false;
+            else seenOpenings.Add (guid);
+        }
+        for (const API_Guid& guid : windows) {
+            if (guid == APINULLGuid || seenOpenings.Contains (guid)) openingGuidsValid = false;
+            else seenOpenings.Add (guid);
+        }
+        if (!openingGuidsValid) {
+            row.Add ("status", "error");
+            row.Add ("error", "Hosted Door/Window ownership returned an invalid or duplicate GUID.");
+            complete = false;
+            wallOpenings (row);
+            continue;
+        }
+
+        const auto addGuids = [&row] (const char* field, const GS::Array<API_Guid>& guids) {
+            const auto& values = row.AddList<GS::ObjectState> (field);
+            for (const API_Guid& guid : guids) values (CreateGuidObjectState (guid));
+        };
+        addGuids ("doorGuids", doors);
+        addGuids ("windowGuids", windows);
+        row.Add ("status", "success");
+        wallOpenings (row);
+    }
+    response.Add ("complete", complete);
     return response;
 }
 
@@ -4017,6 +4159,17 @@ GS::ObjectState MutateNativeElementsCommand::Execute (const GS::ObjectState& par
     bool dispatchComplete = true;
     mutationResult.Get ("mutationComplete", dispatchComplete);
     if (mutationResult.Get ("error") != nullptr || mutationResult.Get ("transactionRolledBack") != nullptr) dispatchComplete = false;
+    // Exact Native DELETE must not be reported complete if restoring the
+    // operator's prior Suspend Groups mode failed.  The element mutation may
+    // already be applied, so retain its factual readback/receipt and never
+    // retry the element command; only mark acceptance incomplete.
+    if (mutationResult.Contains ("groupModeRestored")) {
+        bool groupModeRestored = false;
+        if (!mutationResult.Get ("groupModeRestored", groupModeRestored) || !groupModeRestored)
+            dispatchComplete = false;
+    }
+    if (mutationResult.Contains ("groupModeRestoreError"))
+        dispatchComplete = false;
 
     GS::Array<GS::ObjectState> afterIds = requestedIds;
     bool createIdsComplete = operation != "create";

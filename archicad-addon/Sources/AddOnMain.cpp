@@ -602,6 +602,10 @@ GSErrCode Initialize (void)
             elementCommands, "1.0.0",
             "Returns exact canonical native snapshots for a bounded list of GUIDs."
         );
+        err |= RegisterCommand<GetNativeHostedOpeningsForWallsCommand> (
+            elementCommands, "1.0.0",
+            "Returns exact hosted Door and Window ownership for a bounded list of Wall GUIDs."
+        );
 #if TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS
         err |= RegisterCommand<GetNativeArcDrawingPrimitivesCommand> (
             elementCommands, "1.0.0",
