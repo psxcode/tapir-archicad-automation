@@ -232,6 +232,118 @@ public:
     virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
 };
 
+// Complete, exact-GUID, read-only dimension-family snapshot. Kept additive to
+// the historical GetDimensionData response used by older Tapir clients.
+class GetNativeDimensionDetailsCommand : public CommandBase
+{
+public:
+    GetNativeDimensionDetailsCommand ();
+    virtual GS::String GetName () const override;
+    virtual GS::Optional<GS::UniString> GetInputParametersSchema () const override;
+    virtual GS::Optional<GS::UniString> GetResponseSchema () const override;
+    virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
+};
+
+// Pure fixed-input UTF-8 construction proof shared with the internal fixture
+// creator; accepts no request values and performs no project/API mutation.
+class GetNativeDimensionFixtureInputProofCommand : public CommandBase
+{
+public:
+    GetNativeDimensionFixtureInputProofCommand ();
+    virtual GS::String GetName () const override;
+    virtual GS::Optional<GS::UniString> GetInputParametersSchema () const override;
+    virtual GS::Optional<GS::UniString> GetResponseSchema () const override;
+    virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
+};
+
+// Private read-only context attestation for the disabled fixed Dimension
+// candidate producer. It never activates a window, story, or database.
+class GetNativeDimensionCreateCandidateContextCommand : public CommandBase
+{
+public:
+	GetNativeDimensionCreateCandidateContextCommand ();
+	virtual GS::String GetName () const override;
+	virtual GS::Optional<GS::UniString> GetInputParametersSchema () const override;
+	virtual GS::Optional<GS::UniString> GetResponseSchema () const override;
+	virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
+};
+
+// Internal fixed-recipe branch called only by MutateNativeElements in an
+// isolated native candidate profile. It is not registered as an MCP tool.
+GS::ObjectState ExecuteNativeDimensionCreateCandidate (const GS::ObjectState& parameters, GS::ProcessControl& processControl);
+
+// Internal, exact-scope read-only probe of radial dimension SDK defaults.
+// The result is explicitly tool defaults, not an existing element snapshot.
+class GetNativeDimensionRadialDefaultsCommand : public CommandBase
+{
+public:
+    GetNativeDimensionRadialDefaultsCommand ();
+    virtual GS::String GetName () const override;
+    virtual GS::Optional<GS::UniString> GetInputParametersSchema () const override;
+    virtual GS::Optional<GS::UniString> GetResponseSchema () const override;
+    virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
+};
+
+// Internal, exact-scope READ-only probe of hotspots returned for one exact Arc.
+// It reports SDK neigs and conversions without admitting a dimension anchor.
+class GetNativeDimensionArcHotspotsCommand : public CommandBase
+{
+public:
+    GetNativeDimensionArcHotspotsCommand ();
+    virtual GS::String GetName () const override;
+    virtual GS::Optional<GS::UniString> GetInputParametersSchema () const override;
+    virtual GS::Optional<GS::UniString> GetResponseSchema () const override;
+    virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
+};
+
+// Internal, exact-scope read-only observations of dimension-parent drawing
+// text primitives and version-gated autotext candidate metadata.
+class GetNativeDimensionParentDrawingRunsCommand : public CommandBase
+{
+public:
+    GetNativeDimensionParentDrawingRunsCommand ();
+    virtual GS::String GetName () const override;
+    virtual GS::Optional<GS::UniString> GetInputParametersSchema () const override;
+    virtual GS::Optional<GS::UniString> GetResponseSchema () const override;
+    virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
+};
+
+// Private bounded selected-rectangle inventory and full-parent dimension
+// audit capture. This is not the public complete-audit capability.
+class GetNativeDimensionAuditCaptureCommand : public CommandBase
+{
+public:
+	GetNativeDimensionAuditCaptureCommand ();
+	virtual GS::String GetName () const override;
+	virtual GS::Optional<GS::UniString> GetInputParametersSchema () const override;
+	virtual GS::Optional<GS::UniString> GetResponseSchema () const override;
+	virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
+};
+
+// Internal, process-local staged layer visibility/lock inventory control for
+// disposable dimension fixture qualification. Not a public mutation surface.
+class NativeDimensionLayerControlCommand : public CommandBase
+{
+public:
+	NativeDimensionLayerControlCommand ();
+	virtual GS::String GetName () const override;
+	virtual GS::Optional<GS::UniString> GetInputParametersSchema () const override;
+	virtual GS::Optional<GS::UniString> GetResponseSchema () const override;
+	virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
+};
+
+// Internal, fixed-preset fixture preparation for disposable dimension reads.
+// Deliberately not wired into any public CRUD or MCP capability surface.
+class CreateNativeDimensionReadFixturesCommand : public CommandBase
+{
+public:
+    CreateNativeDimensionReadFixturesCommand ();
+    virtual GS::String GetName () const override;
+    virtual GS::Optional<GS::UniString> GetInputParametersSchema () const override;
+    virtual GS::Optional<GS::UniString> GetResponseSchema () const override;
+    virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
+};
+
 class ModifyMeshesCommand : public CommandBase
 {
 public:

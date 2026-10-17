@@ -527,6 +527,45 @@ GSErrCode Initialize (void)
             elementCommands, "1.5.0",
             "Gets witness point data (coordinates, measured values) from existing dimension chains."
         );
+        // Retained for developer fixture capture/raw-readback compatibility.
+        // Production NativeLayer exact reads route through the scoped canonical
+        // GetNativeElementSnapshots command instead.
+        err |= RegisterCommand<GetNativeDimensionDetailsCommand> (
+            elementCommands, "1.5.0",
+            "Internal versioned exact-GUID dimension detail reader."
+        );
+        err |= RegisterCommand<GetNativeDimensionFixtureInputProofCommand> (
+            elementCommands, "1.5.0",
+            "Internal fixed UTF-8 construction proof for native dimension fixture input."
+        );
+        err |= RegisterCommand<GetNativeDimensionCreateCandidateContextCommand> (
+            elementCommands, "1.5.0",
+            "Internal read-only context and compiled-policy attestation for the disabled fixed Dimension candidate producer."
+        );
+        err |= RegisterCommand<GetNativeDimensionRadialDefaultsCommand> (
+            elementCommands, "1.5.0",
+            "Internal read-only, exact-scope diagnostic of RadialDimension SDK defaults."
+        );
+        err |= RegisterCommand<GetNativeDimensionArcHotspotsCommand> (
+            elementCommands, "1.5.0",
+            "Internal read-only diagnostic of SDK-returned Arc hotspots and NeigToCoord results."
+        );
+        err |= RegisterCommand<GetNativeDimensionParentDrawingRunsCommand> (
+            elementCommands, "1.5.0",
+            "Internal read-only diagnostic of exact dimension-parent drawing text runs and autotext candidates."
+        );
+        err |= RegisterCommand<GetNativeDimensionAuditCaptureCommand> (
+            elementCommands, "1.5.0",
+            "Internal fixed-scope read-only dimension audit capture; not a public complete-audit capability."
+        );
+        err |= RegisterCommand<NativeDimensionLayerControlCommand> (
+            elementCommands, "1.5.0",
+            "Internal staged private layer-inventory fixture control for disposable dimension qualification."
+        );
+        err |= RegisterCommand<CreateNativeDimensionReadFixturesCommand> (
+            elementCommands, "1.5.0",
+            "Internal fixed-preset disposable fixture preparation for native dimension read qualification."
+        );
         err |= RegisterCommand<CreateZonesCommand> (
             elementCommands, "1.1.8",
             "Creates Zone elements based on the given parameters."

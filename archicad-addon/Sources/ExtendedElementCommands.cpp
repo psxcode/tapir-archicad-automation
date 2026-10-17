@@ -3,6 +3,15 @@
 #include "MigrationHelper.hpp"
 #include "NotificationCommands.hpp"
 #include "NativeOwnership.hpp"
+#include "ObjectStateJSONConversion.hpp"
+#include "NativeDimensionFacts.hpp"
+#include "NativeDimensionAuditPolicy.hpp"
+#include "NativeDimensionLayerControlPolicy.hpp"
+#include "NativeDimensionUtf16.hpp"
+#include "NativeDimensionCreateWire.hpp"
+#include "NativeDimensionCreateWireObjectState.hpp"
+#include "NativeDimensionCreateCandidateFacts.hpp"
+#include "GSProcessControl.hpp"
 
 #ifdef ServerMainVers_2900
 #include	"ACAPI/Element/Opening/OpeningDefault.hpp"
@@ -11,12 +20,38 @@
 #endif
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <cctype>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
+#include <cstdint>
+#include <cstring>
+#include <iomanip>
 #include <limits>
+#include <memory>
+#include <map>
+#include <numeric>
+#include <new>
+#include <set>
+#include <sstream>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#ifndef TAPIR_ENABLE_NATIVE_DIMENSION_CREATE_CANDIDATE
+#define TAPIR_ENABLE_NATIVE_DIMENSION_CREATE_CANDIDATE 0
+#endif
+#ifndef TAPIR_ENABLE_NATIVE_DIMENSION_CREATE_POST_CREATE_FAULT
+#define TAPIR_ENABLE_NATIVE_DIMENSION_CREATE_POST_CREATE_FAULT 0
+#endif
 
 namespace {
 
 constexpr double DegreesToRadians = 3.14159265358979323846 / 180.0;
+
+using NativeDimensionFacts::NativeDimensionFactualFingerprint;
 
 enum class StructureSelectionKind {
     Unspecified,
@@ -1125,6 +1160,1534 @@ GS::ObjectState CreateElementListResponse (const GS::Array<GS::ObjectState>& ele
     }
     return response;
 }
+
+std::set<std::string> gUsedNativeDimensionFixtureNonces;
+
+std::string FixtureUtf8 (const GS::UniString& value)
+{
+    return std::string (value.ToCStr (CC_UTF8).Get ());
+}
+
+std::string FixtureByteHex (const std::string& bytes)
+{
+    static const char hexDigits[] = "0123456789ABCDEF";
+    std::string result;
+    result.reserve (bytes.size () * 2);
+    for (unsigned char byte : bytes) {
+        result.push_back (hexDigits[byte >> 4]);
+        result.push_back (hexDigits[byte & 0x0F]);
+    }
+    return result;
+}
+
+bool BuildNativeDimensionFixtureInputProof (GS::ObjectState& proof, GS::UniString& longUnicodeNote, GS::UniString& linearUnicodeNote)
+{
+    // Explicit UTF-8 bytes keep these fixed values independent of the source
+    // file/compiler charset.  This proof describes only input construction.
+    const char* const longUnicodeNoteUtf8 =
+        "\xD0\x9F\xD1\x80\xD0\xBE\xD0\xB2\xD0\xB5\xD1\x80\xD0\xBA\xD0\xB0 Unicode \xD0\xB7\xD0\xB0\xD0\xBC\xD0\xB5\xD1\x82\xD0\xBA\xD0\xB8 \xE2\x80\x94 \xD0\xB4\xD0\xBB\xD0\xB8\xD0\xBD\xD0\xBD\xD1\x8B\xD0\xB9 \xD0\xBF\xD0\xBE\xD0\xBB\xD0\xBD\xD1\x8B\xD0\xB9 \xD1\x82\xD0\xB5\xD0\xBA\xD1\x81\xD1\x82 \xD0\xB4\xD0\xBB\xD1\x8F \xD0\xBE\xD0\xBF\xD1\x80\xD0\xB5\xD0\xB4\xD0\xB5\xD0\xBB\xD0\xB5\xD0\xBD\xD0\xB8\xD1\x8F \xD1\x82\xD0\xBE\xD1\x87\xD0\xBD\xD0\xBE\xD0\xB3\xD0\xBE \xD1\x81\xD0\xBE\xD1\x85\xD1\x80\xD0\xB0\xD0\xBD\xD0\xB5\xD0\xBD\xD0\xB8\xD1\x8F \xD0\xB8\xD1\x81\xD1\x85\xD0\xBE\xD0\xB4\xD0\xBD\xD0\xBE\xD0\xB3\xD0\xBE \xD1\x81\xD0\xBE\xD0\xB4\xD0\xB5\xD1\x80\xD0\xB6\xD0\xB8\xD0\xBC\xD0\xBE\xD0\xB3\xD0\xBE \xD0\xB1\xD0\xB5\xD0\xB7 \xD1\x83\xD1\x81\xD0\xB5\xD1\x87\xD0\xB5\xD0\xBD\xD0\xB8\xD1\x8F";
+    const char* const linearUnicodeNoteUtf8 = "\xD0\x9F\xD1\x80\xD0\xB8\xD0\xBC\xD0\xB5\xD1\x87\xD0\xB0\xD0\xBD\xD0\xB8\xD0\xB5 \xE2\x80\x94 \xD1\x80\xD0\xB0\xD0\xB7\xD0\xBC\xD0\xB5\xD1\x80";
+    longUnicodeNote = GS::UniString (longUnicodeNoteUtf8, CC_UTF8);
+    linearUnicodeNote = GS::UniString (linearUnicodeNoteUtf8, CC_UTF8);
+    const std::string longUnicodeBytes (longUnicodeNoteUtf8);
+    const std::string linearUnicodeBytes (linearUnicodeNoteUtf8);
+    const std::string longUnicodeHex = FixtureByteHex (FixtureUtf8 (longUnicodeNote));
+    const std::string linearUnicodeHex = FixtureByteHex (FixtureUtf8 (linearUnicodeNote));
+    const bool verified = FixtureUtf8 (longUnicodeNote) == longUnicodeBytes
+        && FixtureUtf8 (linearUnicodeNote) == linearUnicodeBytes;
+
+    proof.Add ("schemaVersion", "native-dimension-fixture-input-proof/v1");
+    proof.Add ("status", verified ? "verified-fixed-input-construction" : "encoding-mismatch-before-create");
+    proof.Add ("meaning", "requested-fixture-input-only-not-readback-or-source");
+    const auto& inputs = proof.AddList<GS::ObjectState> ("inputs");
+    inputs (GS::ObjectState ("field", "longUnicodeNote", "value", longUnicodeNote,
+        "encoding", "UTF-8", "utf8ByteHex", GS::UniString (longUnicodeHex.c_str (), CC_UTF8),
+        "byteLength", static_cast<Int32> (FixtureUtf8 (longUnicodeNote).size ())));
+    inputs (GS::ObjectState ("field", "linearUnicodeNote", "value", linearUnicodeNote,
+        "encoding", "UTF-8", "utf8ByteHex", GS::UniString (linearUnicodeHex.c_str (), CC_UTF8),
+        "byteLength", static_cast<Int32> (FixtureUtf8 (linearUnicodeNote).size ())));
+    return verified;
+}
+
+struct PreparedNonradialFixtureDefaults {
+	API_Element linear = {};
+	API_Element angle = {};
+	API_Element levelSingle = {};
+	API_Element levelTwo = {};
+	API_ElementMemo linearMemo = {};
+	API_ElementMemo angleMemo = {};
+	API_ElementMemo levelSingleMemo = {};
+	API_ElementMemo levelTwoMemo = {};
+	bool prepared = false;
+
+	~PreparedNonradialFixtureDefaults ()
+	{
+		ACAPI_DisposeElemMemoHdls (&linearMemo);
+		ACAPI_DisposeElemMemoHdls (&angleMemo);
+		ACAPI_DisposeElemMemoHdls (&levelSingleMemo);
+		ACAPI_DisposeElemMemoHdls (&levelTwoMemo);
+	}
+	PreparedNonradialFixtureDefaults () = default;
+	PreparedNonradialFixtureDefaults (const PreparedNonradialFixtureDefaults&) = delete;
+	PreparedNonradialFixtureDefaults& operator= (const PreparedNonradialFixtureDefaults&) = delete;
+};
+
+struct PreparedLinearStaticFixtureDefaults {
+	API_Element linear = {};
+	API_ElementMemo memo = {};
+	bool prepared = false;
+
+	~PreparedLinearStaticFixtureDefaults () { ACAPI_DisposeElemMemoHdls (&memo); }
+	PreparedLinearStaticFixtureDefaults () = default;
+	PreparedLinearStaticFixtureDefaults (const PreparedLinearStaticFixtureDefaults&) = delete;
+	PreparedLinearStaticFixtureDefaults& operator= (const PreparedLinearStaticFixtureDefaults&) = delete;
+};
+
+bool ReadNonradialFixtureDefaultNotePointerFacts (GS::ObjectState& facts, PreparedNonradialFixtureDefaults& defaults);
+bool ReadLinearStaticFixtureDefaultFacts (GS::ObjectState& facts, PreparedLinearStaticFixtureDefaults& defaults);
+
+bool AddNativeDimensionFixturePresetInputProof (GS::ObjectState& proof, const GS::UniString& preset,
+	const GS::UniString& longUnicodeNote, const GS::UniString& linearUnicodeNote,
+	const GS::ObjectState& defaultNotePointers)
+{
+	if (preset == "linear-static-measured-two-point-v1") {
+		GS::ObjectState controls (
+			"preset", "linear-static-measured-two-point-v1",
+			"meaning", "requested-fixed-input-construction-only-not-readback-source-or-display");
+		controls.Add ("defaultAvailability", defaultNotePointers);
+		GS::ObjectState linear (
+			"linePosition", GS::ObjectState ("x", 20.0, "y", 20.0),
+			"direction", GS::ObjectState ("x", 1.0, "y", 0.0),
+			"appearance", static_cast<Int32> (APIApp_Normal),
+			"textPosition", static_cast<Int32> (APIPos_Above),
+			"textWay", "APIDir_Horizontal", "textWayValue", static_cast<Int32> (APIDir_Horizontal),
+			"defaultStaticSetting", true, "usedIn3D", false, "horizontalText", false, "pushNeighborEnabled", false,
+			"defaultNote", GS::ObjectState ("contentMode", "measured", "fixPos", false, "useLeaderLine", false, "fixedBuffer", "empty", "unicodePointer", "null"));
+		const auto& points = linear.AddList<GS::ObjectState> ("points");
+		points (GS::ObjectState ("index", 0, "anchor", GS::ObjectState ("x", 20.0, "y", 15.0), "dimensionPosition", GS::ObjectState ("x", 20.0, "y", 20.0), "fixedPosition", true, "measuredIntervalRole", "sentinel", "note", GS::ObjectState ("contentMode", "measured", "fixPos", false, "useLeaderLine", false, "fixedBuffer", "empty", "unicodePointer", "null")));
+		points (GS::ObjectState ("index", 1, "anchor", GS::ObjectState ("x", 24.0, "y", 15.0), "dimensionPosition", GS::ObjectState ("x", 24.0, "y", 20.0), "fixedPosition", true, "measuredIntervalRole", "single-real-interval", "note", GS::ObjectState ("contentMode", "measured", "fixPos", false, "useLeaderLine", false, "fixedBuffer", "empty", "unicodePointer", "null")));
+		controls.Add ("linear", linear);
+		proof.Add ("presetControls", controls);
+		GS::UniString status;
+		return defaultNotePointers.Get ("status", status) && status == "verified-null";
+	}
+	if (preset == "linear-static-refc-mask-study-v1") {
+		GS::ObjectState controls (
+			"preset", "linear-static-refc-mask-study-v1",
+			"meaning", "fixed-create-then-refc-only-native-mask-study-not-writer-admission-or-source-proof");
+		controls.Add ("defaultAvailability", defaultNotePointers);
+		GS::ObjectState linear (
+			"linePosition", GS::ObjectState ("x", 20.0, "y", 20.0),
+			"direction", GS::ObjectState ("x", 1.0, "y", 0.0),
+			"appearance", static_cast<Int32> (APIApp_Normal),
+			"textPosition", static_cast<Int32> (APIPos_Above),
+			"textWay", "APIDir_Horizontal", "textWayValue", static_cast<Int32> (APIDir_Horizontal),
+			"defaultStaticSetting", true, "usedIn3D", false, "horizontalText", false, "pushNeighborEnabled", false,
+			"defaultNote", GS::ObjectState ("contentMode", "measured", "fixPos", false, "useLeaderLine", false, "fixedBuffer", "empty", "unicodePointer", "null"));
+		const auto& points = linear.AddList<GS::ObjectState> ("points");
+		points (GS::ObjectState ("index", 0, "anchor", GS::ObjectState ("x", 20.0, "y", 15.0), "dimensionPosition", GS::ObjectState ("x", 20.0, "y", 20.0), "fixedPosition", true, "measuredIntervalRole", "sentinel", "note", GS::ObjectState ("contentMode", "measured", "fixPos", false, "useLeaderLine", false, "fixedBuffer", "empty", "unicodePointer", "null")));
+		points (GS::ObjectState ("index", 1, "anchor", GS::ObjectState ("x", 24.0, "y", 15.0), "dimensionPosition", GS::ObjectState ("x", 24.0, "y", 20.0), "fixedPosition", true, "measuredIntervalRole", "single-real-interval", "note", GS::ObjectState ("contentMode", "measured", "fixPos", false, "useLeaderLine", false, "fixedBuffer", "empty", "unicodePointer", "null")));
+		controls.Add ("linear", linear);
+	GS::ObjectState mutation (
+		"field", "API_DimensionType.refC", "from", GS::ObjectState ("x", 20.0, "y", 20.0),
+		"to", GS::ObjectState ("x", 20.0, "y", 21.0), "memo", "null", "memoMask", 0, "withdel", false);
+	const auto& maskFields = mutation.AddList<GS::UniString> ("elementMaskFields");
+	maskFields ("refC");
+	controls.Add ("mutation", mutation);
+		proof.Add ("presetControls", controls);
+		GS::UniString status;
+		return defaultNotePointers.Get ("status", status) && status == "verified-null";
+	}
+	if (preset == "linear-static-refc-inplace-study-v1") {
+		GS::ObjectState controls (
+			"preset", "linear-static-refc-inplace-study-v1",
+			"meaning", "fixed-create-then-refc-only-native-inplace-study-not-writer-admission-or-source-proof");
+		controls.Add ("defaultAvailability", defaultNotePointers);
+		GS::ObjectState linear (
+			"linePosition", GS::ObjectState ("x", 20.0, "y", 20.0),
+			"direction", GS::ObjectState ("x", 1.0, "y", 0.0),
+			"appearance", static_cast<Int32> (APIApp_Normal),
+			"textPosition", static_cast<Int32> (APIPos_Above),
+			"textWay", "APIDir_Horizontal", "textWayValue", static_cast<Int32> (APIDir_Horizontal),
+			"defaultStaticSetting", true, "usedIn3D", false, "horizontalText", false, "pushNeighborEnabled", false,
+			"defaultNote", GS::ObjectState ("contentMode", "measured", "fixPos", false, "useLeaderLine", false, "fixedBuffer", "empty", "unicodePointer", "null"));
+		const auto& points = linear.AddList<GS::ObjectState> ("points");
+		points (GS::ObjectState ("index", 0, "anchor", GS::ObjectState ("x", 20.0, "y", 15.0), "dimensionPosition", GS::ObjectState ("x", 20.0, "y", 20.0), "fixedPosition", true, "measuredIntervalRole", "sentinel", "note", GS::ObjectState ("contentMode", "measured", "fixPos", false, "useLeaderLine", false, "fixedBuffer", "empty", "unicodePointer", "null")));
+		points (GS::ObjectState ("index", 1, "anchor", GS::ObjectState ("x", 24.0, "y", 15.0), "dimensionPosition", GS::ObjectState ("x", 24.0, "y", 20.0), "fixedPosition", true, "measuredIntervalRole", "single-real-interval", "note", GS::ObjectState ("contentMode", "measured", "fixPos", false, "useLeaderLine", false, "fixedBuffer", "empty", "unicodePointer", "null")));
+		controls.Add ("linear", linear);
+		GS::ObjectState mutation (
+			"field", "API_DimensionType.refC", "from", GS::ObjectState ("x", 20.0, "y", 20.0),
+			"to", GS::ObjectState ("x", 20.0, "y", 21.0), "memo", "null", "memoMask", 0, "withdel", true);
+		const auto& maskFields = mutation.AddList<GS::UniString> ("elementMaskFields");
+		maskFields ("refC");
+		controls.Add ("mutation", mutation);
+		proof.Add ("presetControls", controls);
+		GS::UniString status;
+		return defaultNotePointers.Get ("status", status) && status == "verified-null";
+	}
+	if (preset == "linear-static-refc-automatic-measured-relocation-v1") {
+		GS::ObjectState controls (
+			"preset", "linear-static-refc-automatic-measured-relocation-v1",
+			"meaning", "fixed-create-then-automatic-measured-refc-relocation-hypothesis-not-writer-admission-or-source-proof");
+		controls.Add ("defaultAvailability", defaultNotePointers);
+		GS::ObjectState linear (
+			"linePosition", GS::ObjectState ("x", 20.0, "y", 20.0),
+			"direction", GS::ObjectState ("x", 1.0, "y", 0.0),
+			"appearance", static_cast<Int32> (APIApp_Normal), "textPosition", static_cast<Int32> (APIPos_Above),
+			"textWay", "APIDir_Horizontal", "textWayValue", static_cast<Int32> (APIDir_Horizontal),
+			"defaultStaticSetting", true, "usedIn3D", false, "horizontalText", false, "pushNeighborEnabled", false,
+			"defaultNote", GS::ObjectState ("contentMode", "measured", "fixPos", false, "useLeaderLine", false, "fixedBuffer", "empty", "unicodePointer", "null"));
+		const auto& points = linear.AddList<GS::ObjectState> ("points");
+		points (GS::ObjectState ("index", 0, "anchor", GS::ObjectState ("x", 20.0, "y", 15.0), "dimensionPosition", GS::ObjectState ("x", 20.0, "y", 20.0), "fixedPosition", true, "measuredIntervalRole", "sentinel", "note", GS::ObjectState ("contentMode", "measured", "fixPos", false, "useLeaderLine", false, "fixedBuffer", "empty", "unicodePointer", "null")));
+		points (GS::ObjectState ("index", 1, "anchor", GS::ObjectState ("x", 24.0, "y", 15.0), "dimensionPosition", GS::ObjectState ("x", 24.0, "y", 20.0), "fixedPosition", true, "measuredIntervalRole", "single-real-interval", "note", GS::ObjectState ("contentMode", "measured", "fixPos", false, "useLeaderLine", false, "fixedBuffer", "empty", "unicodePointer", "null")));
+		controls.Add ("linear", linear);
+		GS::ObjectState mutation ("field", "API_DimensionType.refC", "from", GS::ObjectState ("x", 20.0, "y", 20.0),
+			"to", GS::ObjectState ("x", 20.0, "y", 18.0), "memo", "null", "memoMask", 0, "withdel", true);
+		const auto& maskFields = mutation.AddList<GS::UniString> ("elementMaskFields");
+		maskFields ("refC");
+		controls.Add ("mutation", mutation);
+		GS::Array<GS::UniString> allowedPaths = {
+			"geometryAndSettings.linePosition.y", "geometryAndSettings.threeDimensionalPosition.y",
+			"orderedPoints[0].dimensionPosition.y",
+			"orderedPoints[0].note.position.y", "orderedPoints[1].dimensionPosition.y", "orderedPoints[1].note.position.y",
+			"bounds.yMin", "bounds.yMax", "fingerprint", "modificationStamp",
+			"readConsistency.initialModificationStamp", "readConsistency.probeModificationStamp", "readConsistency.finalModificationStamp" };
+		controls.Add ("allowedDeltaPaths", allowedPaths);
+		proof.Add ("presetControls", controls);
+		GS::UniString status;
+		return defaultNotePointers.Get ("status", status) && status == "verified-null";
+	}
+	if (preset != "nonradial-read-controls-v1") return true;
+	GS::ObjectState controls (
+		"preset", "nonradial-read-controls-v1",
+		"meaning", "requested-fixed-controls-only-not-readback-source-or-display");
+	controls.Add ("defaultNotePointerAvailability", defaultNotePointers);
+	GS::ObjectState linear (
+		"linePosition", GS::ObjectState ("x", 20.0, "y", 20.0),
+		"direction", GS::ObjectState ("x", 1.0, "y", 0.0),
+		"appearance", static_cast<Int32> (APIApp_Normal),
+		"textPosition", static_cast<Int32> (APIPos_Above),
+		"textWay", "APIDir_Horizontal",
+		"textWayValue", static_cast<Int32> (APIDir_Horizontal),
+		"defaultStaticSetting", true,
+		"usedIn3D", false,
+		"horizontalText", false,
+		"pointCount", 7,
+		"defaultNote", GS::ObjectState ("contentMode", "measured", "unicodePointer", "null"));
+	const auto& points = linear.AddList<GS::ObjectState> ("pointControls");
+	const GS::UniString pointTexts[] = { "<MeasuredValue>", "Literal dimension note", "4999", linearUnicodeNote, "<UnrecognizedDimensionToken>" };
+	for (Int32 index = 0; index < 7; ++index) {
+		const double anchorX = 20.0 + 4.0 * index;
+		const double dimensionX = 20.0 + 4.0 * index;
+		GS::ObjectState note;
+		note.Add ("contentMode", index == 0 || index == 6 ? "measured" : "custom");
+		note.Add ("fixPos", index != 0);
+		note.Add ("witnessControl", "copied-from-native-default");
+		if (index == 0 || index == 6) note.Add ("unicodePointer", "null");
+		if (index > 0 && index < 6) note.Add ("content", pointTexts[index - 1]);
+		if (index == 6) {
+			note.Add ("useLeaderLine", true);
+			note.Add ("anchorAtTextEnd", false);
+			note.Add ("position", GS::ObjectState ("x", 44.5, "y", 21.0));
+			note.Add ("leaderBegin", GS::ObjectState ("x", 44.0, "y", 20.0));
+			note.Add ("leaderMiddle", GS::ObjectState ("x", 45.0, "y", 22.0));
+			note.Add ("leaderEnd", GS::ObjectState ("x", 49.0, "y", 22.0));
+		}
+		points (GS::ObjectState (
+			"index", index,
+			"anchor", GS::ObjectState ("x", anchorX, "y", 15.0),
+			"dimensionPosition", GS::ObjectState ("x", dimensionX, "y", 20.0),
+			"fixedPosition", true,
+			"note", note));
+	}
+	controls.Add ("linear", linear);
+	GS::ObjectState angle (
+		"arcOrigin", GS::ObjectState ("x", 20.0, "y", 5.0),
+		"arcPosition", GS::ObjectState ("x", 23.5, "y", 8.5),
+		"note", GS::ObjectState (
+			"contentMode", "measured", "unicodePointer", "null", "fixPos", true, "useLeaderLine", true,
+			"position", GS::ObjectState ("x", 23.5, "y", 8.5),
+			"leaderBegin", GS::ObjectState ("x", 23.5, "y", 8.5),
+			"leaderMiddle", GS::ObjectState ("x", 24.5, "y", 10.5),
+			"leaderEnd", GS::ObjectState ("x", 29.5, "y", 10.5)));
+	const auto& anchors = angle.AddList<GS::ObjectState> ("anchors");
+	anchors (GS::ObjectState ("x", 20.0, "y", 5.0));
+	anchors (GS::ObjectState ("x", 25.0, "y", 5.0));
+	anchors (GS::ObjectState ("x", 20.0, "y", 5.0));
+	anchors (GS::ObjectState ("x", 20.0, "y", 10.0));
+	controls.Add ("angle", angle);
+	const auto& levels = controls.AddList<GS::ObjectState> ("levels");
+	levels (GS::ObjectState (
+		"role", "level-single-note", "format", 0, "level", 1.25,
+		"markerPosition", GS::ObjectState ("x", 20.0, "y", 30.0), "staticLevel", false,
+		"parentType", "API_ZombieElemID", "parentGuid", "APINULLGuid",
+		"note1", GS::ObjectState ("contentMode", "custom", "content", longUnicodeNote),
+		"note2", GS::ObjectState ("applicability", "stored-but-not-applicable-for-current-format", "contentMode", "custom", "content", longUnicodeNote)));
+	levels (GS::ObjectState (
+		"role", "level-two-note", "format", 8, "level", 2.5,
+		"markerPosition", GS::ObjectState ("x", 30.0, "y", 30.0), "staticLevel", false,
+		"parentType", "API_ZombieElemID", "parentGuid", "APINULLGuid", "needPlus", false,
+		"note1", GS::ObjectState ("contentMode", "custom", "content", longUnicodeNote),
+		"note2", GS::ObjectState ("applicability", "applicable", "contentMode", "custom", "content", longUnicodeNote)));
+	proof.Add ("presetControls", controls);
+	GS::UniString status;
+	return defaultNotePointers.Get ("status", status) && status == "verified-null";
+}
+
+std::string FixturePathKey (std::string result)
+{
+    std::replace (result.begin (), result.end (), '\\', '/');
+    std::transform (result.begin (), result.end (), result.begin (), [] (unsigned char c) { return static_cast<char> (std::tolower (c)); });
+    return result;
+}
+
+bool FixtureFullPath (const std::string& path, std::string& result)
+{
+    std::vector<char> buffer (32768, '\0');
+    const DWORD length = GetFullPathNameA (path.c_str (), static_cast<DWORD> (buffer.size ()), buffer.data (), nullptr);
+    if (length == 0 || length >= buffer.size ()) return false;
+    result.assign (buffer.data (), length);
+    return true;
+}
+
+bool FixtureCanonicalExistingPath (const std::string& path, std::string& result)
+{
+    std::string fullPath;
+    if (!FixtureFullPath (path, fullPath)) return false;
+    HANDLE handle = CreateFileA (fullPath.c_str (), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (handle == INVALID_HANDLE_VALUE) return false;
+    std::vector<char> buffer (32768, '\0');
+    const DWORD length = GetFinalPathNameByHandleA (handle, buffer.data (), static_cast<DWORD> (buffer.size ()), FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    CloseHandle (handle);
+    if (length == 0 || length >= buffer.size ()) return false;
+    result.assign (buffer.data (), length);
+    if (result.rfind ("\\\\?\\UNC\\", 0) == 0) result = "\\\\" + result.substr (8);
+    else if (result.rfind ("\\\\?\\", 0) == 0) result.erase (0, 4);
+    return true;
+}
+
+const char* FixtureElementTypeName (API_ElemTypeID type)
+{
+    switch (type) {
+        case API_DimensionID: return "Dimension";
+        case API_AngleDimensionID: return "AngleDimension";
+        case API_LevelDimensionID: return "LevelDimension";
+        case API_ArcID: return "Arc";
+        case API_RadialDimensionID: return "RadialDimension";
+        default: return "Unsupported";
+    }
+}
+
+void SetNativeElementTypeHeader (API_Element& element, API_ElemTypeID type)
+{
+#if TAPIR_AC_VERSION == 25
+    element.header.typeID = type;
+#else
+    element.header.type.typeID = type;
+#endif
+}
+
+bool ReadNonradialFixtureDefaultNotePointerFacts (GS::ObjectState& facts, PreparedNonradialFixtureDefaults& defaults)
+{
+	SetNativeElementTypeHeader (defaults.linear, API_DimensionID);
+	const GSErrCode linearError = ACAPI_Element_GetDefaults (&defaults.linear, &defaults.linearMemo);
+	if (linearError != NoError) {
+		facts.Add ("status", "not-read");
+		facts.Add ("linearDefaultNoteErrorCode", static_cast<Int32> (linearError));
+		return false;
+	}
+
+	SetNativeElementTypeHeader (defaults.angle, API_AngleDimensionID);
+	const GSErrCode angleError = ACAPI_Element_GetDefaults (&defaults.angle, &defaults.angleMemo);
+	if (angleError != NoError) {
+		facts.Add ("status", "not-read");
+		facts.Add ("angleNoteErrorCode", static_cast<Int32> (angleError));
+		return false;
+	}
+
+	SetNativeElementTypeHeader (defaults.levelSingle, API_LevelDimensionID);
+	const GSErrCode levelSingleError = ACAPI_Element_GetDefaults (&defaults.levelSingle, &defaults.levelSingleMemo);
+	if (levelSingleError != NoError) {
+		facts.Add ("status", "not-read");
+		facts.Add ("levelSingleNotesErrorCode", static_cast<Int32> (levelSingleError));
+		return false;
+	}
+
+	SetNativeElementTypeHeader (defaults.levelTwo, API_LevelDimensionID);
+	const GSErrCode levelTwoError = ACAPI_Element_GetDefaults (&defaults.levelTwo, &defaults.levelTwoMemo);
+	if (levelTwoError != NoError) {
+		facts.Add ("status", "not-read");
+		facts.Add ("levelTwoNotesErrorCode", static_cast<Int32> (levelTwoError));
+		return false;
+	}
+	defaults.prepared = true;
+
+	const Int32 linearDefaultPointCount = defaults.linear.dimension.nDimElem;
+	const bool linearMemoHandleAbsent = defaults.linearMemo.dimElems == nullptr;
+	const bool linearMemoEmpty = linearMemoHandleAbsent && linearDefaultPointCount == 0;
+	bool linearMemoNotesNull = linearMemoHandleAbsent;
+	const UInt64 requiredLinearMemoBytes = linearDefaultPointCount < 0 ? 0 : static_cast<UInt64> (linearDefaultPointCount) * sizeof (API_DimElem);
+	const UInt64 actualLinearMemoBytes = defaults.linearMemo.dimElems == nullptr ? 0
+		: static_cast<UInt64> (BMGetHandleSize ((GSHandle) defaults.linearMemo.dimElems));
+	if (linearDefaultPointCount < 0 || linearDefaultPointCount > 100000
+		|| (linearDefaultPointCount > 0 && (defaults.linearMemo.dimElems == nullptr || *defaults.linearMemo.dimElems == nullptr))
+		|| actualLinearMemoBytes < requiredLinearMemoBytes) {
+		linearMemoNotesNull = false;
+	} else {
+		for (Int32 index = 0; index < linearDefaultPointCount; ++index)
+			linearMemoNotesNull = linearMemoNotesNull && (*defaults.linearMemo.dimElems)[index].note.contentUStr == nullptr;
+	}
+	const bool allNull = linearMemoEmpty && linearMemoNotesNull
+		&& defaults.linear.dimension.defNote.contentUStr == nullptr
+		&& defaults.angle.angleDimension.note.contentUStr == nullptr
+		&& defaults.levelSingle.levelDimension.note1.contentUStr == nullptr
+		&& defaults.levelSingle.levelDimension.note2.contentUStr == nullptr
+		&& defaults.levelTwo.levelDimension.note1.contentUStr == nullptr
+		&& defaults.levelTwo.levelDimension.note2.contentUStr == nullptr;
+	facts.Add ("status", allNull ? "verified-null" : "refused-nonnull-or-unverifiable-optional-access-pointer");
+	facts.Add ("linearMemoHandle", linearMemoEmpty ? "absent-empty" : "present-or-unverifiable");
+	facts.Add ("linearDefaultPointCount", linearDefaultPointCount);
+	facts.Add ("linearMemoNotes", linearMemoNotesNull ? "null" : "present-or-unavailable");
+	facts.Add ("linearDefaultNote", defaults.linear.dimension.defNote.contentUStr == nullptr ? "null" : "present");
+	facts.Add ("angleNote", defaults.angle.angleDimension.note.contentUStr == nullptr ? "null" : "present");
+	facts.Add ("levelSingleNote1", defaults.levelSingle.levelDimension.note1.contentUStr == nullptr ? "null" : "present");
+	facts.Add ("levelSingleNote2", defaults.levelSingle.levelDimension.note2.contentUStr == nullptr ? "null" : "present");
+	facts.Add ("levelTwoNote1", defaults.levelTwo.levelDimension.note1.contentUStr == nullptr ? "null" : "present");
+	facts.Add ("levelTwoNote2", defaults.levelTwo.levelDimension.note2.contentUStr == nullptr ? "null" : "present");
+	return allNull;
+}
+
+bool ReadLinearStaticFixtureDefaultFacts (GS::ObjectState& facts, PreparedLinearStaticFixtureDefaults& defaults)
+{
+	SetNativeElementTypeHeader (defaults.linear, API_DimensionID);
+	const GSErrCode getDefaultsError = ACAPI_Element_GetDefaults (&defaults.linear, &defaults.memo);
+	if (getDefaultsError != NoError) {
+		facts.Add ("status", "not-read");
+		facts.Add ("getDefaultsErrorCode", static_cast<Int32> (getDefaultsError));
+		return false;
+	}
+	defaults.prepared = true;
+	const Int32 pointCount = defaults.linear.dimension.nDimElem;
+	const bool memoHandleAbsent = defaults.memo.dimElems == nullptr;
+	const bool emptyMemo = memoHandleAbsent && pointCount == 0;
+	const bool defaultNoteNull = defaults.linear.dimension.defNote.contentUStr == nullptr;
+	const bool verified = emptyMemo && defaultNoteNull;
+	facts.Add ("status", verified ? "verified-null" : "refused-nonnull-or-unverifiable-optional-access-pointer");
+	facts.Add ("memoHandle", memoHandleAbsent ? "absent-empty" : "present-or-unverifiable");
+	facts.Add ("storedPointCount", pointCount);
+	facts.Add ("defaultNoteUnicodePointer", defaultNoteNull ? "null" : "present-unverifiable-not-dereferenced");
+	return verified;
+}
+
+// Shared by the historical E-737 static fixture and the separately compiled
+// private producer. Keep this fixed construction in one place so the producer
+// cannot silently drift from the independently observed recipe.
+GSErrCode BuildFixedStaticMeasuredTwoPointDimension (API_Element& linear, API_ElementMemo& memo, const Int16 story)
+{
+	if (linear.dimension.defNote.contentUStr != nullptr || linear.dimension.nDimElem != 0 || memo.dimElems != nullptr)
+		return APIERR_BADPARS;
+	linear.header.floorInd = story;
+	linear.dimension.dimAppear = APIApp_Normal;
+	linear.dimension.textPos = APIPos_Above;
+	linear.dimension.textWay = APIDir_Horizontal;
+	linear.dimension.defStaticDim = true;
+	linear.dimension.usedIn3D = false;
+	linear.dimension.horizontalText = false;
+	linear.dimension.pushNeighborEnabled = false;
+	linear.dimension.refC = { 20.0, 20.0 };
+	linear.dimension.direction = { 1.0, 0.0 };
+	linear.dimension.defNote.contentType = API_NoteContent_Measured;
+	linear.dimension.defNote.contentUStr = nullptr;
+	std::fill (linear.dimension.defNote.content, linear.dimension.defNote.content + sizeof (linear.dimension.defNote.content), '\0');
+	linear.dimension.defNote.fixPos = false;
+	linear.dimension.defNote.useLeaderLine = false;
+	API_DimElem** points = reinterpret_cast<API_DimElem**> (BMhAllClear (2 * sizeof (API_DimElem)));
+	if (points == nullptr) return APIERR_MEMFULL;
+	if (*points == nullptr) {
+		BMKillHandle (reinterpret_cast<GSHandle*> (&points));
+		return APIERR_MEMFULL;
+	}
+	memo.dimElems = points;
+	linear.dimension.nDimElem = 2;
+	for (Int32 index = 0; index < 2; ++index) {
+		API_DimElem& point = (*memo.dimElems)[index];
+		point.base.loc = { 20.0 + 4.0 * index, 15.0 };
+		point.pos = { 20.0 + 4.0 * index, 20.0 };
+		point.note = linear.dimension.defNote;
+		point.note.contentType = API_NoteContent_Measured;
+		point.note.contentUStr = nullptr;
+		std::fill (point.note.content, point.note.content + sizeof (point.note.content), '\0');
+		point.note.fixPos = false;
+		point.note.useLeaderLine = false;
+		point.witnessVal = linear.dimension.defWitnessVal;
+		point.witnessForm = linear.dimension.defWitnessForm;
+		point.fixedPos = true;
+	}
+	return NoError;
+}
+
+GS::ObjectState ReadNativeDimensionFixtureRow (const API_Guid& guid, GS::ProcessControl& processControl)
+{
+	GS::ObjectState request;
+	const auto& guids = request.AddList<GS::UniString> ("guids");
+	guids (APIGuidToString (guid));
+	return GetNativeDimensionDetailsCommand ().Execute (request, processControl);
+}
+
+bool NativeDimensionLayerControlGuidEqual (const GS::UniString& left, const GS::UniString& right);
+
+bool ExtractExactNativeDimensionFixtureRow (const GS::ObjectState& response, const API_Guid& requestedGuid, GS::ObjectState& row)
+{
+	GS::UniString schemaVersion, status;
+	GS::Array<GS::ObjectState> rows;
+	if (!response.Get ("schemaVersion", schemaVersion) || schemaVersion != "native-dimension-read/v1"
+		|| !response.Get ("status", status) || status != "success"
+		|| !response.Get ("elements", rows) || rows.GetSize () != 1)
+		return false;
+	GS::UniString rowStatus, requestedGuidText, elementType;
+	Int32 nativeType = -1;
+	GS::ObjectState elementId;
+	GS::UniString returnedGuid;
+	row = rows[0];
+	return row.Get ("status", rowStatus) && rowStatus == "success"
+		&& row.Get ("requestedGuid", requestedGuidText)
+		&& NativeDimensionLayerControlGuidEqual (requestedGuidText, APIGuidToString (requestedGuid))
+		&& row.Get ("elementType", elementType) && elementType == "Dimension"
+		&& row.Get ("nativeElementTypeId", nativeType) && nativeType == static_cast<Int32> (API_DimensionID)
+		&& row.Get ("elementId", elementId) && elementId.Get ("guid", returnedGuid)
+		&& NativeDimensionLayerControlGuidEqual (returnedGuid, APIGuidToString (requestedGuid));
+}
+
+bool ReadFixedStudyCoordinate (const GS::ObjectState& point, const double expectedX, const double expectedY)
+{
+	GS::UniString unit;
+	double x = 0.0, y = 0.0;
+	return point.Get ("unit", unit) && unit == "project-meter"
+		&& point.Get ("x", x) && point.Get ("y", y)
+		&& std::isfinite (x) && std::isfinite (y)
+		&& std::abs (x - expectedX) <= 1.0e-8 && std::abs (y - expectedY) <= 1.0e-8;
+}
+
+bool ReadFiniteStudyCoordinate (const GS::ObjectState& point, double& x, double& y)
+{
+	GS::UniString unit;
+	return point.Get ("unit", unit) && unit == "project-meter"
+		&& point.Get ("x", x) && point.Get ("y", y)
+		&& std::isfinite (x) && std::isfinite (y);
+}
+
+bool ReadFixedStudyCoordinate3D (const GS::ObjectState& point, const double expectedX, const double expectedY, const double expectedZ)
+{
+	GS::UniString unit;
+	double x = 0.0, y = 0.0, z = 0.0;
+	return point.Get ("unit", unit) && unit == "project-meter"
+		&& point.Get ("x", x) && point.Get ("y", y) && point.Get ("z", z)
+		&& std::isfinite (x) && std::isfinite (y) && std::isfinite (z)
+		&& std::abs (x - expectedX) <= 1.0e-8 && std::abs (y - expectedY) <= 1.0e-8
+		&& std::abs (z - expectedZ) <= 1.0e-8;
+}
+
+// This is a fixed recipe guard, not a general dimension update validator.
+// It admits the refC Change only after the created parent's complete two-point
+// reader row proves the predeclared T4a2 baseline at the exact requested story.
+bool IsNativeDimensionMaskedPositionStage (const GS::ObjectState& response, const API_Guid& expectedGuid,
+	const API_Guid& expectedDatabaseGuid, const Int32 expectedStory, const double expectedLineY, UInt64& modificationStamp)
+{
+	GS::UniString schemaVersion, responseStatus;
+	GS::Array<GS::ObjectState> rows;
+	if (!response.Get ("schemaVersion", schemaVersion) || schemaVersion != "native-dimension-read/v1"
+		|| !response.Get ("status", responseStatus) || responseStatus != "success"
+		|| !response.Get ("elements", rows) || rows.GetSize () != 1)
+		return false;
+	const GS::ObjectState& row = rows[0];
+	GS::UniString rowStatus, requestedGuid, elementType, coverage;
+	Int32 nativeType = 0, variation = -1, story = -1;
+	Int64 stamp = 0;
+	GS::ObjectState elementId, database, databaseId, identity, geometry, memo, consistency;
+	GS::UniString databaseStatus, family, contextStatus, memoStatus, consistencyStatus, returnedDatabaseGuid;
+	Int32 databaseType = -1;
+	if (!row.Get ("status", rowStatus) || rowStatus != "success"
+		|| !row.Get ("requestedGuid", requestedGuid) || APIGuidFromString (requestedGuid.ToCStr ()) != expectedGuid
+		|| !row.Get ("elementType", elementType) || elementType != "Dimension"
+		|| !row.Get ("nativeElementTypeId", nativeType) || nativeType != API_DimensionID
+		|| !row.Get ("elementVariationId", variation) || variation != 0
+		|| !row.Get ("storyIndex", story) || story != expectedStory
+		|| !row.Get ("modificationStamp", stamp) || stamp <= 0
+		|| !row.Get ("elementId", elementId))
+		return false;
+	GS::UniString returnedGuid;
+	if (!elementId.Get ("guid", returnedGuid) || APIGuidFromString (returnedGuid.ToCStr ()) != expectedGuid)
+		return false;
+	if (!row.Get ("database", database) || !database.Get ("status", databaseStatus) || databaseStatus != "available"
+		|| !database.Get ("databaseType", databaseType) || databaseType != APIWind_FloorPlanID
+		|| !database.Get ("databaseId", databaseId) || !databaseId.Get ("guid", returnedDatabaseGuid)
+		|| APIGuidFromString (returnedDatabaseGuid.ToCStr ()) != expectedDatabaseGuid
+		|| !row.Get ("identity", identity) || !identity.Get ("family", family) || family != "linear-chain"
+		|| !identity.Get ("contextStatus", contextStatus) || contextStatus != "database-story-layer-from-native-element-header"
+		|| !row.Get ("memo", memo) || !memo.Get ("status", memoStatus) || memoStatus != "available"
+		|| !row.Get ("coverage", coverage)
+		|| (coverage != "complete-for-versioned-dimension-fields" && coverage != "partial-unicode-source-unproven")
+		|| !row.Get ("readConsistency", consistency)
+		|| !consistency.Get ("status", consistencyStatus) || consistencyStatus != "same-guid-type-and-modification-stamp-through-memo-read")
+		return false;
+	Int64 initialStamp = 0, probeStamp = 0, finalStamp = 0;
+	Int32 finalHeaderError = -1;
+	if (!consistency.Get ("initialModificationStamp", initialStamp)
+		|| !consistency.Get ("probeModificationStamp", probeStamp)
+		|| !consistency.Get ("finalModificationStamp", finalStamp)
+		|| !consistency.Get ("finalHeaderErrorCode", finalHeaderError)
+		|| initialStamp != stamp || probeStamp != stamp || finalStamp != stamp || finalHeaderError != NoError)
+		return false;
+	// Preserve a coherent exact identity/revision even when later geometry or
+	// presentation hypotheses differ. The caller reports those differences
+	// without discarding the observed stamp.
+	modificationStamp = static_cast<UInt64> (stamp);
+
+	if (!row.Get ("geometryAndSettings", geometry)) return false;
+	GS::ObjectState line, direction, defaultNote;
+	double directionX = 0.0, directionY = 0.0;
+	Int32 segmentCount = 0, pointCount = 0, appearance = -1, textPosition = -1, textDirection = -1;
+	bool staticSetting = false, usedIn3D = true, horizontalText = true, pushNeighbor = true;
+	if (!geometry.Get ("linePosition", line) || !ReadFixedStudyCoordinate (line, 20.0, expectedLineY)
+		|| !geometry.Get ("direction", direction) || !direction.Get ("x", directionX) || !direction.Get ("y", directionY)
+		|| !std::isfinite (directionX) || !std::isfinite (directionY)
+		|| std::abs (directionX - 1.0) > 1.0e-8 || std::abs (directionY) > 1.0e-8
+		|| !geometry.Get ("segmentCount", segmentCount) || segmentCount != 2
+		|| !geometry.Get ("pointCount", pointCount) || pointCount != 2
+		|| !geometry.Get ("appearance", appearance) || appearance != APIApp_Normal
+		|| !geometry.Get ("textPosition", textPosition) || textPosition != APIPos_Above
+		|| !geometry.Get ("textDirection", textDirection) || textDirection != APIDir_Horizontal
+		|| !geometry.Get ("defaultStaticSetting", staticSetting) || !staticSetting
+		|| !geometry.Get ("usedIn3D", usedIn3D) || usedIn3D
+		|| !geometry.Get ("horizontalText", horizontalText) || horizontalText
+		|| !geometry.Get ("pushNeighborEnabled", pushNeighbor) || pushNeighbor
+		|| !geometry.Get ("defaultNote", defaultNote))
+		return false;
+	GS::UniString defaultMode;
+	bool defaultFixPos = true, defaultLeader = true;
+	if (!defaultNote.Get ("contentMode", defaultMode) || defaultMode != "measured"
+		|| !defaultNote.Get ("fixPos", defaultFixPos) || defaultFixPos
+		|| !defaultNote.Get ("useLeaderLine", defaultLeader) || defaultLeader)
+		return false;
+
+	GS::Array<GS::ObjectState> points;
+	if (!row.Get ("orderedPoints", points) || points.GetSize () != 2) return false;
+	for (UIndex index = 0; index < 2; ++index) {
+		const GS::ObjectState& point = points[index];
+		Int32 storedIndex = -1;
+		Int32 elementTypeId = -1, specialReference = -1, nodeIndex = -1;
+		UInt64 nativeNodeId = 1;
+		bool lineReference = true;
+		bool fixedPosition = false;
+		GS::ObjectState anchor, anchorLocation, anchorLocation3D, anchorElementId, position, position3D, note;
+		if (!point.Get ("index", storedIndex) || storedIndex != static_cast<Int32> (index)
+			|| !point.Get ("anchor", anchor) || !anchor.Get ("location", anchorLocation)
+			|| !anchor.Get ("location3D", anchorLocation3D)
+			|| !anchor.Get ("elementTypeId", elementTypeId) || elementTypeId != API_ZombieElemID
+			|| !anchor.Get ("lineReference", lineReference) || lineReference
+			|| !anchor.Get ("specialReference", specialReference) || specialReference != 0
+			|| !anchor.Get ("nodeIndex", nodeIndex) || nodeIndex != 0
+			|| !anchor.Get ("nativeNodeId", nativeNodeId) || nativeNodeId != 0
+			|| !anchor.Get ("elementId", anchorElementId)
+			|| !ReadFixedStudyCoordinate (anchorLocation, 20.0 + 4.0 * index, 15.0)
+			|| !ReadFixedStudyCoordinate3D (anchorLocation3D, 20.0 + 4.0 * index, 15.0, 0.0)
+			|| !point.Get ("dimensionPosition", position)
+			|| !ReadFixedStudyCoordinate (position, 20.0 + 4.0 * index, expectedLineY)
+			|| !point.Get ("dimensionPosition3D", position3D) || !ReadFixedStudyCoordinate3D (position3D, 0.0, 0.0, 0.0)
+			|| !point.Get ("fixedPosition", fixedPosition) || !fixedPosition
+			|| !point.Get ("note", note))
+			return false;
+	GS::UniString anchorGuid, associationStatus;
+	if (!anchorElementId.Get ("guid", anchorGuid) || APIGuidFromString (anchorGuid.ToCStr ()) != APINULLGuid
+		|| !anchor.Get ("associationStatus", associationStatus) || associationStatus != "no-element-guid")
+		return false;
+#if TAPIR_AC_VERSION == 25
+	GS::ObjectState anchorVariation;
+	GS::UniString unavailableVariation;
+	if (!anchor.Get ("elementVariationId", anchorVariation)
+		|| !anchorVariation.Get ("status", unavailableVariation) || unavailableVariation != "not-available-in-ac25-API_Base") return false;
+#else
+	Int32 variationId = -1;
+	if (!anchor.Get ("elementVariationId", variationId) || variationId != 0) return false;
+#endif
+		GS::UniString noteMode;
+		bool noteFixPos = true, noteLeader = true;
+		double measured = -1.0;
+		if (!note.Get ("contentMode", noteMode) || noteMode != "measured"
+			|| !note.Get ("fixPos", noteFixPos) || noteFixPos
+			|| !note.Get ("useLeaderLine", noteLeader) || noteLeader
+			|| !point.Get ("measuredValueFromPreviousPoint", measured) || !std::isfinite (measured)
+			|| std::abs (measured - (index == 0 ? 0.0 : 4.0)) > 1.0e-6)
+			return false;
+	}
+	return true;
+}
+
+bool IsNativeDimensionAutomaticRelocationPrechangeStage (const GS::ObjectState& response, const API_Guid& expectedGuid,
+	const API_Guid& expectedDatabaseGuid, const Int32 expectedStory, UInt64& modificationStamp)
+{
+	if (!IsNativeDimensionMaskedPositionStage (response, expectedGuid, expectedDatabaseGuid, expectedStory, 20.0, modificationStamp)) return false;
+	GS::ObjectState row, geometry, reference3D, defaultNote, defaultNotePosition, bounds;
+	GS::Array<GS::ObjectState> points;
+	double defaultNoteX = 0.0, defaultNoteY = 0.0;
+	if (!ExtractExactNativeDimensionFixtureRow (response, expectedGuid, row)
+		|| !row.Get ("geometryAndSettings", geometry)
+		|| !geometry.Get ("threeDimensionalPosition", reference3D)
+		|| !ReadFixedStudyCoordinate3D (reference3D, 20.0, 20.0, 0.0)
+		|| !geometry.Get ("defaultNote", defaultNote)
+		|| !defaultNote.Get ("position", defaultNotePosition)
+		|| !ReadFiniteStudyCoordinate (defaultNotePosition, defaultNoteX, defaultNoteY)
+		|| !row.Get ("orderedPoints", points) || points.GetSize () != 2
+		|| !row.Get ("bounds", bounds)) return false;
+		GS::UniString boundsStatus, boundsUnit;
+		double xMin = 0.0, yMin = 0.0, xMax = 0.0, yMax = 0.0, zMin = 0.0, zMax = 0.0;
+		if (!bounds.Get ("status", boundsStatus) || boundsStatus != "available"
+			|| !bounds.Get ("unit", boundsUnit) || boundsUnit != "project-meter"
+			|| !bounds.Get ("xMin", xMin) || !bounds.Get ("yMin", yMin) || !bounds.Get ("xMax", xMax) || !bounds.Get ("yMax", yMax)
+			|| !bounds.Get ("zMin", zMin) || !bounds.Get ("zMax", zMax)
+			|| !std::isfinite (xMin) || !std::isfinite (yMin) || !std::isfinite (xMax) || !std::isfinite (yMax)
+			|| !std::isfinite (zMin) || !std::isfinite (zMax) || xMin > xMax || yMin > yMax || zMin > zMax) return false;
+		for (UInt32 index = 0; index < 2; ++index) {
+			GS::ObjectState point, note, notePosition;
+		double noteX = 0.0, noteY = 0.0;
+			if (!points[index].Get ("dimensionPosition", notePosition)
+				|| !ReadFixedStudyCoordinate (notePosition, 20.0 + 4.0 * index, 20.0)
+				|| !points[index].Get ("note", note) || !note.Get ("position", notePosition)
+				|| !ReadFiniteStudyCoordinate (notePosition, noteX, noteY)) return false;
+		}
+	return true;
+}
+
+bool IsNativeDimensionAutomaticRelocationHypothesis (const GS::ObjectState& beforeResponse, const GS::ObjectState& afterResponse,
+	const API_Guid& expectedGuid, const API_Guid& expectedDatabaseGuid, const Int32 expectedStory, UInt64& afterStamp)
+{
+	UInt64 beforeStamp = 0;
+	if (!IsNativeDimensionAutomaticRelocationPrechangeStage (beforeResponse, expectedGuid, expectedDatabaseGuid, expectedStory, beforeStamp)
+		|| !IsNativeDimensionMaskedPositionStage (afterResponse, expectedGuid, expectedDatabaseGuid, expectedStory, 18.0, afterStamp)) return false;
+	GS::ObjectState beforeRow, afterRow, beforeGeometry, afterGeometry, beforeReference3D, afterReference3D;
+	GS::ObjectState beforeDefault, afterDefault, beforeDefaultPosition, afterDefaultPosition, beforeBounds, afterBounds;
+	GS::Array<GS::ObjectState> beforePoints, afterPoints;
+	double beforeDefaultX = 0.0, beforeDefaultY = 0.0, afterDefaultX = 0.0, afterDefaultY = 0.0;
+	if (!ExtractExactNativeDimensionFixtureRow (beforeResponse, expectedGuid, beforeRow)
+		|| !ExtractExactNativeDimensionFixtureRow (afterResponse, expectedGuid, afterRow)
+		|| !beforeRow.Get ("geometryAndSettings", beforeGeometry) || !afterRow.Get ("geometryAndSettings", afterGeometry)
+		|| !beforeGeometry.Get ("threeDimensionalPosition", beforeReference3D) || !afterGeometry.Get ("threeDimensionalPosition", afterReference3D)
+		|| !ReadFixedStudyCoordinate3D (beforeReference3D, 20.0, 20.0, 0.0) || !ReadFixedStudyCoordinate3D (afterReference3D, 20.0, 18.0, 0.0)
+		|| !beforeGeometry.Get ("defaultNote", beforeDefault) || !afterGeometry.Get ("defaultNote", afterDefault)
+		|| !beforeDefault.Get ("position", beforeDefaultPosition) || !afterDefault.Get ("position", afterDefaultPosition)
+		|| !ReadFiniteStudyCoordinate (beforeDefaultPosition, beforeDefaultX, beforeDefaultY)
+		|| !ReadFiniteStudyCoordinate (afterDefaultPosition, afterDefaultX, afterDefaultY)
+		|| std::abs (afterDefaultX - beforeDefaultX) > 1.0e-8 || std::abs (afterDefaultY - beforeDefaultY) > 1.0e-8
+		|| !beforeRow.Get ("orderedPoints", beforePoints) || !afterRow.Get ("orderedPoints", afterPoints)
+		|| beforePoints.GetSize () != 2 || afterPoints.GetSize () != 2
+		|| !beforeRow.Get ("bounds", beforeBounds) || !afterRow.Get ("bounds", afterBounds)) return false;
+		GS::UniString beforeBoundsStatus, afterBoundsStatus, beforeBoundsUnit, afterBoundsUnit;
+		double bXMin = 0.0, bYMin = 0.0, bXMax = 0.0, bYMax = 0.0, bZMin = 0.0, bZMax = 0.0;
+		double aXMin = 0.0, aYMin = 0.0, aXMax = 0.0, aYMax = 0.0, aZMin = 0.0, aZMax = 0.0;
+		if (!beforeBounds.Get ("status", beforeBoundsStatus) || beforeBoundsStatus != "available"
+			|| !afterBounds.Get ("status", afterBoundsStatus) || afterBoundsStatus != "available"
+			|| !beforeBounds.Get ("unit", beforeBoundsUnit) || beforeBoundsUnit != "project-meter"
+			|| !afterBounds.Get ("unit", afterBoundsUnit) || afterBoundsUnit != "project-meter"
+			|| !beforeBounds.Get ("xMin", bXMin) || !beforeBounds.Get ("yMin", bYMin) || !beforeBounds.Get ("xMax", bXMax) || !beforeBounds.Get ("yMax", bYMax)
+			|| !beforeBounds.Get ("zMin", bZMin) || !beforeBounds.Get ("zMax", bZMax)
+			|| !afterBounds.Get ("xMin", aXMin) || !afterBounds.Get ("yMin", aYMin) || !afterBounds.Get ("xMax", aXMax) || !afterBounds.Get ("yMax", aYMax)
+			|| !afterBounds.Get ("zMin", aZMin) || !afterBounds.Get ("zMax", aZMax)) return false;
+		for (UInt32 index = 0; index < 2; ++index) {
+			GS::ObjectState beforePoint, afterPoint, beforePosition, afterPosition, beforeNote, afterNote, beforeNotePosition, afterNotePosition;
+			double beforeNoteX = 0.0, beforeNoteY = 0.0, afterNoteX = 0.0, afterNoteY = 0.0;
+			if (!beforePoints[index].Get ("dimensionPosition", beforePosition) || !afterPoints[index].Get ("dimensionPosition", afterPosition)
+				|| !ReadFixedStudyCoordinate (beforePosition, 20.0 + 4.0 * index, 20.0)
+				|| !ReadFixedStudyCoordinate (afterPosition, 20.0 + 4.0 * index, 18.0)
+				|| !beforePoints[index].Get ("note", beforeNote) || !afterPoints[index].Get ("note", afterNote)
+				|| !beforeNote.Get ("position", beforeNotePosition) || !afterNote.Get ("position", afterNotePosition)
+				|| !ReadFiniteStudyCoordinate (beforeNotePosition, beforeNoteX, beforeNoteY)
+				|| !ReadFiniteStudyCoordinate (afterNotePosition, afterNoteX, afterNoteY)
+				|| std::abs (afterNoteX - beforeNoteX) > 1.0e-8 || std::abs (afterNoteY - beforeNoteY + 2.0) > 1.0e-8) return false;
+		}
+		GS::UniString beforeFingerprint, afterFingerprint;
+	return std::abs (aYMin - bYMin + 2.0) <= 1.0e-8 && std::abs (aYMax - bYMax + 2.0) <= 1.0e-8
+		&& std::abs ((aYMax - aYMin) - (bYMax - bYMin)) <= 1.0e-8
+		&& std::abs (aXMin - bXMin) <= 1.0e-8 && std::abs (aXMax - bXMax) <= 1.0e-8
+		&& std::abs (aZMin - bZMin) <= 1.0e-8 && std::abs (aZMax - bZMax) <= 1.0e-8
+		&& beforeRow.Get ("fingerprint", beforeFingerprint) && afterRow.Get ("fingerprint", afterFingerprint)
+		&& !beforeFingerprint.IsEmpty () && !afterFingerprint.IsEmpty () && beforeFingerprint != afterFingerprint;
+}
+
+GS::Optional<GS::UniString> FixtureCurrentScope (const API_ProjectInfo& projectInfo)
+{
+    if (projectInfo.projectPath == nullptr || projectInfo.untitled || projectInfo.teamwork)
+        return {};
+    GS::UniString path (*projectInfo.projectPath);
+    path.ReplaceAll ("\\", "/");
+    path = path.ToLowerCase ();
+    const std::string utf8 = FixtureUtf8 (path);
+    if (utf8.size () < 4 || utf8.compare (utf8.size () - 4, 4, ".pln") != 0)
+        return {};
+    GS::UniString scope ("saved:");
+    scope.Append (path);
+    return scope;
+}
+
+bool CaptureFixedMaskedStudyContext (GS::ObjectState& facts, const GS::UniString& expectedScope,
+	const API_Guid& expectedDatabaseGuid, const Int32 expectedStory)
+{
+	API_ProjectInfo projectInfo = {};
+	const GSErrCode projectError = ACAPI_ProjectOperation_Project (&projectInfo);
+	API_WindowInfo window = {};
+	const GSErrCode windowError = ACAPI_Window_GetCurrentWindow (&window);
+	API_DatabaseInfo database = {};
+	const GSErrCode databaseError = ACAPI_Database_GetCurrentDatabase (&database);
+	API_StoryInfo stories = {};
+	const GS::OnExit storyGuard ([&stories] () { if (stories.data != nullptr) BMKillHandle (reinterpret_cast<GSHandle*> (&stories.data)); });
+	const GSErrCode storyError = ACAPI_ProjectSetting_GetStorySettings (&stories);
+	const GS::Optional<GS::UniString> scope = projectError == NoError ? FixtureCurrentScope (projectInfo) : GS::Optional<GS::UniString> ();
+	const API_Guid observedDatabaseGuid = database.databaseUnId.elemSetId;
+	const bool valid = projectError == NoError && !scope.IsEmpty () && scope.Get () == expectedScope
+		&& windowError == NoError && window.typeID == APIWind_FloorPlanID
+		&& databaseError == NoError && database.typeID == APIWind_FloorPlanID
+		&& observedDatabaseGuid != APINULLGuid && observedDatabaseGuid == expectedDatabaseGuid
+		&& storyError == NoError && stories.actStory == expectedStory;
+	facts.Add ("status", valid ? "same-saved-solo-floor-plan-story" : "unavailable-or-context-different");
+	facts.Add ("fileScopeKey", scope.IsEmpty () ? GS::UniString () : scope.Get ());
+	facts.Add ("windowType", windowError == NoError ? static_cast<Int32> (window.typeID) : -1);
+	facts.Add ("windowErrorCode", static_cast<Int32> (windowError));
+	facts.Add ("databaseType", databaseError == NoError ? static_cast<Int32> (database.typeID) : -1);
+	facts.Add ("databaseErrorCode", static_cast<Int32> (databaseError));
+	facts.Add ("databaseGuid", databaseError == NoError ? APIGuidToString (observedDatabaseGuid) : GS::UniString ());
+	facts.Add ("storyIndex", storyError == NoError ? stories.actStory : -1);
+	facts.Add ("storyErrorCode", static_cast<Int32> (storyError));
+	facts.Add ("projectErrorCode", static_cast<Int32> (projectError));
+	return valid;
+}
+
+GS::ObjectState FixtureError (const GS::UniString& message, const char* code = "FIXTURE_PREFLIGHT_FAILED")
+{
+    GS::ObjectState error;
+    error.Add ("code", code);
+    error.Add ("message", message);
+    return GS::ObjectState ("error", error);
+}
+
+GSErrCode InitializeNativeFixtureElement (API_Element& element, API_ElementMemo* memo, Int32 storyIndex)
+{
+    GSErrCode err = ACAPI_Element_GetDefaults (&element, memo);
+    if (err != NoError)
+        return err;
+    element.header.floorInd = static_cast<short> (storyIndex);
+    return NoError;
+}
+
+} // namespace
+
+GetNativeDimensionFixtureInputProofCommand::GetNativeDimensionFixtureInputProofCommand () : CommandBase (CommonSchema::NotUsed) {}
+GS::String GetNativeDimensionFixtureInputProofCommand::GetName () const { return "GetNativeDimensionFixtureInputProof"; }
+GS::Optional<GS::UniString> GetNativeDimensionFixtureInputProofCommand::GetInputParametersSchema () const
+{
+	return R"({"type":"object","properties":{"preset":{"type":"string","enum":["nonradial-read-controls-v1","linear-static-measured-two-point-v1","linear-static-refc-mask-study-v1","linear-static-refc-inplace-study-v1","linear-static-refc-automatic-measured-relocation-v1"]}},"additionalProperties":false})";
+}
+GS::Optional<GS::UniString> GetNativeDimensionFixtureInputProofCommand::GetResponseSchema () const { return {}; }
+GS::ObjectState GetNativeDimensionFixtureInputProofCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl& /*processControl*/) const
+{
+	GS::UniString preset;
+	const auto fieldNames = parameters.GetFieldNames ();
+	if (!fieldNames.IsEmpty () && (fieldNames.GetSize () != 1 || !parameters.Get ("preset", preset)
+		|| (preset != "nonradial-read-controls-v1" && preset != "linear-static-measured-two-point-v1" && preset != "linear-static-refc-mask-study-v1" && preset != "linear-static-refc-inplace-study-v1" && preset != "linear-static-refc-automatic-measured-relocation-v1")))
+		return FixtureError ("GetNativeDimensionFixtureInputProof accepts only an empty object or a closed fixture preset.", "INVALID_INPUT_PROOF_REQUEST");
+    GS::ObjectState proof;
+    GS::UniString longUnicodeNote, linearUnicodeNote;
+    (void) longUnicodeNote;
+    (void) linearUnicodeNote;
+    if (!BuildNativeDimensionFixtureInputProof (proof, longUnicodeNote, linearUnicodeNote)) {
+        GS::ObjectState error = FixtureError ("Fixed fixture Unicode construction did not round-trip its explicit UTF-8 bytes.", "FIXTURE_INPUT_ENCODING_MISMATCH");
+        error.Add ("requestedFixtureInputProof", proof);
+        return error;
+    }
+	GS::ObjectState defaultNotePointers;
+	bool defaultsVerified = true;
+	if (preset == "nonradial-read-controls-v1") {
+		PreparedNonradialFixtureDefaults defaults;
+		defaultsVerified = ReadNonradialFixtureDefaultNotePointerFacts (defaultNotePointers, defaults);
+	} else if (preset == "linear-static-measured-two-point-v1" || preset == "linear-static-refc-mask-study-v1" || preset == "linear-static-refc-inplace-study-v1" || preset == "linear-static-refc-automatic-measured-relocation-v1") {
+		PreparedLinearStaticFixtureDefaults defaults;
+		defaultsVerified = ReadLinearStaticFixtureDefaultFacts (defaultNotePointers, defaults);
+	}
+	if (!defaultsVerified || !AddNativeDimensionFixturePresetInputProof (proof, preset, longUnicodeNote, linearUnicodeNote, defaultNotePointers)) {
+		proof.Add ("presetControls", GS::ObjectState ("defaultAvailability", defaultNotePointers));
+		GS::ObjectState error = FixtureError ("Fixture defaults did not prove the required null optional note-access pointers.", "FIXTURE_DEFAULT_NOTE_POINTER_UNAVAILABLE");
+		error.Add ("requestedFixtureInputProof", proof);
+		return error;
+	}
+    return proof;
+}
+
+CreateNativeDimensionReadFixturesCommand::CreateNativeDimensionReadFixturesCommand () : CommandBase (CommonSchema::NotUsed) {}
+GS::String CreateNativeDimensionReadFixturesCommand::GetName () const { return "CreateNativeDimensionReadFixtures"; }
+GS::Optional<GS::UniString> CreateNativeDimensionReadFixturesCommand::GetInputParametersSchema () const
+{
+	return R"({"type":"object","properties":{"schemaVersion":{"type":"string","enum":["native-dimension-read-fixture-v1"]},"preset":{"type":"string","enum":["all-family-read-v2","core-dimension-read-v1","radial-arc-on-read-v1","nonradial-read-controls-v1","linear-static-measured-two-point-v1","linear-static-refc-mask-study-v1","linear-static-refc-inplace-study-v1","linear-static-refc-automatic-measured-relocation-v1"]},"runId":{"type":"string","pattern":"^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$"},"actionNonce":{"type":"string","minLength":16,"maxLength":96,"pattern":"^[A-Za-z0-9_-]+$"},"expectedProjectPath":{"type":"string","minLength":1,"maxLength":1024},"fileScopeKey":{"type":"string","minLength":1,"maxLength":1100},"storyIndex":{"type":"integer"}},"required":["schemaVersion","preset","runId","actionNonce","expectedProjectPath","fileScopeKey","storyIndex"],"additionalProperties":false})";
+}
+GS::Optional<GS::UniString> CreateNativeDimensionReadFixturesCommand::GetResponseSchema () const { return {}; }
+GS::ObjectState CreateNativeDimensionReadFixturesCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const
+{
+    GS::UniString schemaVersion, preset, runId, actionNonce, expectedProjectPath, fileScopeKey;
+    Int32 requestedStory = 0;
+    if (!parameters.Get ("schemaVersion", schemaVersion) || schemaVersion != "native-dimension-read-fixture-v1"
+		|| !parameters.Get ("preset", preset) || (preset != "all-family-read-v2" && preset != "core-dimension-read-v1" && preset != "radial-arc-on-read-v1" && preset != "nonradial-read-controls-v1" && preset != "linear-static-measured-two-point-v1" && preset != "linear-static-refc-mask-study-v1" && preset != "linear-static-refc-inplace-study-v1" && preset != "linear-static-refc-automatic-measured-relocation-v1")
+        || !parameters.Get ("runId", runId) || !parameters.Get ("actionNonce", actionNonce)
+        || !parameters.Get ("expectedProjectPath", expectedProjectPath) || !parameters.Get ("fileScopeKey", fileScopeKey)
+        || !parameters.Get ("storyIndex", requestedStory))
+        return FixtureError ("The fixed native dimension fixture contract is incomplete or unsupported.");
+    const bool useNonradialReadControls = preset == "nonradial-read-controls-v1";
+	const bool useLinearStaticMeasuredTwoPoint = preset == "linear-static-measured-two-point-v1";
+	const bool useLinearStaticRefcMaskStudy = preset == "linear-static-refc-mask-study-v1";
+	const bool useLinearStaticRefcInplaceStudy = preset == "linear-static-refc-inplace-study-v1";
+	const bool useLinearStaticAutomaticMeasuredRelocation = preset == "linear-static-refc-automatic-measured-relocation-v1";
+	const bool useFixedStaticLinear = useLinearStaticMeasuredTwoPoint || useLinearStaticRefcMaskStudy || useLinearStaticRefcInplaceStudy || useLinearStaticAutomaticMeasuredRelocation;
+
+    const std::string runIdUtf8 = FixtureUtf8 (runId);
+    const std::string nonceUtf8 = FixtureUtf8 (actionNonce);
+    if (runIdUtf8.empty () || runIdUtf8.size () > 48 || !std::all_of (runIdUtf8.begin (), runIdUtf8.end (), [] (unsigned char c) { return std::isalnum (c) || c == '_' || c == '-'; })
+        || nonceUtf8.size () < 16 || nonceUtf8.size () > 96 || !std::all_of (nonceUtf8.begin (), nonceUtf8.end (), [] (unsigned char c) { return std::isalnum (c) || c == '_' || c == '-'; }))
+        return FixtureError ("runId or actionNonce is outside the closed safe character bounds.");
+    if (gUsedNativeDimensionFixtureNonces.find (nonceUtf8) != gUsedNativeDimensionFixtureNonces.end ())
+        return FixtureError ("actionNonce was already dispatched in this Archicad process.", "ACTION_NONCE_REPLAY");
+
+    API_ProjectInfo projectInfo = {};
+    if (ACAPI_ProjectOperation_Project (&projectInfo) != NoError || projectInfo.untitled || projectInfo.teamwork || projectInfo.projectPath == nullptr)
+        return FixtureError ("Fixture preparation requires a saved Solo PLN copy.");
+    const GS::Optional<GS::UniString> currentScope = FixtureCurrentScope (projectInfo);
+    if (currentScope.IsEmpty () || fileScopeKey != currentScope.Get ())
+        return FixtureError ("fileScopeKey does not match the current saved Solo PLN.");
+
+    char localAppData[MAX_PATH + 1] = {};
+    const DWORD localAppDataLength = GetEnvironmentVariableA ("LOCALAPPDATA", localAppData, MAX_PATH);
+    if (localAppDataLength == 0 || localAppDataLength >= MAX_PATH)
+        return FixtureError ("LOCALAPPDATA is unavailable or too long.");
+#if TAPIR_AC_VERSION == 25
+    constexpr const char* ArchicadMajor = "25";
+#else
+    constexpr const char* ArchicadMajor = "28";
+#endif
+    const std::string expectedCopy = std::string (localAppData) + "\\ArchicadTapirMcp\\runner\\scratch\\AC" + ArchicadMajor + "\\mutation-" + runIdUtf8 + ".pln";
+    const std::string suppliedPath = FixtureUtf8 (expectedProjectPath);
+    const std::string openedPath = FixtureUtf8 (*projectInfo.projectPath);
+    std::string expectedCanonical, expectedFull, suppliedCanonical, openedCanonical;
+    if (!FixtureCanonicalExistingPath (expectedCopy, expectedCanonical) || !FixtureFullPath (expectedCopy, expectedFull)
+        || !FixtureCanonicalExistingPath (suppliedPath, suppliedCanonical) || !FixtureCanonicalExistingPath (openedPath, openedCanonical))
+        return FixtureError ("The expected disposable copy, supplied path, or current project path is unavailable.");
+    if (FixturePathKey (expectedCanonical) != FixturePathKey (expectedFull)
+        || FixturePathKey (suppliedPath) != FixturePathKey (expectedCopy)
+        || FixturePathKey (openedPath) != FixturePathKey (expectedCopy)
+        || FixturePathKey (suppliedCanonical) != FixturePathKey (expectedCanonical)
+        || FixturePathKey (openedCanonical) != FixturePathKey (expectedCanonical))
+        return FixtureError ("The expected, supplied and opened project must be the exact canonical task-owned mutation copy.");
+
+    API_WindowInfo currentWindow = {};
+    if (ACAPI_Window_GetCurrentWindow (&currentWindow) != NoError || currentWindow.typeID != APIWind_FloorPlanID)
+        return FixtureError ("Fixture preparation is limited to the active Floor Plan window.");
+    API_DatabaseInfo currentDatabase = {};
+    if (ACAPI_Database_GetCurrentDatabase (&currentDatabase) != NoError || currentDatabase.typeID != APIWind_FloorPlanID)
+        return FixtureError ("Fixture preparation requires the current native database itself to be the Floor Plan.", "CURRENT_DATABASE_NOT_FLOOR_PLAN");
+	const API_Guid expectedFixtureDatabaseGuid = currentDatabase.databaseUnId.elemSetId;
+	if (expectedFixtureDatabaseGuid == APINULLGuid)
+		return FixtureError ("The current Floor Plan database identity is unavailable.", "CURRENT_DATABASE_IDENTITY_UNAVAILABLE");
+    API_StoryInfo storyInfo = {};
+    const GS::OnExit storyInfoGuard ([&storyInfo] () { if (storyInfo.data != nullptr) BMKillHandle (reinterpret_cast<GSHandle*> (&storyInfo.data)); });
+    if (ACAPI_ProjectSetting_GetStorySettings (&storyInfo) != NoError || storyInfo.actStory != requestedStory)
+        return FixtureError ("storyIndex must match the currently active native story.");
+
+	GS::ObjectState defaultNotePointerFacts;
+	PreparedNonradialFixtureDefaults preparedDefaults;
+	PreparedLinearStaticFixtureDefaults preparedStaticLinear;
+	if (useNonradialReadControls && !ReadNonradialFixtureDefaultNotePointerFacts (defaultNotePointerFacts, preparedDefaults)) {
+		GS::ObjectState error = FixtureError ("Nonradial fixture defaults did not prove null optional note-access pointers before dispatch.", "FIXTURE_DEFAULT_NOTE_POINTER_UNAVAILABLE");
+		error.Add ("defaultNotePointerAvailability", defaultNotePointerFacts);
+		return error;
+	}
+	if (useFixedStaticLinear && !ReadLinearStaticFixtureDefaultFacts (defaultNotePointerFacts, preparedStaticLinear)) {
+		GS::ObjectState error = FixtureError ("Linear static fixture defaults did not prove an empty memo and null default-note Unicode pointer before dispatch.", "FIXTURE_DEFAULT_NOTE_POINTER_UNAVAILABLE");
+		error.Add ("defaultAvailability", defaultNotePointerFacts);
+		return error;
+	}
+	if (useNonradialReadControls) {
+		preparedDefaults.linear.header.floorInd = static_cast<short> (requestedStory);
+		preparedDefaults.angle.header.floorInd = static_cast<short> (requestedStory);
+		preparedDefaults.levelSingle.header.floorInd = static_cast<short> (requestedStory);
+		preparedDefaults.levelTwo.header.floorInd = static_cast<short> (requestedStory);
+	}
+	if (useFixedStaticLinear) preparedStaticLinear.linear.header.floorInd = static_cast<short> (requestedStory);
+
+    const bool includeCoreDimensions = preset != "radial-arc-on-read-v1";
+	const bool includeRadialArcOn = preset != "core-dimension-read-v1" && preset != "nonradial-read-controls-v1" && !useFixedStaticLinear;
+    GS::ObjectState radialHostBefore;
+    GS::ObjectState radialHostAfter;
+    API_Guid radialHostGuid = APINULLGuid;
+    bool radialHostUnchanged = false;
+    struct CreatedFixture { const char* role; API_Guid guid; API_ElemTypeID type; };
+    GS::Array<CreatedFixture> created;
+    // Reuse the pure fixed-input generator also exposed by the read-only
+    // preflight. Keep this independent byte roundtrip guard before creation.
+    GS::ObjectState requestedFixtureInputProof;
+    GS::UniString longUnicodeNote, linearUnicodeNote;
+    const bool fixtureInputEncodingVerified = BuildNativeDimensionFixtureInputProof (requestedFixtureInputProof, longUnicodeNote, linearUnicodeNote);
+    if (!fixtureInputEncodingVerified) {
+        GS::ObjectState error = FixtureError ("Fixed fixture Unicode construction did not round-trip its explicit UTF-8 bytes before the undoable write.", "FIXTURE_INPUT_ENCODING_MISMATCH");
+        error.Add ("requestedFixtureInputProof", requestedFixtureInputProof);
+        return error;
+    }
+	if (!AddNativeDimensionFixturePresetInputProof (requestedFixtureInputProof, preset, longUnicodeNote, linearUnicodeNote, defaultNotePointerFacts)) {
+		GS::ObjectState error = FixtureError ("Nonradial fixture defaults changed before dispatch; optional note-access pointers must remain null.", "FIXTURE_DEFAULT_NOTE_POINTER_UNAVAILABLE");
+		error.Add ("requestedFixtureInputProof", requestedFixtureInputProof);
+		return error;
+	}
+    // The API memo note pointers use heap ownership.  Keep distinct strings for
+    // each note until the undoable command and memo disposal have completed;
+    // never alias defNote.contentUStr across point notes.
+    std::array<std::unique_ptr<GS::UniString>, 16> fixtureNoteStrings;
+    const auto makeFixtureText = [&fixtureNoteStrings, &longUnicodeNote] (const GS::UIndex index) -> bool {
+        fixtureNoteStrings[index].reset (new (std::nothrow) GS::UniString (longUnicodeNote));
+        return fixtureNoteStrings[index] != nullptr;
+    };
+    const char* failingStep = "undoable-command";
+    const char* failingRole = "transaction";
+    GS::ObjectState refcMaskStudy;
+    GS::ObjectState refcInplaceStudy;
+	GS::ObjectState automaticMeasuredRelocationStudy;
+	if (useLinearStaticRefcInplaceStudy) {
+		// This invariant exists even when CREATE fails before a later study stage
+		// can be observed. Do not synthesize missing stages in that prefix.
+		refcInplaceStudy.Add ("meaning", "private-characterization-only-sdk-does-not-guarantee-derived-position-or-note-translation");
+	}
+	if (useLinearStaticAutomaticMeasuredRelocation) {
+		automaticMeasuredRelocationStudy.Add ("meaning", "private-automatic-measured-refc-relocation-hypothesis-not-sdk-guarantee-source-proof-or-writer-admission");
+	}
+    bool inplaceReturnedIdentityExact = false;
+    bool inplaceChangeMayHaveRun = false;
+	bool automaticRelocationReturnedIdentityExact = false;
+	bool automaticRelocationChangeMayHaveRun = false;
+    // Burn the nonce immediately before dispatching the only write transaction.
+    // Any timeout after this point is unknown and cannot be retried in-process.
+    gUsedNativeDimensionFixtureNonces.insert (nonceUtf8);
+    GSErrCode createResult = ACAPI_CallUndoableCommand ("Create Native Dimension Read Fixtures", [&] () -> GSErrCode {
+        GSErrCode err = NoError;
+        if (includeCoreDimensions) {
+        API_Element linearStorage = {};
+        API_ElementMemo linearMemoStorage = {};
+        API_Element& linear = useNonradialReadControls ? preparedDefaults.linear : useFixedStaticLinear ? preparedStaticLinear.linear : linearStorage;
+        API_ElementMemo& linearMemo = useNonradialReadControls ? preparedDefaults.linearMemo : useFixedStaticLinear ? preparedStaticLinear.memo : linearMemoStorage;
+        const GS::OnExit linearMemoGuard ([&linearMemoStorage, useNonradialReadControls, useFixedStaticLinear] () { if (!useNonradialReadControls && !useFixedStaticLinear) ACAPI_DisposeElemMemoHdls (&linearMemoStorage); });
+        const char* linearRole = useLinearStaticRefcMaskStudy ? "linear-static-refc-mask-study"
+            : useLinearStaticRefcInplaceStudy ? "linear-static-refc-inplace-study"
+            : useLinearStaticAutomaticMeasuredRelocation ? "linear-static-refc-automatic-measured-relocation"
+            : useLinearStaticMeasuredTwoPoint ? "linear-static-measured-two-point" : "linear-chain-notes";
+        failingStep = "defaults"; failingRole = linearRole;
+        if (!useNonradialReadControls && !useFixedStaticLinear) {
+            SetNativeElementTypeHeader (linear, API_DimensionID);
+            err = InitializeNativeFixtureElement (linear, &linearMemo, requestedStory);
+        }
+        if (err != NoError) return err;
+		if ((useNonradialReadControls || useFixedStaticLinear) && linear.dimension.defNote.contentUStr != nullptr) return APIERR_BADPARS;
+        linear.dimension.dimAppear = APIApp_Normal;
+        linear.dimension.textPos = APIPos_Above;
+		linear.dimension.textWay = (useNonradialReadControls || useFixedStaticLinear) ? APIDir_Horizontal : APIDir_Parallel;
+        linear.dimension.defStaticDim = true;
+        linear.dimension.usedIn3D = false;
+        linear.dimension.horizontalText = false;
+        if (useFixedStaticLinear) linear.dimension.pushNeighborEnabled = false;
+        linear.dimension.refC = { 20.0, 20.0 };
+        linear.dimension.direction = { 1.0, 0.0 };
+		linear.dimension.defNote.contentType = (useNonradialReadControls || useFixedStaticLinear) ? API_NoteContent_Measured : API_NoteContent_Custom;
+		linear.dimension.defNote.contentUStr = nullptr;
+		if (useFixedStaticLinear) {
+			std::fill (linear.dimension.defNote.content, linear.dimension.defNote.content + sizeof (linear.dimension.defNote.content), '\0');
+			linear.dimension.defNote.fixPos = false;
+			linear.dimension.defNote.useLeaderLine = false;
+		}
+		if (!useNonradialReadControls) {
+		if (!useFixedStaticLinear) {
+			failingStep = "text-allocation"; failingRole = "linear-chain-notes.defaultNote";
+			if (!makeFixtureText (6)) return APIERR_MEMFULL;
+			linear.dimension.defNote.contentUStr = fixtureNoteStrings[6].get ();
+		}
+		}
+        failingStep = "memo-allocation"; failingRole = linearRole;
+		// The prepared SDK default memo remains owned by PreparedNonradialFixtureDefaults.
+		// Never overwrite its handle: a nonempty/uninspectable default was refused
+		// before dispatch, and this immediate guard protects against drift.
+		if ((useNonradialReadControls || useFixedStaticLinear) && (linear.dimension.nDimElem != 0 || linearMemo.dimElems != nullptr)) return APIERR_BADPARS;
+		if (useFixedStaticLinear) {
+			err = BuildFixedStaticMeasuredTwoPointDimension (linear, linearMemo, static_cast<Int16> (requestedStory));
+			if (err != NoError) return err;
+		} else {
+			const Int32 fixturePointCount = 7;
+			API_DimElem** allocatedDimElems = reinterpret_cast<API_DimElem**> (BMhAllClear (fixturePointCount * sizeof (API_DimElem)));
+			if (allocatedDimElems == nullptr) return APIERR_MEMFULL;
+			if (*allocatedDimElems == nullptr) {
+				BMKillHandle (reinterpret_cast<GSHandle*> (&allocatedDimElems));
+				return APIERR_MEMFULL;
+			}
+			linearMemo.dimElems = allocatedDimElems;
+			linear.dimension.nDimElem = fixturePointCount;
+
+        const GS::UniString linearNoteTexts[] = {
+            GS::UniString ("<MeasuredValue>"), GS::UniString ("Literal dimension note"), GS::UniString ("4999"),
+            linearUnicodeNote, GS::UniString ("<UnrecognizedDimensionToken>")
+        };
+        for (Int32 i = 0; i < 7; ++i) {
+            API_DimElem& point = (*linearMemo.dimElems)[i];
+            point.base.loc = { 20.0 + 4.0 * i, 15.0 };
+            point.pos = { 20.0 + 4.0 * i, 20.0 };
+            point.note = linear.dimension.defNote;
+            point.note.contentUStr = nullptr;
+            point.note.contentType = API_NoteContent_Measured;
+            point.witnessVal = linear.dimension.defWitnessVal;
+            point.witnessForm = linear.dimension.defWitnessForm;
+            point.fixedPos = true;
+            if (i == 0) { point.note.contentType = API_NoteContent_Measured; point.note.fixPos = false; }
+            if (i >= 1 && i <= 5) {
+                failingStep = "text-allocation"; failingRole = "linear-chain-notes.point-note";
+                point.note.contentType = API_NoteContent_Custom;
+                const GS::UIndex noteIndex = static_cast<GS::UIndex> (i - 1);
+                fixtureNoteStrings[noteIndex].reset (new (std::nothrow) GS::UniString (linearNoteTexts[noteIndex]));
+                if (fixtureNoteStrings[noteIndex] == nullptr) return APIERR_MEMFULL;
+                point.note.contentUStr = fixtureNoteStrings[noteIndex].release ();
+                point.note.fixPos = true;
+                point.note.pos = { point.pos.x + 0.5, point.pos.y + 1.0 };
+            }
+            if (i == 6) {
+                point.note.contentType = API_NoteContent_Measured;
+                point.note.fixPos = true;
+                point.note.useLeaderLine = true; point.note.anchorAtTextEnd = false;
+                point.note.pos = { point.pos.x + 0.5, point.pos.y + 1.0 };
+                point.note.begC = { point.pos.x, point.pos.y }; point.note.midC = { point.pos.x + 1.0, point.pos.y + 2.0 }; point.note.endC = { point.pos.x + 5.0, point.pos.y + 2.0 };
+            }
+            if ((i == 0 || i == 6) && !useNonradialReadControls) {
+                const GS::UIndex noteIndex = i == 0 ? 13 : 14;
+                failingStep = "text-allocation"; failingRole = "linear-chain-notes.measured-point-note";
+                if (!makeFixtureText (noteIndex)) return APIERR_MEMFULL;
+                point.note.contentUStr = fixtureNoteStrings[noteIndex].release ();
+            }
+        }
+		}
+        failingStep = "element-create"; failingRole = linearRole;
+        err = ACAPI_Element_Create (&linear, &linearMemo);
+        if (err != NoError || linear.header.guid == APINULLGuid) return err == NoError ? APIERR_BADID : err;
+        created.Push ({ linearRole, linear.header.guid, API_DimensionID });
+
+		if (useLinearStaticRefcMaskStudy || useLinearStaticRefcInplaceStudy || useLinearStaticAutomaticMeasuredRelocation) {
+			GS::ObjectState& study = useLinearStaticAutomaticMeasuredRelocation ? automaticMeasuredRelocationStudy
+				: useLinearStaticRefcInplaceStudy ? refcInplaceStudy : refcMaskStudy;
+			GS::ObjectState beforeRead;
+			UInt64 beforeStamp = 0;
+			GS::ObjectState beforeRaw = ReadNativeDimensionFixtureRow (linear.header.guid, processControl);
+			const bool beforeFactsMatch = useLinearStaticAutomaticMeasuredRelocation
+				? IsNativeDimensionAutomaticRelocationPrechangeStage (beforeRaw, linear.header.guid, expectedFixtureDatabaseGuid, requestedStory, beforeStamp)
+				: IsNativeDimensionMaskedPositionStage (beforeRaw, linear.header.guid, expectedFixtureDatabaseGuid, requestedStory, 20.0, beforeStamp);
+			beforeRead.Add ("status", beforeFactsMatch ? "exact-created-parent-baseline" : "unavailable-or-baseline-different");
+			beforeRead.Add ("modificationStamp", static_cast<Int64> (beforeStamp));
+			beforeRead.Add ("rawResponse", beforeRaw);
+			study.Add ("beforeRead", beforeRead);
+			if (!beforeFactsMatch) { failingStep = "before-read"; failingRole = linearRole; return APIERR_BADID; }
+
+			API_Element changed = {};
+			changed.header.guid = linear.header.guid;
+			failingStep = "prechange-exact-read"; failingRole = linearRole;
+			err = ACAPI_Element_Get (&changed);
+			const bool directIdentityExact = err == NoError && changed.header.guid == linear.header.guid
+				&& GetElemTypeId (changed.header) == API_DimensionID;
+			const bool directRevisionAndRefCMatch = directIdentityExact && changed.header.modiStamp == beforeStamp
+				&& std::abs (changed.dimension.refC.x - 20.0) <= 1.0e-8 && std::abs (changed.dimension.refC.y - 20.0) <= 1.0e-8;
+			const char* directReadStatus = err != NoError ? "sdk-error" : !directIdentityExact ? "identity-mismatch"
+				: !directRevisionAndRefCMatch ? "revision-or-refC-mismatch" : "exact-created-guid-type-stamp-and-refC";
+			study.Add ("beforeElement", GS::ObjectState (
+				"status", directReadStatus, "errorCode", static_cast<Int32> (err),
+				"guid", err == NoError ? APIGuidToString (changed.header.guid) : GS::UniString (),
+				"nativeElementTypeId", err == NoError ? static_cast<Int32> (GetElemTypeId (changed.header)) : -1,
+				"modificationStamp", err == NoError ? static_cast<Int64> (changed.header.modiStamp) : 0,
+				"refC", err == NoError ? GS::ObjectState ("x", changed.dimension.refC.x, "y", changed.dimension.refC.y) : GS::ObjectState ()));
+			if (err != NoError || !directIdentityExact || !directRevisionAndRefCMatch) {
+				const char* refusalStatus = err != NoError ? "sdk-error" : !directIdentityExact ? "identity-mismatch"
+					: "revision-or-refC-mismatch";
+				GS::ObjectState changeStage ("status", "not-dispatched", "errorCode", static_cast<Int32> (err), "refusalStatus", refusalStatus, "field", "API_DimensionType.refC", "memo", "null", "memoMask", 0, "withdel", useLinearStaticRefcInplaceStudy || useLinearStaticAutomaticMeasuredRelocation);
+				changeStage.AddList<GS::UniString> ("elementMaskFields");
+				study.Add ("change", changeStage);
+				failingStep = "prechange-exact-read";
+				return err != NoError ? err : APIERR_BADID;
+			}
+			GS::ObjectState beforeContext;
+			const bool contextBeforeChangeValid = CaptureFixedMaskedStudyContext (beforeContext, currentScope.Get (), expectedFixtureDatabaseGuid, requestedStory);
+			study.Add ("contextBeforeChange", beforeContext);
+			if (!contextBeforeChangeValid) {
+				GS::ObjectState changeStage ("status", "not-dispatched", "errorCode", static_cast<Int32> (APIERR_BADID), "field", "API_DimensionType.refC", "memo", "null", "memoMask", 0, "withdel", useLinearStaticRefcInplaceStudy || useLinearStaticAutomaticMeasuredRelocation);
+				changeStage.AddList<GS::UniString> ("elementMaskFields");
+				study.Add ("change", changeStage);
+				failingStep = "prechange-context-check"; return APIERR_BADID;
+			}
+			changed.dimension.refC = { 20.0, useLinearStaticAutomaticMeasuredRelocation ? 18.0 : 21.0 };
+			API_Element mask = {};
+			ACAPI_ELEMENT_MASK_CLEAR (mask);
+			ACAPI_ELEMENT_MASK_SET (mask, API_DimensionType, refC);
+			failingStep = "element-change"; failingRole = linearRole;
+			const API_Guid changeInputGuid = changed.header.guid;
+			if (useLinearStaticRefcInplaceStudy) inplaceChangeMayHaveRun = true;
+			if (useLinearStaticAutomaticMeasuredRelocation) automaticRelocationChangeMayHaveRun = true;
+			err = (useLinearStaticRefcInplaceStudy || useLinearStaticAutomaticMeasuredRelocation)
+				? ACAPI_Element_Change (&changed, &mask, nullptr, 0, true)
+				: ACAPI_Element_Change (&changed, &mask, nullptr, 0, false);
+			const API_Guid returnedGuid = changed.header.guid;
+			const bool returnedGuidValid = returnedGuid != APINULLGuid;
+			const bool returnedGuidSame = returnedGuidValid && returnedGuid == changeInputGuid;
+			const API_ElemTypeID returnedType = GetElemTypeId (changed.header);
+			inplaceReturnedIdentityExact = !useLinearStaticRefcInplaceStudy
+				|| (err == NoError && returnedGuidSame && returnedType == API_DimensionID);
+			automaticRelocationReturnedIdentityExact = !useLinearStaticAutomaticMeasuredRelocation
+				|| (err == NoError && returnedGuidSame && returnedType == API_DimensionID);
+			GS::ObjectState changeStage ("status", err == NoError ? "applied" : "error", "errorCode", static_cast<Int32> (err),
+				"field", "API_DimensionType.refC", "memo", "null", "memoMask", 0,
+				"withdel", useLinearStaticRefcInplaceStudy || useLinearStaticAutomaticMeasuredRelocation);
+			if (useLinearStaticRefcInplaceStudy || useLinearStaticAutomaticMeasuredRelocation) {
+				changeStage.Add ("inputGuid", APIGuidToString (changeInputGuid));
+				changeStage.Add ("returnedGuid", returnedGuidValid ? APIGuidToString (returnedGuid) : GS::UniString ());
+				changeStage.Add ("returnedGuidStatus", !returnedGuidValid ? "null-guid-observed" : returnedGuidSame ? "same-exact-guid" : "different-guid-observed");
+				changeStage.Add ("returnedNativeElementTypeId", static_cast<Int32> (returnedType));
+				changeStage.Add ("returnedHeaderStatus", err == NoError ? "returned-header-observed" : "sdk-error-buffer-retained");
+			}
+			const auto& changedFields = changeStage.AddList<GS::UniString> ("elementMaskFields");
+			changedFields ("refC");
+			study.Add ("change", changeStage);
+			if (err != NoError) return err;
+			if ((useLinearStaticRefcInplaceStudy || useLinearStaticAutomaticMeasuredRelocation) && (!returnedGuidSame || returnedType != API_DimensionID)) {
+				failingStep = "change-returned-identity"; failingRole = linearRole;
+				// No follow-up getter may reinterpret a different or null returned
+				// identity as the original dimension. Preserve this prefix only.
+				return APIERR_BADID;
+			}
+			GS::ObjectState afterContext;
+			const bool contextAfterChangeValid = CaptureFixedMaskedStudyContext (afterContext, currentScope.Get (), expectedFixtureDatabaseGuid, requestedStory);
+			study.Add ("contextAfterChange", afterContext);
+			API_Element afterElement = {};
+			const API_Guid expectedAfterGuid = (useLinearStaticRefcInplaceStudy || useLinearStaticAutomaticMeasuredRelocation) ? returnedGuid : linear.header.guid;
+			GSErrCode afterElementError = NoError;
+			if (expectedAfterGuid != APINULLGuid) {
+				afterElement.header.guid = expectedAfterGuid;
+				afterElementError = ACAPI_Element_Get (&afterElement);
+			}
+			const bool afterElementIdentityExact = afterElementError == NoError && expectedAfterGuid != APINULLGuid && afterElement.header.guid == expectedAfterGuid
+				&& GetElemTypeId (afterElement.header) == API_DimensionID;
+			const char* afterElementStatus = expectedAfterGuid == APINULLGuid ? "null-guid-observed" : afterElementError != NoError ? "sdk-error"
+				: afterElement.header.guid != expectedAfterGuid ? "guid-mismatch"
+				: GetElemTypeId (afterElement.header) != API_DimensionID ? "type-mismatch"
+				: (useLinearStaticRefcInplaceStudy || useLinearStaticAutomaticMeasuredRelocation) ? "exact-change-returned-guid-type-readback" : "exact-created-guid-type-readback";
+			study.Add ("afterElement", GS::ObjectState (
+				"status", afterElementStatus,
+				"errorCode", static_cast<Int32> (afterElementError),
+				"guid", afterElementError == NoError ? APIGuidToString (afterElement.header.guid) : GS::UniString (),
+				"nativeElementTypeId", afterElementError == NoError ? static_cast<Int32> (GetElemTypeId (afterElement.header)) : -1,
+				"modificationStamp", afterElementError == NoError ? static_cast<Int64> (afterElement.header.modiStamp) : 0,
+				"refC", afterElementIdentityExact ? GS::ObjectState ("x", afterElement.dimension.refC.x, "y", afterElement.dimension.refC.y) : GS::ObjectState ()));
+
+			GS::ObjectState afterRaw;
+			UInt64 afterStamp = 0;
+			const bool afterRawAvailable = expectedAfterGuid != APINULLGuid;
+			bool afterHypothesisMatches = false;
+			if (afterRawAvailable) {
+				afterRaw = ReadNativeDimensionFixtureRow (expectedAfterGuid, processControl);
+				afterHypothesisMatches = useLinearStaticAutomaticMeasuredRelocation
+					? IsNativeDimensionAutomaticRelocationHypothesis (beforeRaw, afterRaw, expectedAfterGuid, expectedFixtureDatabaseGuid, requestedStory, afterStamp)
+					: IsNativeDimensionMaskedPositionStage (afterRaw, expectedAfterGuid, expectedFixtureDatabaseGuid, requestedStory, 21.0, afterStamp);
+			}
+			const bool afterReaderIdentityRevisionAvailable = afterStamp > 0 && afterElementIdentityExact
+				&& afterElement.header.modiStamp == afterStamp;
+			const bool afterRefCMatches = afterElementIdentityExact
+				&& std::abs (afterElement.dimension.refC.x - 20.0) <= 1.0e-8
+				&& std::abs (afterElement.dimension.refC.y - (useLinearStaticAutomaticMeasuredRelocation ? 18.0 : 21.0)) <= 1.0e-8;
+			const bool afterGeometryHypothesisMatches = afterHypothesisMatches && afterReaderIdentityRevisionAvailable && afterRefCMatches;
+			GS::ObjectState afterRead (
+				"status", !afterRawAvailable ? "not-read-null-returned-guid" : afterReaderIdentityRevisionAvailable ? "exact-reader-identity-and-revision-available" : "reader-identity-or-revision-unavailable",
+				"readerIdentityStatus", afterReaderIdentityRevisionAvailable ? "exact-parent-story-database-and-revision" : "identity-or-revision-unavailable",
+				"geometryHypothesisStatus", !afterReaderIdentityRevisionAvailable ? "incomplete" : afterGeometryHypothesisMatches ? "matches" : "differs",
+				"modificationStamp", static_cast<Int64> (afterStamp));
+			if (afterRawAvailable) afterRead.Add ("rawResponse", afterRaw);
+			study.Add ("afterRead", afterRead);
+			const bool allAfterGeometricHypothesesMatch = afterGeometryHypothesisMatches && contextAfterChangeValid;
+			study.Add ("hypothesisStatus", allAfterGeometricHypothesesMatch ? "predeclared-geometric-hypotheses-match" : "predeclared-hypothesis-not-confirmed-raw-facts-retained");
+			if (!useLinearStaticRefcInplaceStudy && !useLinearStaticAutomaticMeasuredRelocation)
+				study.Add ("meaning", "private-characterization-only-sdk-does-not-guarantee-derived-position-or-note-translation");
+		}
+
+        if (!useFixedStaticLinear) {
+        API_Element angleStorage = {};
+        API_ElementMemo angleMemoStorage = {};
+        API_Element& angle = useNonradialReadControls ? preparedDefaults.angle : angleStorage;
+        API_ElementMemo& angleMemo = useNonradialReadControls ? preparedDefaults.angleMemo : angleMemoStorage;
+        const GS::OnExit angleMemoGuard ([&angleMemoStorage, useNonradialReadControls] () { if (!useNonradialReadControls) ACAPI_DisposeElemMemoHdls (&angleMemoStorage); });
+        failingStep = "defaults"; failingRole = "static-angle";
+        if (!useNonradialReadControls) {
+            SetNativeElementTypeHeader (angle, API_AngleDimensionID);
+            err = InitializeNativeFixtureElement (angle, &angleMemo, requestedStory);
+        }
+        if (err != NoError) return err;
+		if (useNonradialReadControls && angle.angleDimension.note.contentUStr != nullptr) return APIERR_BADPARS;
+        angle.angleDimension.base[0].loc = { 20.0, 5.0 }; angle.angleDimension.base[1].loc = { 25.0, 5.0 };
+        angle.angleDimension.base[2].loc = { 20.0, 5.0 }; angle.angleDimension.base[3].loc = { 20.0, 10.0 };
+        angle.angleDimension.origo = { 20.0, 5.0 }; angle.angleDimension.pos = { 23.5, 8.5 };
+		angle.angleDimension.note.contentType = useNonradialReadControls ? API_NoteContent_Measured : API_NoteContent_Custom;
+		angle.angleDimension.note.contentUStr = nullptr;
+		if (!useNonradialReadControls) {
+			failingStep = "text-allocation"; failingRole = "static-angle.note";
+			if (!makeFixtureText (7)) return APIERR_MEMFULL;
+			angle.angleDimension.note.contentUStr = fixtureNoteStrings[7].get ();
+		}
+        angle.angleDimension.note.fixPos = true; angle.angleDimension.note.useLeaderLine = true;
+        if (useNonradialReadControls) angle.angleDimension.note.pos = { 23.5, 8.5 };
+        angle.angleDimension.note.begC = angle.angleDimension.pos; angle.angleDimension.note.midC = { 24.5, 10.5 }; angle.angleDimension.note.endC = { 29.5, 10.5 };
+        failingStep = "element-create"; failingRole = "static-angle";
+        err = ACAPI_Element_Create (&angle, &angleMemo);
+        if (err != NoError || angle.header.guid == APINULLGuid) return err == NoError ? APIERR_BADID : err;
+        created.Push ({ "static-angle", angle.header.guid, API_AngleDimensionID });
+
+        for (Int32 form : { 0, 8 }) {
+            API_Element levelStorage = {};
+            API_ElementMemo levelMemoStorage = {};
+            API_Element& level = useNonradialReadControls
+                ? (form == 0 ? preparedDefaults.levelSingle : preparedDefaults.levelTwo) : levelStorage;
+            API_ElementMemo& levelMemo = useNonradialReadControls
+                ? (form == 0 ? preparedDefaults.levelSingleMemo : preparedDefaults.levelTwoMemo) : levelMemoStorage;
+            const GS::OnExit levelMemoGuard ([&levelMemoStorage, useNonradialReadControls] () { if (!useNonradialReadControls) ACAPI_DisposeElemMemoHdls (&levelMemoStorage); });
+            failingStep = "defaults"; failingRole = form == 0 ? "level-single-note" : "level-two-note";
+            if (!useNonradialReadControls) {
+                SetNativeElementTypeHeader (level, API_LevelDimensionID);
+                err = InitializeNativeFixtureElement (level, &levelMemo, requestedStory);
+            }
+            if (err != NoError) return err;
+			if (useNonradialReadControls && (level.levelDimension.note1.contentUStr != nullptr || level.levelDimension.note2.contentUStr != nullptr)) return APIERR_BADPARS;
+			level.levelDimension.staticLevel = !useNonradialReadControls;
+            level.levelDimension.dimForm = static_cast<short> (form);
+            level.levelDimension.parentType = API_ZombieElemID;
+			if (useNonradialReadControls) {
+				level.levelDimension.parentGuid = APINULLGuid;
+				if (form == 8) level.levelDimension.needPlus = false;
+			}
+            level.levelDimension.level = form == 0 ? 1.25 : 2.5;
+            level.levelDimension.loc = { form == 0 ? 20.0 : 30.0, 30.0 };
+            level.levelDimension.note2.contentUStr = nullptr;
+            const GS::UIndex levelNote1Index = form == 0 ? 9 : 10;
+            failingStep = "text-allocation"; failingRole = form == 0 ? "level-single-note.note1" : "level-two-note.note1";
+            if (!makeFixtureText (levelNote1Index)) return APIERR_MEMFULL;
+            level.levelDimension.note1.contentType = API_NoteContent_Custom;
+            level.levelDimension.note1.contentUStr = fixtureNoteStrings[levelNote1Index].get ();
+            if (form == 8) {
+                failingStep = "text-allocation"; failingRole = "level-two-note.note2";
+                if (!makeFixtureText (11)) return APIERR_MEMFULL;
+                level.levelDimension.note2.contentType = API_NoteContent_Custom;
+                level.levelDimension.note2.contentUStr = fixtureNoteStrings[11].get ();
+            } else {
+                failingStep = "text-allocation"; failingRole = "level-single-note.inactive-note2";
+                if (!makeFixtureText (15)) return APIERR_MEMFULL;
+                level.levelDimension.note2.contentType = API_NoteContent_Custom;
+                level.levelDimension.note2.contentUStr = fixtureNoteStrings[15].get ();
+            }
+            failingStep = "element-create"; failingRole = form == 0 ? "level-single-note" : "level-two-note";
+            err = ACAPI_Element_Create (&level, &levelMemo);
+            if (err != NoError || level.header.guid == APINULLGuid) return err == NoError ? APIERR_BADID : err;
+            created.Push ({ form == 0 ? "level-single-note" : "level-two-note", level.header.guid, API_LevelDimensionID });
+        }
+
+        }
+		}
+
+        if (includeRadialArcOn) {
+        API_Element arc = {};
+        SetNativeElementTypeHeader (arc, API_ArcID);
+        failingStep = "defaults"; failingRole = "radial-host-arc";
+        err = InitializeNativeFixtureElement (arc, nullptr, requestedStory);
+        if (err != NoError) return err;
+        arc.arc.origC = { 40.0, 20.0 }; arc.arc.r = 4.0; arc.arc.ratio = 1.0; arc.arc.begAng = 0.0; arc.arc.endAng = 5.0;
+        failingStep = "element-create"; failingRole = "radial-host-arc";
+        err = ACAPI_Element_Create (&arc, nullptr);
+        if (err != NoError || arc.header.guid == APINULLGuid) return err == NoError ? APIERR_BADID : err;
+        radialHostGuid = arc.header.guid;
+        created.Push ({ "radial-host-arc", arc.header.guid, API_ArcID });
+
+        API_Element freshArcBeforeRadial = {};
+        freshArcBeforeRadial.header.guid = arc.header.guid;
+        failingStep = "radial-host-readback-before"; failingRole = "radial-host-arc";
+        err = ACAPI_Element_Get (&freshArcBeforeRadial);
+        if (err != NoError || freshArcBeforeRadial.header.guid != arc.header.guid || GetElemTypeId (freshArcBeforeRadial.header) != API_ArcID
+            || std::abs (freshArcBeforeRadial.arc.origC.x - 40.0) > 1.0e-9 || std::abs (freshArcBeforeRadial.arc.origC.y - 20.0) > 1.0e-9
+            || std::abs (freshArcBeforeRadial.arc.r - 4.0) > 1.0e-9 || std::abs (freshArcBeforeRadial.arc.ratio - 1.0) > 1.0e-9
+            || std::abs (freshArcBeforeRadial.arc.begAng - 0.0) > 1.0e-9 || std::abs (freshArcBeforeRadial.arc.endAng - 5.0) > 1.0e-9)
+            return err == NoError ? APIERR_BADID : err;
+        const auto arcSnapshot = [] (const API_Element& value) {
+            return GS::ObjectState (
+                "status", "exact-guid-type-and-fixed-geometry-readback",
+                "guid", APIGuidToString (value.header.guid),
+                "elementType", "Arc",
+                "geometry", GS::ObjectState (
+                    "center", GS::ObjectState ("x", value.arc.origC.x, "y", value.arc.origC.y),
+                    "radius", value.arc.r, "ratio", value.arc.ratio,
+                    "beginAngle", value.arc.begAng, "endAngle", value.arc.endAng));
+        };
+        radialHostBefore = arcSnapshot (freshArcBeforeRadial);
+
+        API_Element radial = {};
+        SetNativeElementTypeHeader (radial, API_RadialDimensionID);
+        API_ElementMemo radialMemo = {};
+        const GS::OnExit radialMemoGuard ([&radialMemo] () { ACAPI_DisposeElemMemoHdls (&radialMemo); });
+        failingStep = "defaults"; failingRole = "radial-associated-to-created-arc";
+        err = InitializeNativeFixtureElement (radial, &radialMemo, requestedStory);
+        if (err != NoError) return err;
+#if TAPIR_AC_VERSION == 25
+        radial.radialDimension.base.base.typeID = API_ArcID;
+#else
+        radial.radialDimension.base.base.type.typeID = API_ArcID;
+#endif
+        radial.radialDimension.base.base.line = preset == "radial-arc-on-read-v1";
+        radial.radialDimension.base.base.guid = arc.header.guid;
+        radial.radialDimension.base.loc = { 40.0, 20.0 };
+        radial.radialDimension.endC = { 44.0, 20.0 };
+        radial.radialDimension.note.contentType = API_NoteContent_Custom;
+        failingStep = "text-allocation"; failingRole = "radial-associated-to-created-arc.note";
+        if (!makeFixtureText (8)) return APIERR_MEMFULL;
+        radial.radialDimension.note.contentUStr = fixtureNoteStrings[8].get ();
+        failingStep = "prefix-setup"; failingRole = "radial-associated-to-created-arc.prefix";
+        std::fill (radial.radialDimension.prefix, radial.radialDimension.prefix + sizeof (radial.radialDimension.prefix), '\0');
+        radial.radialDimension.prefix[0] = 'R';
+        radial.radialDimension.prefixUStr = nullptr;
+        failingStep = "element-create"; failingRole = "radial-associated-to-created-arc";
+        err = ACAPI_Element_Create (&radial, &radialMemo);
+        if (err != NoError || radial.header.guid == APINULLGuid) return err == NoError ? APIERR_BADID : err;
+        created.Push ({ "radial-associated-to-created-arc", radial.header.guid, API_RadialDimensionID });
+
+        API_Element freshArcAfterRadial = {};
+        freshArcAfterRadial.header.guid = arc.header.guid;
+        failingStep = "radial-host-readback-after"; failingRole = "radial-host-arc";
+        err = ACAPI_Element_Get (&freshArcAfterRadial);
+        if (err != NoError || freshArcAfterRadial.header.guid != arc.header.guid || GetElemTypeId (freshArcAfterRadial.header) != API_ArcID
+            || std::abs (freshArcAfterRadial.arc.origC.x - 40.0) > 1.0e-9 || std::abs (freshArcAfterRadial.arc.origC.y - 20.0) > 1.0e-9
+            || std::abs (freshArcAfterRadial.arc.r - 4.0) > 1.0e-9 || std::abs (freshArcAfterRadial.arc.ratio - 1.0) > 1.0e-9
+            || std::abs (freshArcAfterRadial.arc.begAng - 0.0) > 1.0e-9 || std::abs (freshArcAfterRadial.arc.endAng - 5.0) > 1.0e-9)
+            return err == NoError ? APIERR_BADID : err;
+        radialHostAfter = arcSnapshot (freshArcAfterRadial);
+        radialHostUnchanged = true;
+        }
+
+        for (const CreatedFixture& item : created) {
+            API_Element readback = {};
+            readback.header.guid = item.guid;
+            failingStep = "element-readback"; failingRole = item.role;
+            err = ACAPI_Element_Get (&readback);
+            const bool exactReadback = err == NoError && readback.header.guid != APINULLGuid
+                && readback.header.guid == item.guid && GetElemTypeId (readback.header) == item.type;
+            if (!exactReadback) return err == NoError ? APIERR_BADID : err;
+        }
+        if ((useLinearStaticRefcInplaceStudy && !inplaceReturnedIdentityExact)
+			|| (useLinearStaticAutomaticMeasuredRelocation && !automaticRelocationReturnedIdentityExact)) {
+            failingStep = "change-returned-identity";
+			failingRole = useLinearStaticAutomaticMeasuredRelocation
+				? "linear-static-refc-automatic-measured-relocation" : "linear-static-refc-inplace-study";
+        } else {
+            failingStep = "complete"; failingRole = "";
+        }
+        return NoError;
+    });
+    if (createResult != NoError && failingRole[0] == '\0') {
+        failingStep = "undoable-command";
+        failingRole = "transaction";
+    }
+    if (useLinearStaticRefcMaskStudy || useLinearStaticRefcInplaceStudy || useLinearStaticAutomaticMeasuredRelocation) {
+		GS::ObjectState& study = useLinearStaticAutomaticMeasuredRelocation ? automaticMeasuredRelocationStudy
+			: useLinearStaticRefcInplaceStudy ? refcInplaceStudy : refcMaskStudy;
+        study.Add ("outerUndoableCommand", GS::ObjectState (
+            "status", createResult == NoError ? "completed" : "error",
+            "errorCode", static_cast<Int32> (createResult)));
+    }
+
+    bool rollbackProven = false;
+    GS::Array<GS::ObjectState> rollbackReadback;
+    if (createResult != NoError) {
+        // The in-place study may return a GUID distinct from the CREATE GUID.
+        // Absence of only the original cannot prove rollback for that operation.
+        rollbackProven = !inplaceChangeMayHaveRun && !automaticRelocationChangeMayHaveRun && !created.IsEmpty ();
+        for (const CreatedFixture& item : created) {
+            API_Elem_Head remaining = {};
+            remaining.guid = item.guid;
+            const GSErrCode readbackError = ACAPI_Element_GetHeader (&remaining);
+            const bool absent = readbackError == APIERR_DELETED;
+            if (!absent) rollbackProven = false;
+            rollbackReadback.Push (GS::ObjectState (
+                "guid", APIGuidToString (item.guid),
+                "absenceStatus", absent ? "apierr-deleted-confirmed-absent" : readbackError == NoError ? "still-present" : "indeterminate-error",
+                "readbackErrorCode", static_cast<Int32> (readbackError)));
+        }
+        if (rollbackReadback.GetSize () != created.GetSize ()) rollbackProven = false;
+    }
+
+    GS::Array<GS::ObjectState> finalCreatedReadbacks;
+    bool finalCreatedReadbacksExact = true;
+    for (const CreatedFixture& item : created) {
+        API_Element readback = {};
+        readback.header.guid = item.guid;
+        const GSErrCode readErr = ACAPI_Element_Get (&readback);
+        const bool exactReadback = readErr == NoError && readback.header.guid != APINULLGuid
+            && readback.header.guid == item.guid && GetElemTypeId (readback.header) == item.type;
+        const GSErrCode reportedReadError = readErr == NoError && !exactReadback ? APIERR_BADID : readErr;
+        if (!exactReadback) {
+            finalCreatedReadbacksExact = false;
+            if (createResult == NoError) {
+                failingStep = "element-readback-response";
+                failingRole = item.role;
+            }
+        }
+        GS::ObjectState row;
+        row.Add ("role", item.role);
+        row.Add ("guid", APIGuidToString (item.guid));
+        row.Add ("elementType", FixtureElementTypeName (item.type));
+        row.Add ("nativeReadback", GS::ObjectState (
+            "status", exactReadback ? "exact-guid-type-confirmed" : "unavailable",
+            "errorCode", static_cast<Int32> (reportedReadError)));
+        finalCreatedReadbacks.Push (row);
+    }
+    const bool fixtureProvisioned = createResult == NoError && finalCreatedReadbacksExact
+		&& (!useLinearStaticRefcInplaceStudy || inplaceReturnedIdentityExact)
+		&& (!useLinearStaticAutomaticMeasuredRelocation || automaticRelocationReturnedIdentityExact);
+
+    GS::ObjectState response;
+    response.Add ("schemaVersion", "native-dimension-read-fixture-v1");
+    response.Add ("preset", preset);
+    response.Add ("actionNonce", actionNonce);
+    response.Add ("fileScopeKey", currentScope.Get ());
+    response.Add ("storyIndex", requestedStory);
+    response.Add ("currentDatabaseType", static_cast<Int32> (currentDatabase.typeID));
+    response.Add ("currentWindowType", static_cast<Int32> (currentWindow.typeID));
+    response.Add ("status", fixtureProvisioned ? "provisioned" : createResult != NoError && rollbackProven ? "failed_rolled_back" : "unknown");
+    response.Add ("transactionErrorCode", static_cast<Int32> (createResult));
+    response.Add ("failingStep", fixtureProvisioned ? "complete" : failingStep);
+    response.Add ("failingRole", fixtureProvisioned ? "" : failingRole);
+    response.Add ("preservationStatus", "independent-protected-set-readback-required");
+    response.Add ("requestedFixtureInputProof", requestedFixtureInputProof);
+    if (useLinearStaticRefcMaskStudy) response.Add ("maskedPositionStudy", refcMaskStudy);
+    if (useLinearStaticRefcInplaceStudy) response.Add ("inplacePositionStudy", refcInplaceStudy);
+	if (useLinearStaticAutomaticMeasuredRelocation) response.Add ("automaticMeasuredRelocationStudy", automaticMeasuredRelocationStudy);
+    if (includeRadialArcOn) {
+        response.Add ("radialHostReadback", GS::ObjectState (
+            "status", radialHostUnchanged ? "verified-unchanged-exact-host-geometry" : "unverified",
+            "guid", radialHostGuid == APINULLGuid ? GS::UniString () : APIGuidToString (radialHostGuid),
+            "elementType", "Arc", "before", radialHostBefore, "after", radialHostAfter));
+        response.Add ("radialAssociationDescriptorStatus", preset == "radial-arc-on-read-v1"
+            ? "fixed-ArcOn-line-kind; node-index-and-location-semantics-unproven"
+            : "all-family-read-v2-fixed-base-line-false");
+    }
+    response.Add ("rollbackVerification", GS::ObjectState (
+        "status", rollbackProven ? "all-created-guids-absent" : fixtureProvisioned ? "not-needed" : "indeterminate",
+        "created", rollbackReadback));
+    const auto& rows = response.AddList<GS::ObjectState> ("created");
+    for (const GS::ObjectState& row : finalCreatedReadbacks) rows (row);
+    return response;
+}
+
+namespace {
 
 GS::ObjectState CreateExecutionResultResponse (const GS::Array<GS::ObjectState>& results)
 {
@@ -4649,6 +6212,4953 @@ GS::ObjectState GetDimensionDataCommand::Execute (const GS::ObjectState& paramet
     }
 
     return response;
+}
+
+// ============================================================================
+// GetNativeDimensionDetails (additive to legacy GetDimensionData)
+// ============================================================================
+
+namespace {
+
+GS::ObjectState DimensionPoint2D (const API_Coord& point)
+{
+    return GS::ObjectState ("x", point.x, "y", point.y, "unit", "project-meter");
+}
+
+GS::ObjectState DimensionPoint3D (const API_Coord3D& point)
+{
+    return GS::ObjectState ("x", point.x, "y", point.y, "z", point.z, "unit", "project-meter");
+}
+
+Int32 DimensionAttributeIndex (const API_AttributeIndex& index)
+{
+#if TAPIR_AC_VERSION == 25
+    return static_cast<Int32> (index);
+#else
+    return index.ToInt32_Deprecated ();
+#endif
+}
+
+GS::ObjectState DimensionBaseDetails (const API_DimBase& base)
+{
+    GS::ObjectState state;
+#if TAPIR_AC_VERSION == 25
+    const Int32 type = static_cast<Int32> (base.base.typeID);
+    state.Add ("elementVariationId", GS::ObjectState ("status", "not-available-in-ac25-API_Base"));
+#else
+    const Int32 type = static_cast<Int32> (base.base.type.typeID);
+    state.Add ("elementVariationId", static_cast<Int32> (base.base.type.variationID));
+#endif
+    state.Add ("elementTypeId", type);
+    state.Add ("lineReference", base.base.line);
+    state.Add ("specialReference", static_cast<Int32> (base.base.special));
+    state.Add ("nodeIndex", base.base.inIndex);
+    state.Add ("elementId", CreateGuidObjectState (base.base.guid));
+    // node_id is a meaningful Base identity field (a polygon-vertex ID on
+    // AC28; the AC25 API documents this storage as the native node ID). Keep
+    // it losslessly, without exposing the reserved node_status/node_typ bits.
+    state.Add ("nativeNodeId", static_cast<UInt64> (base.base.node_id));
+    state.Add ("sectionNodeStatus", static_cast<Int32> (base.base.node_status));
+    state.Add ("sectionNodeType", static_cast<Int32> (base.base.node_typ));
+    state.Add ("sectionNodeFactsStatus", "native-read-only-internal-fields");
+    state.Add ("location", DimensionPoint2D (base.loc));
+    state.Add ("location3D", DimensionPoint3D (base.loc3D));
+    state.Add ("associationStatus", base.base.guid == APINULLGuid ? "no-element-guid" : "element-guid-present-type-not-independently-resolved");
+    return state;
+}
+
+// Defaults are a separate internal diagnostic surface. Keep it typed and do
+// not carry the section-dimension-only node_status/node_typ bits exposed by
+// the historical element reader.
+GS::ObjectState RadialDefaultsBaseDetails (const API_DimBase& base)
+{
+    GS::ObjectState state;
+#if TAPIR_AC_VERSION == 25
+    state.Add ("elementVariationId", GS::ObjectState ("status", "not-available-in-ac25-API_Base"));
+    state.Add ("elementTypeId", static_cast<Int32> (base.base.typeID));
+#else
+    state.Add ("elementVariationId", static_cast<Int32> (base.base.type.variationID));
+    state.Add ("elementTypeId", static_cast<Int32> (base.base.type.typeID));
+#endif
+    state.Add ("lineReference", base.base.line);
+    state.Add ("specialReference", static_cast<Int32> (base.base.special));
+    state.Add ("nodeIndex", base.base.inIndex);
+    state.Add ("elementId", CreateGuidObjectState (base.base.guid));
+    state.Add ("nativeNodeId", static_cast<UInt64> (base.base.node_id));
+    state.Add ("location", DimensionPoint2D (base.loc));
+    state.Add ("location3D", DimensionPoint3D (base.loc3D));
+    state.Add ("associationStatus", base.base.guid == APINULLGuid ? "no-element-guid" : "element-guid-present-type-not-independently-resolved");
+    return state;
+}
+
+GS::ObjectState DimensionFixedContentDetails (const API_NoteType& note)
+{
+    constexpr std::size_t capacity = sizeof (note.content);
+    std::size_t byteLength = 0;
+    while (byteLength < capacity && note.content[byteLength] != '\0') ++byteLength;
+    const bool nulTerminated = byteLength < capacity;
+    bool asciiNulTerminated = nulTerminated;
+    std::string bytesHex;
+    bytesHex.reserve (byteLength * 2);
+    static const char hexDigits[] = "0123456789ABCDEF";
+    for (GS::USize index = 0; index < byteLength; ++index) {
+        const unsigned char byte = static_cast<unsigned char> (note.content[index]);
+        asciiNulTerminated = asciiNulTerminated && byte < 0x80;
+        bytesHex.push_back (hexDigits[byte >> 4]);
+        bytesHex.push_back (hexDigits[byte & 0x0F]);
+    }
+    GS::ObjectState fixedContent;
+    fixedContent.Add ("status", asciiNulTerminated ? "ascii-nul-terminated-verified" : "encoding-unproven");
+    fixedContent.Add ("byteLength", static_cast<Int32> (byteLength));
+    fixedContent.Add ("bufferCapacity", static_cast<Int32> (capacity));
+    fixedContent.Add ("nulTerminated", nulTerminated);
+    fixedContent.Add ("bytesHex", GS::UniString (bytesHex.c_str (), CC_UTF8));
+    if (asciiNulTerminated) {
+        char ascii[sizeof (note.content) + 1] = {};
+        std::copy (note.content, note.content + byteLength, ascii);
+        fixedContent.Add ("value", GS::UniString (ascii, CC_UTF8));
+    }
+    return fixedContent;
+}
+
+GS::ObjectState DimensionNoteDetails (const API_NoteType& note, const GS::UniString* verifiedUnicodeContent = nullptr, const bool allowNativeUnicodePointer = true)
+{
+    GS::ObjectState state;
+    state.Add ("pen", static_cast<Int32> (note.notePen));
+    state.Add ("font", static_cast<Int32> (note.noteFont));
+    state.Add ("layer", DimensionAttributeIndex (note.noteLayer));
+    state.Add ("textHeight", note.noteSize);
+    state.Add ("textHeightUnit", "millimeter-paper-size");
+    state.Add ("angle", note.noteAngle);
+    state.Add ("angleUnit", "radian");
+    state.Add ("position", DimensionPoint2D (note.pos));
+    GS::UniString returnedContent;
+    const char* returnedContentStatus = nullptr;
+    const char* returnedContentSource = nullptr;
+    if (verifiedUnicodeContent != nullptr) {
+        returnedContent = *verifiedUnicodeContent;
+        returnedContentStatus = "unicode-content-available";
+        returnedContentSource = "verified-caller-bound-unicode-contentUStr";
+    } else if (allowNativeUnicodePointer && note.contentUStr != nullptr) {
+        returnedContent = *note.contentUStr;
+        returnedContentStatus = "unicode-content-available";
+        returnedContentSource = "memo-owned-unicode-contentUStr";
+    } else {
+        char fixedContent[sizeof (note.content) + 1] = {};
+        std::copy (note.content, note.content + sizeof (note.content), fixedContent);
+        GS::UInt32 byteLength = 0;
+        while (byteLength < sizeof (note.content) && fixedContent[byteLength] != '\0') ++byteLength;
+        returnedContent = GS::UniString (fixedContent);
+        returnedContentStatus = note.contentUStr == nullptr ? "fixed-buffer-content-preserved-encoding-unproven" : "fixed-buffer-content-unicode-pointer-unverified";
+        returnedContentSource = note.contentUStr == nullptr ? "fixed-buffer-content" : "fixed-buffer-content-unverified-unicode-pointer-not-dereferenced";
+        state.Add ("contentByteLength", static_cast<Int32> (byteLength));
+    }
+    state.Add ("content", returnedContent);
+    state.Add ("contentStatus", returnedContentStatus);
+    state.Add ("contentSource", returnedContentSource);
+    state.Add ("nativeContent", GS::ObjectState (
+        "value", returnedContent,
+        "accessStatus", returnedContentStatus,
+        "accessSource", returnedContentSource,
+        "meaningStatus", "returned-native-content-expression-meaning-unproven"));
+    state.Add ("fixedContent", DimensionFixedContentDetails (note));
+    state.Add ("sourceExpression", GS::ObjectState (
+        "status", "unproven",
+        "reason", "returned-native-content-does-not-prove-original-note-expression"));
+    state.Add ("contentType", static_cast<Int32> (note.contentType));
+    state.Add ("contentMode", note.contentType == API_NoteContent_Measured ? "measured" : note.contentType == API_NoteContent_Custom ? "custom" : "unknown");
+    state.Add ("fixPos", note.fixPos);
+    state.Add ("styleBits", static_cast<Int32> (note.faceBits));
+    state.Add ("opaque", note.opaque);
+    state.Add ("frame", note.frame);
+    state.Add ("backgroundPen", static_cast<Int32> (note.backgroundPen));
+    state.Add ("framePen", static_cast<Int32> (note.framePen));
+    state.Add ("useLeaderLine", note.useLeaderLine);
+    state.Add ("anchorAtTextEnd", note.anchorAtTextEnd);
+    state.Add ("leaderBegin", DimensionPoint2D (note.begC));
+    state.Add ("leaderMiddle", DimensionPoint2D (note.midC));
+    state.Add ("leaderEnd", DimensionPoint2D (note.endC));
+    state.Add ("leaderPen", static_cast<Int32> (note.leaderPen));
+    state.Add ("leaderLineType", DimensionAttributeIndex (note.leaderLineType));
+    state.Add ("leaderShape", static_cast<Int32> (note.leaderShape));
+    state.Add ("leaderArrowType", static_cast<Int32> (note.arrowData.arrowType));
+    state.Add ("leaderArrowAtBegin", note.arrowData.begArrow);
+    state.Add ("leaderArrowAtEnd", note.arrowData.endArrow);
+    state.Add ("leaderArrowPen", static_cast<Int32> (note.arrowData.arrowPen));
+    state.Add ("leaderArrowSize", note.arrowData.arrowSize);
+    state.Add ("anchorPoint", static_cast<Int32> (note.anchorPoint));
+    state.Add ("justification", static_cast<Int32> (note.just));
+    state.Add ("widthFactor", note.widthFactor);
+    state.Add ("spacingFactor", note.spacingFactor);
+    state.Add ("rowAnchor", static_cast<Int32> (note.rowAnchor));
+    state.Add ("effectBits", static_cast<Int32> (note.effectBits));
+    state.Add ("observedDisplay", GS::ObjectState ("status", "unavailable", "reason", "native-note-source-does-not-independently-prove-rendered-display"));
+    return state;
+}
+
+GS::ObjectState DimensionMarkerDetails (const API_MarkerData& marker)
+{
+    return GS::ObjectState (
+        "markerType", static_cast<Int32> (marker.markerType),
+        "markerPen", static_cast<Int32> (marker.markerPen),
+        "markerSize", marker.markerSize,
+        "markerSizeUnit", "millimeter-paper-size");
+}
+
+void AddDimensionUnits (GS::ObjectState& row)
+{
+    API_DimensionPrefs preferences = {};
+    const GSErrCode preferencesError = ACAPI_ProjectSetting_GetPreferences (&preferences, APIPrefs_DimensionsID);
+    GS::ObjectState preferenceState;
+    preferenceState.Add ("status", preferencesError == NoError ? "available" : "unavailable");
+    preferenceState.Add ("source", "ACAPI_ProjectSetting_GetPreferences/APIPrefs_DimensionsID");
+    preferenceState.Add ("scope", "project-dimension-preferences");
+    preferenceState.Add ("savedViewEffectiveFormat", "not-proven-by-project-preferences-read");
+    preferenceState.Add ("formatCoverage", preferencesError == NoError ? "complete-project-context" : "unavailable");
+    if (preferencesError == NoError) {
+        const auto lengthFormat = [] (const API_LengthDimFormat& format) {
+            return GS::ObjectState (
+                "unit", static_cast<Int32> (format.unit),
+                "roundInch", static_cast<Int32> (format.roundInch),
+                "decimals", static_cast<Int32> (format.lenDecimals),
+                "showZeroWhole", format.show0Whole,
+                "showZeroInch", static_cast<Int32> (format.show0Inch),
+                "showSmall5", static_cast<Int32> (format.showSmall5),
+                "hideZeroDecimals", format.hide0Dec);
+        };
+        preferenceState.Add ("linear", lengthFormat (preferences.linear));
+        preferenceState.Add ("radial", lengthFormat (preferences.radial));
+        preferenceState.Add ("level", lengthFormat (preferences.level));
+        preferenceState.Add ("elevation", lengthFormat (preferences.elevation));
+        preferenceState.Add ("doorWindow", lengthFormat (preferences.doorwindow));
+        preferenceState.Add ("parapet", lengthFormat (preferences.parapet));
+        preferenceState.Add ("area", GS::ObjectState (
+            "unit", static_cast<Int32> (preferences.area.unit),
+            "decimals", static_cast<Int32> (preferences.area.lenDecimals),
+            "hideZeroDecimals", preferences.area.hide0Dec));
+        preferenceState.Add ("angle", GS::ObjectState (
+            "unit", static_cast<Int32> (preferences.angle.unit),
+            "decimals", static_cast<Int32> (preferences.angle.angleDecimals),
+            "accuracy", static_cast<Int32> (preferences.angle.angleAccuracy),
+            "hideZeroDecimals", preferences.angle.hide0Dec));
+        preferenceState.Add ("dimensionStyleAttributeIndex", static_cast<Int32> (preferences.index));
+    } else {
+        preferenceState.Add ("errorCode", static_cast<Int32> (preferencesError));
+    }
+    row.Add ("units", GS::ObjectState (
+        "coordinates", "project-meter",
+        "linearMeasurements", "project-length-values-with-project-preferences-attached",
+        "angles", "radian",
+        "noteHeights", "millimeter-paper-size",
+        "markerSizes", "millimeter-paper-size"));
+    row.Add ("dimensionPreferences", preferenceState);
+}
+
+void AddDimensionIdentity (GS::ObjectState& row, const API_Element& element)
+{
+    const API_Elem_Head& head = element.header;
+    row.Add ("elementId", CreateGuidObjectState (head.guid));
+    row.Add ("nativeElementTypeId", static_cast<Int32> (GetElemTypeId (head)));
+    row.Add ("modificationStamp", static_cast<Int64> (head.modiStamp));
+#if TAPIR_AC_VERSION == 25
+    row.Add ("elementVariationId", static_cast<Int32> (head.variationID));
+#else
+    row.Add ("elementVariationId", static_cast<Int32> (head.type.variationID));
+#endif
+    row.Add ("storyIndex", static_cast<Int32> (head.floorInd));
+    row.Add ("layerIndex", DimensionAttributeIndex (head.layer));
+    row.Add ("groupElementId", CreateGuidObjectState (head.groupGuid));
+    row.Add ("hotlinkElementId", CreateGuidObjectState (head.hotlinkGuid));
+    row.Add ("drawingOrderIndex", static_cast<Int32> (head.drwIndex));
+    row.Add ("teamworkOwnerId", static_cast<Int32> (head.userId));
+    row.Add ("teamworkLockId", static_cast<Int32> (head.lockId));
+    row.Add ("referenceGroupLayerIndex", DimensionAttributeIndex (head.rgr_layer));
+    row.Add ("hasMemo", head.hasMemo);
+    row.Add ("renovationStatus", static_cast<Int32> (head.renovationStatus));
+    row.Add ("renovationFilterId", CreateGuidObjectState (head.renovationFilterGuid));
+
+    API_DatabaseInfo database = {};
+    const GSErrCode databaseError = ACAPI_Database_GetContainingDatabase (&head.guid, &database);
+    GS::ObjectState databaseState;
+    databaseState.Add ("status", databaseError == NoError ? "available" : "unavailable");
+    if (databaseError == NoError) {
+        databaseState.Add ("databaseId", CreateGuidObjectState (database.databaseUnId.elemSetId));
+        databaseState.Add ("name", GS::UniString (database.name));
+        databaseState.Add ("title", GS::UniString (database.title));
+        databaseState.Add ("reference", GS::UniString (database.ref));
+        databaseState.Add ("databaseType", static_cast<Int32> (database.typeID));
+        databaseState.Add ("databaseIndex", static_cast<Int32> (database.index));
+        databaseState.Add ("linkedElementId", CreateGuidObjectState (database.linkedElement));
+        databaseState.Add ("linkedDatabaseId", CreateGuidObjectState (database.linkedDatabaseUnId.elemSetId));
+        databaseState.Add ("linkedSegmentMemoIndex", database.linkedSegmentMemoIndex);
+    } else {
+        databaseState.Add ("errorCode", static_cast<Int32> (databaseError));
+    }
+    row.Add ("database", databaseState);
+
+    API_Elem_Head header = {};
+    header.guid = head.guid;
+    API_Box3D bounds = {};
+    const GSErrCode boundsError = ACAPI_Element_CalcBounds (&header, &bounds);
+    GS::ObjectState boundsState;
+    boundsState.Add ("status", boundsError == NoError ? "available" : "unavailable");
+    if (boundsError == NoError) {
+        boundsState.Add ("xMin", bounds.xMin);
+        boundsState.Add ("yMin", bounds.yMin);
+        boundsState.Add ("xMax", bounds.xMax);
+        boundsState.Add ("yMax", bounds.yMax);
+        boundsState.Add ("zMin", bounds.zMin);
+        boundsState.Add ("zMax", bounds.zMax);
+        boundsState.Add ("unit", "project-meter");
+    } else {
+        boundsState.Add ("errorCode", static_cast<Int32> (boundsError));
+    }
+    row.Add ("bounds", boundsState);
+}
+
+GS::ObjectState DimensionElementError (const GS::UniString& guidText, const API_Guid& guid, const GSErrCode error, const char* reason)
+{
+    GS::ObjectState row;
+    row.Add ("status", "error");
+    row.Add ("requestedGuid", guidText);
+    row.Add ("elementId", CreateGuidObjectState (guid));
+    row.Add ("elementType", GS::ObjectState ("status", "unavailable", "reason", "exact-element-type-read-failed"));
+    row.Add ("errorCode", static_cast<Int32> (error));
+    row.Add ("error", reason);
+    return row;
+}
+
+const char* KnownDimensionUnsupportedNativeTypeName (API_ElemTypeID type)
+{
+    switch (type) {
+        case API_WallID: return "Wall";
+        case API_SlabID: return "Slab";
+        case API_ColumnID: return "Column";
+        case API_BeamID: return "Beam";
+        case API_DoorID: return "Door";
+        case API_WindowID: return "Window";
+        case API_ObjectID: return "Object";
+        case API_MeshID: return "Mesh";
+        case API_RoofID: return "Roof";
+        case API_SectElemID: return "Section";
+        default: return "UnsupportedNativeElement";
+    }
+}
+
+GS::ObjectState DimensionUnsupportedElementError (const GS::UniString& guidText, const API_Element& element)
+{
+    const API_ElemTypeID type = GetElemTypeId (element.header);
+    GS::ObjectState row;
+    row.Add ("status", "error");
+    row.Add ("requestedGuid", guidText);
+    row.Add ("elementId", CreateGuidObjectState (element.header.guid));
+    row.Add ("elementType", KnownDimensionUnsupportedNativeTypeName (type));
+    row.Add ("elementTypeReadStatus", "available-exact-native-header");
+    row.Add ("nativeElementTypeId", static_cast<Int32> (type));
+#if TAPIR_AC_VERSION == 25
+    row.Add ("elementVariationId", static_cast<Int32> (element.header.variationID));
+#else
+    row.Add ("elementVariationId", static_cast<Int32> (element.header.type.variationID));
+#endif
+    row.Add ("errorCode", static_cast<Int32> (APIERR_BADID));
+    row.Add ("error", "Exact GUID resolves to a native element outside the supported dimension families.");
+    return row;
+}
+
+} // namespace
+
+GetNativeDimensionDetailsCommand::GetNativeDimensionDetailsCommand () : CommandBase (CommonSchema::NotUsed) {}
+GS::String GetNativeDimensionDetailsCommand::GetName () const { return "GetNativeDimensionDetails"; }
+GS::Optional<GS::UniString> GetNativeDimensionDetailsCommand::GetInputParametersSchema () const
+{
+    return R"({"type":"object","properties":{"guids":{"type":"array","minItems":1,"maxItems":25,"items":{"type":"string","format":"uuid"}}},"additionalProperties":false,"required":["guids"]})";
+}
+GS::Optional<GS::UniString> GetNativeDimensionDetailsCommand::GetResponseSchema () const { return {}; }
+GS::ObjectState GetNativeDimensionDetailsCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl& /*processControl*/) const
+{
+    GS::Array<GS::UniString> guids;
+    if (!parameters.Get ("guids", guids) || guids.GetSize () < 1 || guids.GetSize () > 25)
+        return CreateErrorResponse (APIERR_BADPARS, "GetNativeDimensionDetails requires between one and 25 exact GUIDs.");
+
+    GS::Array<API_Guid> parsedGuids;
+    for (const GS::UniString& text : guids) {
+        const API_Guid guid = APIGuidFromString (text.ToCStr ());
+        if (guid == APINULLGuid || parsedGuids.Contains (guid))
+            return CreateErrorResponse (APIERR_BADPARS, "Dimension GUIDs must be valid and unique.");
+        parsedGuids.Push (guid);
+    }
+
+    GS::ObjectState response;
+    response.Add ("schemaVersion", "native-dimension-read/v1");
+    response.Add ("status", "success");
+    const auto& rows = response.AddList<GS::ObjectState> ("elements");
+    for (UInt32 requestIndex = 0; requestIndex < guids.GetSize (); ++requestIndex) {
+        const GS::UniString& guidText = guids[requestIndex];
+        API_Element element = {};
+        element.header.guid = parsedGuids[requestIndex];
+        const GSErrCode getError = ACAPI_Element_Get (&element);
+        if (getError != NoError) {
+            rows (DimensionElementError (guidText, parsedGuids[requestIndex], getError, "Failed to read the exact dimension GUID."));
+            continue;
+        }
+
+        const API_ElemTypeID type = GetElemTypeId (element.header);
+        const UInt64 initialModificationStamp = element.header.modiStamp;
+        const bool linear = type == API_DimensionID;
+        const bool radial = type == API_RadialDimensionID;
+        const bool angle = type == API_AngleDimensionID;
+        const bool level = type == API_LevelDimensionID;
+        if (!linear && !radial && !angle && !level) {
+            rows (DimensionUnsupportedElementError (guidText, element));
+            continue;
+        }
+
+        // Fixed-width note buffers cannot prove full Unicode source.  Seed
+        // caller-owned values on the family-resolved element and issue a
+        // second exact read.  Only use a value when the API preserves that
+        // precise pointer and populates its known storage; never dereference a
+        // pointer returned by the host unless it is still our own storage.
+        const GS::UniString probeSentinel = "<Tapir-Native-Dimension-Read-Probe-Do-Not-Persist>";
+        GS::UniString defaultNoteProbe = probeSentinel;
+        GS::UniString noteProbe1 = probeSentinel;
+        GS::UniString noteProbe2 = probeSentinel;
+        GS::UniString prefixProbe = probeSentinel;
+        API_Element textProbeElement = {};
+        SetNativeElementTypeHeader (textProbeElement, type);
+        textProbeElement.header.guid = parsedGuids[requestIndex];
+        if (linear) textProbeElement.dimension.defNote.contentUStr = &defaultNoteProbe;
+        if (radial) { textProbeElement.radialDimension.note.contentUStr = &noteProbe1; textProbeElement.radialDimension.prefixUStr = &prefixProbe; }
+        if (angle) textProbeElement.angleDimension.note.contentUStr = &noteProbe1;
+        if (level) { textProbeElement.levelDimension.note1.contentUStr = &noteProbe1; textProbeElement.levelDimension.note2.contentUStr = &noteProbe2; }
+        const GSErrCode unicodeProbeError = ACAPI_Element_Get (&textProbeElement);
+        const bool unicodeProbeReadSucceeded = unicodeProbeError == NoError;
+        const bool unicodeProbeSameRevision = unicodeProbeReadSucceeded
+            && textProbeElement.header.guid == element.header.guid
+            && GetElemTypeId (textProbeElement.header) == type
+            && textProbeElement.header.modiStamp == initialModificationStamp;
+        const bool defaultNoteUnicodeVerified = unicodeProbeSameRevision && linear && textProbeElement.dimension.defNote.contentUStr == &defaultNoteProbe && defaultNoteProbe != probeSentinel;
+        const bool standaloneNote1UnicodeVerified = unicodeProbeSameRevision && (radial ? textProbeElement.radialDimension.note.contentUStr == &noteProbe1 && noteProbe1 != probeSentinel
+            : angle ? textProbeElement.angleDimension.note.contentUStr == &noteProbe1 && noteProbe1 != probeSentinel
+            : level ? textProbeElement.levelDimension.note1.contentUStr == &noteProbe1 && noteProbe1 != probeSentinel : false);
+        const bool standaloneNote2UnicodeVerified = unicodeProbeSameRevision && level && textProbeElement.levelDimension.note2.contentUStr == &noteProbe2 && noteProbe2 != probeSentinel;
+        const bool radialPrefixUnicodeVerified = unicodeProbeSameRevision && radial && textProbeElement.radialDimension.prefixUStr == &prefixProbe && prefixProbe != probeSentinel;
+
+        GS::ObjectState row;
+        row.Add ("requestedGuid", guidText);
+        row.Add ("elementType", linear ? "Dimension" : radial ? "RadialDimension" : angle ? "AngleDimension" : "LevelDimension");
+        AddDimensionIdentity (row, element);
+        AddDimensionUnits (row);
+
+        GS::ObjectState identity;
+        GS::ObjectState geometry;
+        GS::Array<GS::ObjectState> standaloneNotes;
+        GS::Array<GS::ObjectState> points;
+        identity.Add ("family", linear ? "linear-chain" : radial ? "radial" : angle ? "angle" : "level");
+        identity.Add ("contextStatus", "database-story-layer-from-native-element-header");
+
+        API_ElementMemo memo = {};
+        const GS::OnExit memoGuard ([&memo] () { ACAPI_DisposeElemMemoHdls (&memo); });
+        const GSErrCode memoError = ACAPI_Element_GetMemo (element.header.guid, &memo, APIMemoMask_All);
+        if (memoError != NoError) {
+            row.Add ("status", "error");
+            row.Add ("error", "The dimension memo could not be read; the row is partial.");
+            row.Add ("memo", GS::ObjectState ("status", "unavailable", "errorCode", static_cast<Int32> (memoError)));
+            row.Add ("coverage", "partial-memo-read-failed");
+            row.Add ("identity", identity);
+            rows (row);
+            continue;
+        }
+        row.Add ("memo", GS::ObjectState ("status", "available"));
+        bool unicodeCoverageComplete = unicodeProbeReadSucceeded;
+        row.Add ("unicodeProbeStatus", unicodeProbeReadSucceeded ? "second-exact-element-read-completed" : "second-exact-element-read-failed");
+        row.Add ("unicodeProbeConsistency", unicodeProbeSameRevision ? "same-guid-type-and-modification-stamp" : "different-or-unverified-native-revision");
+
+        if (linear) {
+            const API_DimensionType& dimension = element.dimension;
+            geometry.Add ("linePosition", DimensionPoint2D (dimension.refC));
+            geometry.Add ("direction", GS::ObjectState ("x", dimension.direction.x, "y", dimension.direction.y));
+            geometry.Add ("directionUnit", "unitless-vector");
+            geometry.Add ("threeDimensionalPosition", DimensionPoint3D (dimension.refC3D));
+            geometry.Add ("threeDimensionalDirection", GS::ObjectState ("x", dimension.direction3D.x, "y", dimension.direction3D.y, "z", dimension.direction3D.z));
+            geometry.Add ("threeDimensionalNormal", GS::ObjectState ("x", dimension.normVect3D.x, "y", dimension.normVect3D.y, "z", dimension.normVect3D.z));
+            geometry.Add ("arcAnchor", DimensionBaseDetails (dimension.arcBase));
+            geometry.Add ("segmentCount", dimension.nDimElem);
+            geometry.Add ("linePen", static_cast<Int32> (dimension.linPen));
+            geometry.Add ("textPosition", static_cast<Int32> (dimension.textPos));
+            geometry.Add ("textDirection", static_cast<Int32> (dimension.textWay));
+            geometry.Add ("appearance", static_cast<Int32> (dimension.dimAppear));
+            geometry.Add ("detailedOpeningDimension", dimension.detailedHoleDim);
+            geometry.Add ("nominalOpeningDimension", static_cast<Int32> (dimension.nominalHoleDim));
+            geometry.Add ("compositeThicknessMode", static_cast<Int32> (dimension.compAutoThick));
+            geometry.Add ("defaultStaticSetting", dimension.defStaticDim);
+            geometry.Add ("defaultWitnessForm", static_cast<Int32> (dimension.defWitnessForm));
+            geometry.Add ("defaultWitnessValue", dimension.defWitnessVal);
+            geometry.Add ("defaultNote", DimensionNoteDetails (dimension.defNote, defaultNoteUnicodeVerified ? &defaultNoteProbe : nullptr, false));
+            geometry.Add ("defaultNoteUnicodeStatus", defaultNoteUnicodeVerified ? "verified-full-unicode-content" : "fixed-buffer-or-unverified-unicode-pointer");
+            unicodeCoverageComplete = unicodeCoverageComplete && defaultNoteUnicodeVerified;
+            geometry.Add ("marker", DimensionMarkerDetails (dimension.markerData));
+            geometry.Add ("elevationMarkerForm", static_cast<Int32> (dimension.ed_dimForm));
+            geometry.Add ("elevationArrowAngleCode", static_cast<Int32> (dimension.ed_arrowAng));
+            geometry.Add ("elevationArrowFilled", dimension.ed_arrowFill);
+            geometry.Add ("elevationArrowUp", dimension.ed_arrowUp);
+            geometry.Add ("elevationNeedsPlus", dimension.ed_needPlus);
+            geometry.Add ("usedIn3D", dimension.usedIn3D);
+            geometry.Add ("horizontalText", dimension.horizontalText);
+            geometry.Add ("onlyDimensionText", dimension.onlyDimensionText);
+            geometry.Add ("elevationOrigin", static_cast<Int32> (dimension.ed_origin));
+            geometry.Add ("circleLevelFill", static_cast<Int32> (dimension.ed_circleLevelDimensionFill));
+            geometry.Add ("layout", static_cast<Int32> (dimension.dimLayout));
+            geometry.Add ("pushNeighborEnabled", dimension.pushNeighborEnabled);
+            geometry.Add ("placeUnderEnabled", dimension.placeUnderEnabled);
+            geometry.Add ("advancedLayout", dimension.advanced);
+            geometry.Add ("clipOtherSide", dimension.clipOtherSide);
+#if TAPIR_AC_VERSION >= 26
+            geometry.Add ("textFillOrder", static_cast<Int32> (dimension.textFillOrder));
+#else
+            geometry.Add ("textFillOrder", GS::ObjectState ("status", "not-applicable-in-ac25"));
+#endif
+            geometry.Add ("measurement", GS::ObjectState ("source", "per-point-native-dimVal", "display", "unavailable-unless-independently-observed"));
+            geometry.Add ("staticAnchorEvidence", "per-point-anchor-fields-only-defaultStaticDim-is-not-proof");
+
+            const Int32 count = dimension.nDimElem;
+            const UInt64 requiredMemoBytes = count < 0 ? 0 : static_cast<UInt64> (count) * sizeof (API_DimElem);
+            const UInt64 actualMemoBytes = memo.dimElems == nullptr ? 0 : static_cast<UInt64> (BMGetHandleSize ((GSHandle) memo.dimElems));
+            if (count < 0 || count > 100000 || (count > 0 && (memo.dimElems == nullptr || *memo.dimElems == nullptr)) || actualMemoBytes < requiredMemoBytes) {
+                row.Add ("status", "error");
+                row.Add ("coverage", "memo-count-or-handle-invalid");
+                row.Add ("error", "Linear dimension memo count is invalid or its complete handle is missing or shorter than the declared point count.");
+                row.Add ("identity", identity);
+                row.Add ("geometryAndSettings", geometry);
+                rows (row);
+                continue;
+            }
+            for (Int32 index = 0; index < count; ++index) {
+                const API_DimElem& item = (*memo.dimElems)[index];
+                GS::ObjectState point;
+                point.Add ("index", index);
+                point.Add ("anchor", DimensionBaseDetails (item.base));
+                point.Add ("dimensionPosition", DimensionPoint2D (item.pos));
+                point.Add ("dimensionPosition3D", DimensionPoint3D (item.pos3D));
+                point.Add ("measuredValueFromPreviousPoint", item.dimVal);
+                point.Add ("measurementSource", "native-API_DimElem.dimVal");
+                point.Add ("witnessForm", static_cast<Int32> (item.witnessForm));
+                point.Add ("witnessValue", item.witnessVal);
+                point.Add ("fixedPosition", item.fixedPos);
+                point.Add ("note", DimensionNoteDetails (item.note));
+                if (item.note.contentUStr == nullptr)
+                    unicodeCoverageComplete = false;
+                points.Push (point);
+            }
+            geometry.Add ("pointCount", count);
+            geometry.Add ("pointMemoHandleBytes", static_cast<Int64> (actualMemoBytes));
+            geometry.Add ("pointMemoStatus", "complete-ordered-count-validated");
+        } else if (radial) {
+            const API_RadialDimensionType& dimension = element.radialDimension;
+            geometry.Add ("base", DimensionBaseDetails (dimension.base));
+            geometry.Add ("endPosition", DimensionPoint2D (dimension.endC));
+            geometry.Add ("measuredRadius", dimension.dimVal);
+            geometry.Add ("measurementSource", "native-API_RadialDimensionType.dimVal");
+            geometry.Add ("display", "unavailable-unless-independently-observed");
+            geometry.Add ("linePen", static_cast<Int32> (dimension.linPen));
+            geometry.Add ("textPosition", static_cast<Int32> (dimension.textPos));
+            geometry.Add ("textDirection", static_cast<Int32> (dimension.textWay));
+            geometry.Add ("showOrigin", dimension.showOrigo);
+            geometry.Add ("onlyDimensionText", dimension.onlyDimensionText);
+            if (radialPrefixUnicodeVerified) {
+                geometry.Add ("prefix", prefixProbe);
+                geometry.Add ("prefixSource", "verified-caller-bound-unicode-prefixUStr");
+            } else {
+                char fixedPrefix[sizeof (dimension.prefix) + 1] = {};
+                std::copy (dimension.prefix, dimension.prefix + sizeof (dimension.prefix), fixedPrefix);
+                GS::UInt32 prefixLength = 0;
+                while (prefixLength < sizeof (dimension.prefix) && fixedPrefix[prefixLength] != '\0') ++prefixLength;
+                geometry.Add ("prefix", GS::UniString (fixedPrefix));
+                geometry.Add ("prefixByteLength", static_cast<Int32> (prefixLength));
+                geometry.Add ("prefixBufferCapacity", static_cast<Int32> (sizeof (dimension.prefix)));
+                geometry.Add ("prefixSource", dimension.prefixUStr == nullptr ? "bounded-fixed-buffer-prefix-encoding-unproven" : "bounded-fixed-buffer-prefix-unverified-pointer-not-dereferenced");
+            }
+            geometry.Add ("prefixUnicodeStatus", radialPrefixUnicodeVerified ? "verified-full-unicode-content" : "bounded-prefix-unicode-unproven");
+            geometry.Add ("marker", DimensionMarkerDetails (dimension.markerData));
+            standaloneNotes.Push (GS::ObjectState ("slot", "note", "applicability", "always", "details", DimensionNoteDetails (dimension.note, standaloneNote1UnicodeVerified ? &noteProbe1 : nullptr, false)));
+            unicodeCoverageComplete = unicodeCoverageComplete && standaloneNote1UnicodeVerified && radialPrefixUnicodeVerified;
+            geometry.Add ("staticAnchorEvidence", "native-base-anchor-fields-only");
+        } else if (angle) {
+            const API_AngleDimensionType& dimension = element.angleDimension;
+            geometry.Add ("arcPosition", DimensionPoint2D (dimension.pos));
+            geometry.Add ("arcOrigin", DimensionPoint2D (dimension.origo));
+            geometry.Add ("measuredAngle", dimension.dimVal);
+            geometry.Add ("measurementUnit", "radian");
+            geometry.Add ("measurementSource", "native-API_AngleDimensionType.dimVal");
+            geometry.Add ("display", "unavailable-unless-independently-observed");
+            geometry.Add ("arcRadius", dimension.radius);
+            geometry.Add ("arcRadiusUnit", "project-meter");
+            geometry.Add ("linePen", static_cast<Int32> (dimension.linPen));
+            geometry.Add ("smallArc", dimension.smallArc);
+            geometry.Add ("onlyDimensionText", dimension.onlyDimensionText);
+            geometry.Add ("textPosition", static_cast<Int32> (dimension.textPos));
+            geometry.Add ("textDirection", static_cast<Int32> (dimension.textWay));
+            geometry.Add ("witnessForm", static_cast<Int32> (dimension.witnessForm));
+            geometry.Add ("witnessValue", dimension.witnessVal);
+            geometry.Add ("marker", DimensionMarkerDetails (dimension.markerData));
+            GS::Array<GS::ObjectState> anchors;
+            for (Int32 index = 0; index < 4; ++index) anchors.Push (DimensionBaseDetails (dimension.base[index]));
+            geometry.Add ("anchors", anchors);
+            standaloneNotes.Push (GS::ObjectState ("slot", "note", "applicability", "always", "details", DimensionNoteDetails (dimension.note, standaloneNote1UnicodeVerified ? &noteProbe1 : nullptr, false)));
+            unicodeCoverageComplete = unicodeCoverageComplete && standaloneNote1UnicodeVerified;
+        } else {
+            const API_LevelDimensionType& dimension = element.levelDimension;
+            geometry.Add ("markerPosition", DimensionPoint2D (dimension.loc));
+            geometry.Add ("levelValue", dimension.level);
+            geometry.Add ("levelMeasurementSource", "native-API_LevelDimensionType.level");
+            geometry.Add ("display", "unavailable-unless-independently-observed");
+            geometry.Add ("pen", static_cast<Int32> (dimension.pen));
+            geometry.Add ("format", static_cast<Int32> (dimension.dimForm));
+            geometry.Add ("needsPlus", dimension.needPlus);
+            geometry.Add ("staticLevel", dimension.staticLevel);
+            geometry.Add ("markerSize", dimension.markerSize);
+            geometry.Add ("markerSizeUnit", "millimeter-paper-size");
+            geometry.Add ("markerAngle", dimension.angle);
+            geometry.Add ("markerAngleUnit", "radian");
+#if TAPIR_AC_VERSION == 25
+            const Int32 parentType = static_cast<Int32> (dimension.parentType);
+            const bool parentIsFloor = dimension.parentType == API_ZombieElemID;
+            geometry.Add ("parentTypeVariationId", GS::ObjectState ("status", "not-available-in-ac25-API_LevelDimensionType"));
+#else
+            const Int32 parentType = static_cast<Int32> (dimension.parentType.typeID);
+            const bool parentIsFloor = dimension.parentType.typeID == API_ZombieElemID;
+            geometry.Add ("parentTypeVariationId", static_cast<Int32> (dimension.parentType.variationID));
+#endif
+            geometry.Add ("parentTypeId", parentType);
+            geometry.Add ("parentElementId", CreateGuidObjectState (dimension.parentGuid));
+            geometry.Add ("parentAssociationStatus", parentIsFloor ? "floor-level-parent" : dimension.parentGuid == APINULLGuid ? "no-parent-guid-static-or-unresolved" : "element-parent-guid-present");
+            geometry.Add ("parentFloorSemantics", parentIsFloor ? "native-type-identifies-floor" : "not-a-native-floor-type");
+            geometry.Add ("origin", static_cast<Int32> (dimension.origin));
+            standaloneNotes.Push (GS::ObjectState ("slot", "note1", "applicability", "always", "details", DimensionNoteDetails (dimension.note1, standaloneNote1UnicodeVerified ? &noteProbe1 : nullptr, false)));
+            const bool note2Applicable = dimension.dimForm == 8 || dimension.dimForm == 9;
+            standaloneNotes.Push (GS::ObjectState ("slot", "note2", "applicability", note2Applicable ? "applicable" : "stored-but-not-applicable-for-current-format", "details", DimensionNoteDetails (dimension.note2, standaloneNote2UnicodeVerified ? &noteProbe2 : nullptr, false)));
+            unicodeCoverageComplete = unicodeCoverageComplete && standaloneNote1UnicodeVerified && standaloneNote2UnicodeVerified;
+        }
+
+        API_Elem_Head finalHeader = {};
+        finalHeader.guid = element.header.guid;
+        const GSErrCode finalHeaderError = ACAPI_Element_GetHeader (&finalHeader);
+        const bool stableReadRevision = unicodeProbeSameRevision && finalHeaderError == NoError
+            && finalHeader.guid == element.header.guid
+            && GetElemTypeId (finalHeader) == type
+            && finalHeader.modiStamp == initialModificationStamp;
+        row.Add ("readConsistency", GS::ObjectState (
+            "status", stableReadRevision ? "same-guid-type-and-modification-stamp-through-memo-read" : "native-revision-changed-or-unverified",
+            "initialModificationStamp", static_cast<Int64> (initialModificationStamp),
+            "probeModificationStamp", static_cast<Int64> (textProbeElement.header.modiStamp),
+            "finalHeaderErrorCode", static_cast<Int32> (finalHeaderError),
+            "finalModificationStamp", static_cast<Int64> (finalHeader.modiStamp)));
+        row.Add ("status", stableReadRevision ? "success" : "error");
+        if (!stableReadRevision) row.Add ("error", "The exact element GUID, type, or modification stamp changed during Unicode and memo reads.");
+        row.Add ("unicodeAccessCoverage", GS::ObjectState ("status", !stableReadRevision ? "unverified" : unicodeCoverageComplete ? "complete" : "partial",
+            "reason", !stableReadRevision ? "native-revision-coherence-unverified" : "exact-pointer-and-memo-Unicode-access-only"));
+        row.Add ("sourceFidelityCoverage", GS::ObjectState ("status", "unproven",
+            "reason", "native-Unicode-content-access-or-requested-input-equality-does-not-prove-original-expression"));
+        row.Add ("identity", identity);
+        row.Add ("coverage", !stableReadRevision ? "partial-read-revision-unverified" : unicodeCoverageComplete ? "complete-for-versioned-dimension-fields" : "partial-unicode-source-unproven");
+        row.Add ("geometryAndSettings", geometry);
+        row.Add ("orderedPoints", points);
+        row.Add ("standaloneNotes", standaloneNotes);
+        if (stableReadRevision) {
+            const GS::Optional<GS::UniString> factualFingerprint = NativeDimensionFactualFingerprint (row);
+            if (factualFingerprint.HasValue ()) {
+                row.Add ("fingerprint", factualFingerprint.Get ());
+                row.Add ("fingerprintAlgorithm", "native-dimension-fnv1a-64-typed-facts-v2");
+                row.Add ("fingerprintCoverage", "partial");
+            }
+        }
+        rows (row);
+    }
+    return response;
+}
+
+namespace {
+
+struct RadialDefaultsContext {
+    GSErrCode projectError = APIERR_GENERAL;
+    GSErrCode windowError = APIERR_GENERAL;
+    GSErrCode databaseError = APIERR_GENERAL;
+    GSErrCode storyError = APIERR_GENERAL;
+    GS::UniString projectPath;
+    bool projectPathPresent = false;
+    bool savedSolo = false;
+    API_WindowInfo window = {};
+    API_DatabaseInfo database = {};
+    Int32 activeStory = -1;
+    GSErrCode drawingScaleError = APIERR_GENERAL;
+    double drawingScale = 0.0;
+    GS::Optional<GS::UniString> fileScopeKey;
+};
+
+constexpr auto NativeDimensionAuditBudget = std::chrono::seconds (30);
+constexpr API_ElemTypeID NativeDimensionAuditFamilies[] = {
+	API_DimensionID, API_RadialDimensionID, API_AngleDimensionID, API_LevelDimensionID
+};
+
+struct NativeDimensionAuditCandidate {
+	API_Guid guid = APINULLGuid;
+	GS::UniString guidText;
+	API_ElemTypeID type = API_ZombieElemID;
+	Int32 variationId = 0;
+	Int32 storyIndex = 0;
+	UInt64 modificationStamp = 0;
+	NativeDimensionAuditPolicy::Bounds2D bounds = {};
+};
+
+struct NativeDimensionAuditManifest {
+	GS::ObjectState state;
+	std::vector<NativeDimensionAuditCandidate> candidates;
+	UInt64 rawCandidateCount = 0;
+	UInt64 checkedCount = 0;
+	UInt64 unreadableCount = 0;
+	UInt64 duplicateCount = 0;
+	UInt64 wrongTypeCount = 0;
+	UInt64 wrongStoryCount = 0;
+	UInt64 unavailableBoundsCount = 0;
+	UInt64 matchedCount = 0;
+	UInt64 errorCount = 0;
+	bool withinCandidateLimit = true;
+	bool complete = true;
+	bool cancelled = false;
+	GS::UniString reason;
+};
+
+GS::ObjectState RadialDefaultsContextDetails (const RadialDefaultsContext& context);
+bool RadialDefaultsContextAvailable (const RadialDefaultsContext& context);
+
+bool NativeDimensionAuditExpired (const std::chrono::steady_clock::time_point& started, GS::ProcessControl& processControl)
+{
+	return processControl.TestBreak () || std::chrono::steady_clock::now () - started >= NativeDimensionAuditBudget;
+}
+
+std::string NativeDimensionAuditPathKey (const GS::UniString& value)
+{
+	GS::UniString normalized (value);
+	normalized.ReplaceAll ("\\", "/");
+	normalized = normalized.ToLowerCase ();
+	return FixtureUtf8 (normalized);
+}
+
+GS::ObjectState NativeDimensionAuditContextFacts (const RadialDefaultsContext& context, const GS::ObjectState& preferences)
+{
+	GS::ObjectState result = RadialDefaultsContextDetails (context);
+	GS::ObjectState scale (
+		"status", context.drawingScaleError == NoError && std::isfinite (context.drawingScale) && context.drawingScale > 0.0 ? "available" : "unavailable",
+		"errorCode", static_cast<Int32> (context.drawingScaleError),
+		"source", "TAPIR_Drawing_GetDrawingScale-current-FloorPlan-context");
+	if (context.drawingScaleError == NoError && std::isfinite (context.drawingScale) && context.drawingScale > 0.0) {
+		scale.Add ("value", context.drawingScale);
+		scale.Add ("unit", "drawing-scale-ratio");
+	}
+	result.Add ("drawingScale", scale);
+	if (context.projectError == NoError && context.projectPathPresent)
+		result.Add ("projectPath", context.projectPath);
+	if (context.fileScopeKey.HasValue ())
+		result.Add ("fileScopeKey", context.fileScopeKey.Get ());
+	result.Add ("preferences", preferences);
+	return result;
+}
+
+// V2 adds exact current-window facts without changing the historic v1
+// context shape. The Floor Plan window is identified by its SDK type; retain
+// its returned index and databaseUnId exactly (the latter may be APINULLGuid).
+// The current database's concrete non-null identity is carried separately.
+GS::ObjectState NativeDimensionAuditWindowIdentityFacts (const RadialDefaultsContext& context)
+{
+	GS::ObjectState window (
+		"status", context.windowError == NoError ? "available" : "unavailable",
+		"errorCode", static_cast<Int32> (context.windowError));
+	if (context.windowError == NoError) {
+		window.Add ("typeId", static_cast<Int32> (context.window.typeID));
+		window.Add ("index", static_cast<Int32> (context.window.index));
+		window.Add ("databaseId", APIGuidToString (context.window.databaseUnId.elemSetId));
+	}
+	return window;
+}
+
+bool SameNativeDimensionAuditWindowIdentity (const RadialDefaultsContext& before, const RadialDefaultsContext& after)
+{
+	return before.windowError == NoError && after.windowError == NoError
+		&& before.window.typeID == after.window.typeID
+		&& before.window.index == after.window.index
+		&& before.window.databaseUnId.elemSetId == after.window.databaseUnId.elemSetId;
+}
+
+GS::ObjectState NativeDimensionAuditPreferences ()
+{
+	GS::ObjectState holder;
+	AddDimensionUnits (holder);
+	GS::ObjectState preferences, units;
+	const bool preferencesPresent = holder.Get ("dimensionPreferences", preferences);
+	const bool unitsPresent = holder.Get ("units", units);
+	GS::UniString preferenceStatus;
+	const bool preferenceValuesAvailable = preferencesPresent && preferences.Get ("status", preferenceStatus) && preferenceStatus == "available";
+	return GS::ObjectState (
+		"status", preferenceValuesAvailable && unitsPresent ? "available" : "partial",
+		"source", "ACAPI_ProjectSetting_GetPreferences/APIPrefs_DimensionsID-plus-reader-unit-declarations",
+		"scope", "project-dimension-preferences-and-reader-unit-declarations",
+		"dimensionPreferences", preferencesPresent ? preferences : GS::ObjectState (
+			"status", "unavailable", "source", "ACAPI_ProjectSetting_GetPreferences/APIPrefs_DimensionsID",
+			"scope", "project-dimension-preferences", "savedViewEffectiveFormat", "not-proven-by-project-preferences-read",
+			"formatCoverage", "unavailable", "errorCode", static_cast<Int32> (APIERR_GENERAL)),
+		"units", unitsPresent ? units : GS::ObjectState ("status", "unavailable", "reason", "unit-declarations-not-returned"));
+}
+
+bool NativeDimensionAuditPreferencesAvailable (const GS::ObjectState& preferences)
+{
+	GS::UniString status;
+	return preferences.Get ("status", status) && status == "available";
+}
+
+bool NativeDimensionAuditFactsText (const GS::ObjectState& facts, GS::UniString& serialized, std::uint64_t& byteCount)
+{
+	if (JSON::CreateFromObjectState (facts, serialized, false) != NoError)
+		return false;
+	byteCount = static_cast<std::uint64_t> (FixtureUtf8 (serialized).size ());
+	return true;
+}
+
+bool NativeDimensionAuditContextMatchesRequest (
+	const RadialDefaultsContext& context,
+	const GS::UniString& projectPath,
+	const GS::UniString& fileScopeKey,
+	const API_Guid& databaseGuid,
+	const Int32 storyIndex)
+{
+	return RadialDefaultsContextAvailable (context)
+		&& NativeDimensionAuditPathKey (context.projectPath) == NativeDimensionAuditPathKey (projectPath)
+		&& context.fileScopeKey.HasValue () && context.fileScopeKey.Get () == fileScopeKey
+        && context.database.databaseUnId.elemSetId == databaseGuid
+		&& context.drawingScaleError == NoError && std::isfinite (context.drawingScale) && context.drawingScale > 0.0
+		&& context.activeStory == storyIndex;
+}
+
+bool NativeDimensionAuditRowMatchesCandidate (
+	const GS::ObjectState& row,
+	const NativeDimensionAuditCandidate& candidate,
+	const API_Guid& databaseGuid,
+	const Int32 databaseTypeId,
+	const Int32 storyIndex,
+	const GS::ObjectState& preferences,
+	GS::UniString& mismatchReason)
+{
+	auto mismatch = [&mismatchReason] (const char* reason) {
+		mismatchReason = reason;
+		return false;
+	};
+	Int32 typeId = 0;
+	Int32 variationId = 0;
+	Int32 returnedStory = 0;
+	Int64 modificationStamp = -1;
+	if (!row.Get ("nativeElementTypeId", typeId) || typeId != static_cast<Int32> (candidate.type)) return mismatch ("native-element-type-differs-from-inventory-header");
+	if (!row.Get ("elementVariationId", variationId) || variationId != candidate.variationId) return mismatch ("element-variation-differs-from-inventory-header");
+	if (!row.Get ("storyIndex", returnedStory) || returnedStory != storyIndex || returnedStory != candidate.storyIndex) return mismatch ("story-differs-from-request-or-inventory-header");
+	if (!row.Get ("modificationStamp", modificationStamp) || modificationStamp < 0 || static_cast<UInt64> (modificationStamp) != candidate.modificationStamp) return mismatch ("modification-stamp-differs-from-inventory-header");
+	GS::ObjectState database;
+	GS::UniString databaseStatus;
+	GS::ObjectState databaseId;
+	GS::UniString returnedDatabaseGuid;
+	Int32 returnedDatabaseType = 0;
+	if (!row.Get ("database", database) || !database.Get ("status", databaseStatus) || databaseStatus != "available"
+		|| !database.Get ("databaseId", databaseId) || !databaseId.Get ("guid", returnedDatabaseGuid)
+		|| !database.Get ("databaseType", returnedDatabaseType) || returnedDatabaseType != databaseTypeId
+		|| NativeDimensionAuditPathKey (returnedDatabaseGuid) != NativeDimensionAuditPathKey (APIGuidToString (databaseGuid)))
+		return mismatch ("reader-database-differs-from-verified-floor-plan-context");
+	GS::ObjectState bounds;
+	GS::UniString boundsStatus, boundsUnit;
+	double xMin = 0.0, yMin = 0.0, xMax = 0.0, yMax = 0.0;
+	if (!row.Get ("bounds", bounds) || !bounds.Get ("status", boundsStatus) || boundsStatus != "available"
+		|| !bounds.Get ("xMin", xMin) || !bounds.Get ("yMin", yMin) || !bounds.Get ("xMax", xMax) || !bounds.Get ("yMax", yMax)
+		|| !bounds.Get ("unit", boundsUnit) || boundsUnit != "project-meter"
+		|| !NativeDimensionAuditPolicy::IsFiniteOrderedBounds ({ xMin, yMin, xMax, yMax })
+		|| xMin != candidate.bounds.xMin || yMin != candidate.bounds.yMin || xMax != candidate.bounds.xMax || yMax != candidate.bounds.yMax)
+		return mismatch ("reader-bounds-differ-from-inventory-membership-facts");
+	GS::ObjectState consistency;
+	GS::UniString consistencyStatus;
+	Int64 initialStamp = -1, probeStamp = -1, finalStamp = -1;
+	Int32 finalHeaderError = APIERR_GENERAL;
+	if (!row.Get ("readConsistency", consistency)
+		|| !consistency.Get ("status", consistencyStatus) || consistencyStatus != "same-guid-type-and-modification-stamp-through-memo-read"
+		|| !consistency.Get ("initialModificationStamp", initialStamp)
+		|| !consistency.Get ("probeModificationStamp", probeStamp)
+		|| !consistency.Get ("finalHeaderErrorCode", finalHeaderError) || finalHeaderError != NoError
+		|| !consistency.Get ("finalModificationStamp", finalStamp)
+		|| static_cast<UInt64> (initialStamp) != candidate.modificationStamp
+		|| static_cast<UInt64> (probeStamp) != candidate.modificationStamp
+		|| static_cast<UInt64> (finalStamp) != candidate.modificationStamp)
+		return mismatch ("reader-internal-revision-check-does-not-match-inventory-header");
+	GS::ObjectState rowUnits, expectedUnits, rowDimensionPreferences, expectedDimensionPreferences;
+	if (!row.Get ("units", rowUnits) || !preferences.Get ("units", expectedUnits)
+		|| !row.Get ("dimensionPreferences", rowDimensionPreferences) || !preferences.Get ("dimensionPreferences", expectedDimensionPreferences))
+		return mismatch ("reader-units-or-dimension-preferences-are-unavailable");
+	GS::UniString actualFactsText, expectedFactsText;
+	std::uint64_t ignoredBytes = 0;
+	if (!NativeDimensionAuditFactsText (rowUnits, actualFactsText, ignoredBytes)
+		|| !NativeDimensionAuditFactsText (expectedUnits, expectedFactsText, ignoredBytes)
+		|| actualFactsText != expectedFactsText)
+		return mismatch ("reader-unit-declarations-differ-from-audit-context");
+	if (!NativeDimensionAuditFactsText (rowDimensionPreferences, actualFactsText, ignoredBytes)
+		|| !NativeDimensionAuditFactsText (expectedDimensionPreferences, expectedFactsText, ignoredBytes)
+		|| actualFactsText != expectedFactsText)
+		return mismatch ("reader-dimension-preferences-differ-from-audit-context");
+	return true;
+}
+
+NativeDimensionAuditManifest ReadNativeDimensionAuditManifest (
+	const NativeDimensionAuditPolicy::Bounds2D& requestedBounds,
+	const Int32 requestedStory,
+	const std::chrono::steady_clock::time_point& started,
+	GS::ProcessControl& processControl)
+{
+	NativeDimensionAuditManifest manifest;
+	const auto& familyStates = manifest.state.AddList<GS::ObjectState> ("families");
+	std::set<std::string> seen;
+	bool allFamilyListsInspected = true;
+	for (std::size_t familyIndex = 0; familyIndex < std::size (NativeDimensionAuditFamilies); ++familyIndex) {
+		const API_ElemTypeID family = NativeDimensionAuditFamilies[familyIndex];
+		if (NativeDimensionAuditExpired (started, processControl)) {
+			allFamilyListsInspected = false;
+			manifest.cancelled = true;
+			manifest.complete = false;
+			manifest.reason = processControl.TestBreak () ? "cooperative-cancelled-before-family-list" : "cooperative-deadline-before-family-list";
+			for (std::size_t remaining = familyIndex; remaining < std::size (NativeDimensionAuditFamilies); ++remaining) {
+				GS::ObjectState skipped ("requestedNativeElementTypeId", static_cast<Int32> (NativeDimensionAuditFamilies[remaining]), "listStatus", "not-read", "candidateCountStatus", "not-read-after-cooperative-stop", "checkedCount", static_cast<Int64> (0));
+				GS::Array<GS::ObjectState> noCandidates;
+				skipped.Add ("candidates", noCandidates);
+				familyStates (skipped);
+			}
+			break;
+		}
+		GS::ObjectState familyState;
+		familyState.Add ("requestedNativeElementTypeId", static_cast<Int32> (family));
+		GS::Array<API_Guid> guids;
+		const GSErrCode listError = ACAPI_Element_GetElemList (family, &guids, APIFilt_OnActFloor);
+		familyState.Add ("listErrorCode", static_cast<Int32> (listError));
+		familyState.Add ("listStatus", listError == NoError ? "available" : "unavailable");
+		if (listError != NoError) {
+			allFamilyListsInspected = false;
+			manifest.errorCount++;
+			manifest.complete = false;
+			familyState.Add ("candidateCountStatus", "unavailable-list-error-not-known-zero");
+			familyState.Add ("checkedCount", static_cast<Int64> (0));
+			GS::Array<GS::ObjectState> noCandidates;
+			familyState.Add ("candidates", noCandidates);
+			familyStates (familyState);
+			continue;
+		}
+		const UInt64 familyCount = guids.GetSize ();
+		manifest.rawCandidateCount += familyCount;
+		familyState.Add ("candidateCount", static_cast<Int64> (familyCount));
+		if (!NativeDimensionAuditPolicy::WithinCandidateLimit (manifest.rawCandidateCount)) {
+			allFamilyListsInspected = false;
+			manifest.withinCandidateLimit = false;
+			manifest.complete = false;
+			manifest.reason = "typed-current-story-candidate-limit-exceeded";
+			familyState.Add ("checkedCount", static_cast<Int64> (0));
+			familyState.Add ("candidatesStatus", "not-inspected-after-combined-candidate-limit");
+			familyStates (familyState);
+			continue;
+		}
+		std::vector<API_Guid> orderedGuids;
+		orderedGuids.reserve (guids.GetSize ());
+		for (const API_Guid& guid : guids) orderedGuids.push_back (guid);
+		std::sort (orderedGuids.begin (), orderedGuids.end (), [] (const API_Guid& left, const API_Guid& right) {
+			return FixtureUtf8 (APIGuidToString (left).ToLowerCase ()) < FixtureUtf8 (APIGuidToString (right).ToLowerCase ());
+		});
+		const auto& candidatesState = familyState.AddList<GS::ObjectState> ("candidates");
+		UInt64 familyMatched = 0;
+		UInt64 familyChecked = 0;
+		for (const API_Guid& guid : orderedGuids) {
+			if (NativeDimensionAuditExpired (started, processControl)) {
+				allFamilyListsInspected = false;
+				manifest.cancelled = true;
+				manifest.complete = false;
+				manifest.reason = processControl.TestBreak () ? "cooperative-cancelled" : "cooperative-deadline-exceeded";
+				break;
+			}
+			manifest.checkedCount++;
+			familyChecked++;
+			NativeDimensionAuditCandidate candidate;
+			candidate.guid = guid;
+			candidate.guidText = APIGuidToString (guid);
+			GS::ObjectState entry;
+			entry.Add ("elementId", CreateGuidObjectState (guid));
+			const std::string key = FixtureUtf8 (candidate.guidText.ToLowerCase ());
+			if (!seen.insert (key).second) {
+				entry.Add ("status", "duplicate-guid");
+				manifest.duplicateCount++;
+				manifest.complete = false;
+				manifest.errorCount++;
+				candidatesState (entry);
+				continue;
+			}
+			API_Elem_Head header = {};
+			header.guid = guid;
+			const GSErrCode headerError = ACAPI_Element_GetHeader (&header);
+			entry.Add ("headerErrorCode", static_cast<Int32> (headerError));
+			if (headerError != NoError) {
+				entry.Add ("status", "unavailable-header");
+				manifest.unreadableCount++;
+				manifest.complete = false;
+				manifest.errorCount++;
+				candidatesState (entry);
+				continue;
+			}
+			if (header.guid != guid || header.guid == APINULLGuid) {
+				entry.Add ("returnedHeaderGuid", CreateGuidObjectState (header.guid));
+				entry.Add ("status", "unavailable-header-identity-mismatch");
+				manifest.unreadableCount++;
+				manifest.complete = false;
+				manifest.errorCount++;
+				candidatesState (entry);
+				continue;
+			}
+			candidate.type = GetElemTypeId (header);
+#if TAPIR_AC_VERSION == 25
+			candidate.variationId = static_cast<Int32> (header.variationID);
+#else
+			candidate.variationId = static_cast<Int32> (header.type.variationID);
+#endif
+			candidate.storyIndex = static_cast<Int32> (header.floorInd);
+			candidate.modificationStamp = header.modiStamp;
+			entry.Add ("nativeElementTypeId", static_cast<Int32> (candidate.type));
+			entry.Add ("elementVariationId", candidate.variationId);
+			entry.Add ("storyIndex", candidate.storyIndex);
+			entry.Add ("modificationStamp", static_cast<Int64> (candidate.modificationStamp));
+			if (candidate.type != family) {
+				entry.Add ("status", "wrong-family-header");
+				manifest.wrongTypeCount++;
+				manifest.complete = false;
+				manifest.errorCount++;
+				candidatesState (entry);
+				continue;
+			}
+			if (candidate.storyIndex != requestedStory) {
+				entry.Add ("status", "wrong-story-header");
+				manifest.wrongStoryCount++;
+				manifest.complete = false;
+				manifest.errorCount++;
+				candidatesState (entry);
+				continue;
+			}
+			API_Box3D nativeBounds = {};
+			API_Elem_Head boundsHeader = {};
+			boundsHeader.guid = guid;
+			const GSErrCode boundsError = ACAPI_Element_CalcBounds (&boundsHeader, &nativeBounds);
+			entry.Add ("boundsErrorCode", static_cast<Int32> (boundsError));
+			if (boundsError != NoError) {
+				entry.Add ("status", "unavailable-bounds");
+				manifest.unavailableBoundsCount++;
+				manifest.complete = false;
+				manifest.errorCount++;
+				candidatesState (entry);
+				continue;
+			}
+			candidate.bounds = { nativeBounds.xMin, nativeBounds.yMin, nativeBounds.xMax, nativeBounds.yMax };
+			if (!NativeDimensionAuditPolicy::IsFiniteOrderedBounds (candidate.bounds)) {
+				entry.Add ("status", "invalid-bounds");
+				manifest.unavailableBoundsCount++;
+				manifest.complete = false;
+				manifest.errorCount++;
+				candidatesState (entry);
+				continue;
+			}
+			entry.Add ("bounds", GS::ObjectState (
+				"xMin", candidate.bounds.xMin, "yMin", candidate.bounds.yMin,
+				"xMax", candidate.bounds.xMax, "yMax", candidate.bounds.yMax,
+				"unit", "project-meter"));
+			const bool matched = NativeDimensionAuditPolicy::IntersectsInclusive (candidate.bounds, requestedBounds);
+			entry.Add ("status", matched ? "matched" : "outside-rectangle");
+			if (matched) {
+				manifest.matchedCount++;
+				familyMatched++;
+				manifest.candidates.push_back (candidate);
+			}
+			candidatesState (entry);
+		}
+		familyState.Add ("checkedCount", static_cast<Int64> (familyChecked));
+		familyState.Add ("familyMatchedCount", static_cast<Int64> (familyMatched));
+		familyStates (familyState);
+		if (manifest.cancelled) {
+			for (std::size_t remaining = familyIndex + 1; remaining < std::size (NativeDimensionAuditFamilies); ++remaining) {
+				GS::ObjectState skipped ("requestedNativeElementTypeId", static_cast<Int32> (NativeDimensionAuditFamilies[remaining]), "listStatus", "not-read", "candidateCountStatus", "not-read-after-cooperative-stop", "checkedCount", static_cast<Int64> (0));
+				GS::Array<GS::ObjectState> noCandidates;
+				skipped.Add ("candidates", noCandidates);
+				familyStates (skipped);
+			}
+			break;
+		}
+	}
+	std::sort (manifest.candidates.begin (), manifest.candidates.end (), [] (const auto& left, const auto& right) {
+		return FixtureUtf8 (left.guidText.ToLowerCase ()) < FixtureUtf8 (right.guidText.ToLowerCase ());
+	});
+	manifest.state.Add ("rawCandidateCount", static_cast<Int64> (manifest.rawCandidateCount));
+	manifest.state.Add ("checkedCount", static_cast<Int64> (manifest.checkedCount));
+	manifest.state.Add ("unreadableCount", static_cast<Int64> (manifest.unreadableCount));
+	manifest.state.Add ("duplicateCount", static_cast<Int64> (manifest.duplicateCount));
+	manifest.state.Add ("wrongTypeCount", static_cast<Int64> (manifest.wrongTypeCount));
+	manifest.state.Add ("wrongStoryCount", static_cast<Int64> (manifest.wrongStoryCount));
+	manifest.state.Add ("unavailableBoundsCount", static_cast<Int64> (manifest.unavailableBoundsCount));
+	manifest.state.Add ("matchedCount", static_cast<Int64> (manifest.matchedCount));
+	manifest.state.Add ("errorCount", static_cast<Int64> (manifest.errorCount));
+	manifest.complete = manifest.complete && allFamilyListsInspected && manifest.errorCount == 0
+		&& NativeDimensionAuditPolicy::WithinCandidateLimit (manifest.rawCandidateCount);
+	manifest.state.Add ("status", manifest.complete ? "complete" : "partial");
+	if (!manifest.reason.IsEmpty ()) manifest.state.Add ("reason", manifest.reason);
+	return manifest;
+}
+
+void ReadRadialDefaultsContext (RadialDefaultsContext& context)
+{
+    // API_ProjectInfo owns four heap pointers and must not be shallow-copied or
+    // returned by value. Copy only the path/flags needed by this snapshot;
+    // its destructor releases the SDK allocations on this stack frame.
+    API_ProjectInfo project = {};
+    context.projectError = ACAPI_ProjectOperation_Project (&project);
+    if (context.projectError == NoError) {
+        context.savedSolo = project.projectPath != nullptr && !project.untitled && !project.teamwork;
+        if (project.projectPath != nullptr) {
+            context.projectPath = *project.projectPath;
+            context.projectPathPresent = true;
+            context.fileScopeKey = FixtureCurrentScope (project);
+        }
+    }
+    context.windowError = ACAPI_Window_GetCurrentWindow (&context.window);
+    context.databaseError = ACAPI_Database_GetCurrentDatabase (&context.database);
+
+    API_StoryInfo storyInfo = {};
+    const GS::OnExit storyInfoGuard ([&storyInfo] () {
+        if (storyInfo.data != nullptr)
+            BMKillHandle (reinterpret_cast<GSHandle*> (&storyInfo.data));
+    });
+    context.storyError = ACAPI_ProjectSetting_GetStorySettings (&storyInfo);
+    if (context.storyError == NoError)
+        context.activeStory = static_cast<Int32> (storyInfo.actStory);
+}
+
+void ReadNativeDimensionAuditContext (RadialDefaultsContext& context)
+{
+	ReadRadialDefaultsContext (context);
+	context.drawingScaleError = TAPIR_Drawing_GetDrawingScale (&context.drawingScale);
+}
+
+GS::ObjectState RadialDefaultsContextDetails (const RadialDefaultsContext& context)
+{
+    GS::ObjectState project;
+    project.Add ("status", context.projectError == NoError ? "available" : "unavailable");
+    project.Add ("errorCode", static_cast<Int32> (context.projectError));
+    if (context.projectError == NoError) {
+        project.Add ("savedSolo", context.savedSolo);
+        if (context.fileScopeKey.HasValue ())
+            project.Add ("fileScopeKey", context.fileScopeKey.Get ());
+    }
+
+    GS::ObjectState window;
+    window.Add ("status", context.windowError == NoError ? "available" : "unavailable");
+    window.Add ("errorCode", static_cast<Int32> (context.windowError));
+    if (context.windowError == NoError) {
+        window.Add ("typeId", static_cast<Int32> (context.window.typeID));
+        window.Add ("isFloorPlan", context.window.typeID == APIWind_FloorPlanID);
+    }
+
+    GS::ObjectState database;
+    database.Add ("status", context.databaseError == NoError ? "available" : "unavailable");
+    database.Add ("errorCode", static_cast<Int32> (context.databaseError));
+    if (context.databaseError == NoError) {
+        database.Add ("typeId", static_cast<Int32> (context.database.typeID));
+        database.Add ("isFloorPlan", context.database.typeID == APIWind_FloorPlanID);
+        database.Add ("databaseId", APIGuidToString (context.database.databaseUnId.elemSetId));
+    }
+
+    GS::ObjectState story;
+    story.Add ("status", context.storyError == NoError ? "available" : "unavailable");
+    story.Add ("errorCode", static_cast<Int32> (context.storyError));
+    if (context.storyError == NoError)
+        story.Add ("activeStoryIndex", context.activeStory);
+
+    return GS::ObjectState (
+        "project", project,
+        "window", window,
+        "database", database,
+        "story", story);
+}
+
+bool RadialDefaultsContextAvailable (const RadialDefaultsContext& context)
+{
+    return context.projectError == NoError && context.projectPathPresent
+        && context.savedSolo && context.fileScopeKey.HasValue ()
+        && context.windowError == NoError && context.window.typeID == APIWind_FloorPlanID
+        && context.databaseError == NoError && context.database.typeID == APIWind_FloorPlanID
+        && context.storyError == NoError;
+}
+
+bool RadialDefaultsContextFactsAvailable (const RadialDefaultsContext& context)
+{
+    return context.projectError == NoError && context.windowError == NoError
+        && context.databaseError == NoError && context.storyError == NoError;
+}
+
+bool SameRadialDefaultsContext (const RadialDefaultsContext& before, const RadialDefaultsContext& after)
+{
+    return RadialDefaultsContextAvailable (before) && RadialDefaultsContextAvailable (after)
+        && before.fileScopeKey.Get () == after.fileScopeKey.Get ()
+        && before.window.typeID == after.window.typeID
+        && before.database.typeID == after.database.typeID
+        && before.database.databaseUnId.elemSetId == after.database.databaseUnId.elemSetId
+        && before.activeStory == after.activeStory;
+}
+
+bool IsExactTaskOwnedRadialDefaultsCopy (
+    const GS::UniString& runId,
+    const GS::UniString& suppliedProjectPath,
+    const GS::UniString& requestedFileScopeKey,
+    const RadialDefaultsContext& context)
+{
+    if (!RadialDefaultsContextAvailable (context) || context.fileScopeKey.Get () != requestedFileScopeKey)
+        return false;
+    const std::string runIdUtf8 = FixtureUtf8 (runId);
+    if (runIdUtf8.empty () || runIdUtf8.size () > 48
+        || !std::all_of (runIdUtf8.begin (), runIdUtf8.end (), [] (unsigned char c) { return std::isalnum (c) || c == '_' || c == '-'; }))
+        return false;
+
+    char localAppData[MAX_PATH + 1] = {};
+    const DWORD localAppDataLength = GetEnvironmentVariableA ("LOCALAPPDATA", localAppData, MAX_PATH);
+    if (localAppDataLength == 0 || localAppDataLength >= MAX_PATH)
+        return false;
+#if TAPIR_AC_VERSION == 25
+    constexpr const char* ArchicadMajor = "25";
+#else
+    constexpr const char* ArchicadMajor = "28";
+#endif
+    const std::string expectedCopy = std::string (localAppData) + "\\ArchicadTapirMcp\\runner\\scratch\\AC" + ArchicadMajor + "\\mutation-" + runIdUtf8 + ".pln";
+    const std::string suppliedPath = FixtureUtf8 (suppliedProjectPath);
+    const std::string openedPath = FixtureUtf8 (context.projectPath);
+    std::string expectedCanonical, expectedFull, suppliedCanonical, openedCanonical;
+    if (!FixtureCanonicalExistingPath (expectedCopy, expectedCanonical) || !FixtureFullPath (expectedCopy, expectedFull)
+        || !FixtureCanonicalExistingPath (suppliedPath, suppliedCanonical) || !FixtureCanonicalExistingPath (openedPath, openedCanonical))
+        return false;
+    return FixturePathKey (expectedCanonical) == FixturePathKey (expectedFull)
+        && FixturePathKey (suppliedPath) == FixturePathKey (expectedCopy)
+        && FixturePathKey (openedPath) == FixturePathKey (expectedCopy)
+        && FixturePathKey (suppliedCanonical) == FixturePathKey (expectedCanonical)
+        && FixturePathKey (openedCanonical) == FixturePathKey (expectedCanonical);
+}
+
+bool ReadNativeDimensionCreateProcessIdentity (std::string& processId, std::string& startTicks)
+{
+#if defined (_WIN32)
+	FILETIME creation = {}, exitTime = {}, kernel = {}, user = {};
+	if (!GetProcessTimes (GetCurrentProcess (), &creation, &exitTime, &kernel, &user)) return false;
+	ULARGE_INTEGER fileTime = {};
+	fileTime.LowPart = creation.dwLowDateTime;
+	fileTime.HighPart = creation.dwHighDateTime;
+	constexpr UInt64 DotNetTicksAtFileTimeEpoch = 504911232000000000ULL;
+	if (fileTime.QuadPart == 0 || fileTime.QuadPart > std::numeric_limits<UInt64>::max () - DotNetTicksAtFileTimeEpoch) return false;
+	processId = std::to_string (GetCurrentProcessId ());
+	startTicks = std::to_string (fileTime.QuadPart + DotNetTicksAtFileTimeEpoch);
+	return !processId.empty () && processId != "0";
+#else
+	(void) processId;
+	(void) startTicks;
+	return false;
+#endif
+}
+
+bool CaptureNativeDimensionCreateContext (
+	const GS::UniString& runId,
+	const GS::UniString& expectedProjectPath,
+	const GS::UniString& fileScopeKey,
+	NativeDimensionCreateWire::Context& context,
+	GS::ObjectState& facts)
+{
+	RadialDefaultsContext native;
+	ReadRadialDefaultsContext (native);
+	const bool taskCopy = IsExactTaskOwnedRadialDefaultsCopy (runId, expectedProjectPath, fileScopeKey, native);
+	std::string processId, processStartTicks;
+	const bool processIdentity = ReadNativeDimensionCreateProcessIdentity (processId, processStartTicks);
+	IO::Location addonLocation;
+	const GSErrCode addonError = ACAPI_GetOwnLocation (&addonLocation);
+	const bool databaseIdentity = native.databaseError == NoError && native.database.typeID == APIWind_FloorPlanID
+		&& native.database.databaseUnId.elemSetId != APINULLGuid;
+	const bool windowValid = native.windowError == NoError && native.window.typeID == APIWind_FloorPlanID;
+	const bool storyValid = native.storyError == NoError;
+#if TAPIR_AC_VERSION == 25
+	constexpr const char* major = "25";
+#else
+	constexpr const char* major = "28";
+#endif
+	if (native.projectError == NoError && native.projectPathPresent) context.projectPath = FixtureUtf8 (native.projectPath);
+	if (native.fileScopeKey.HasValue ()) context.fileScopeKey = FixtureUtf8 (native.fileScopeKey.Get ());
+	context.kind = "nativeDimensionCreateCandidateContext";
+	context.schemaVersion = "native-dimension-create-context/v1";
+	context.runId = FixtureUtf8 (runId);
+	context.processId = processId;
+	context.processStartUtcTicks = processStartTicks;
+	context.processStartEpoch = "dotnet-ticks-utc-v1";
+	context.archicadMajor = major;
+	context.buildId = TAPIR_BUILD_ID;
+	context.addonLocation = addonError == NoError ? FixtureUtf8 (addonLocation.ToDisplayText ()) : std::string ();
+	context.windowType = windowValid ? "FloorPlan" : "unavailable";
+	context.windowIndex = windowValid ? std::to_string (native.window.index) : "-1";
+	context.windowDatabaseGuid = windowValid
+		? (native.window.databaseUnId.elemSetId == APINULLGuid ? "null" : FixtureUtf8 (APIGuidToString (native.window.databaseUnId.elemSetId)))
+		: "null";
+	context.currentDatabaseGuid = databaseIdentity ? FixtureUtf8 (APIGuidToString (native.database.databaseUnId.elemSetId)) : "00000000-0000-0000-0000-000000000000";
+	context.storyIndex = storyValid ? std::to_string (native.activeStory) : "-1";
+	context.contractVersion = "native-crud-v2";
+	context.recipe = NativeDimensionCreateWire::Recipe;
+	context.policyVersion = "native-dimension-create-policy/v1";
+	context.candidateEnabled = TAPIR_ENABLE_NATIVE_DIMENSION_CREATE_CANDIDATE ? "true" : "false";
+	context.postCreateFaultEnabled = TAPIR_ENABLE_NATIVE_DIMENSION_CREATE_POST_CREATE_FAULT ? "true" : "false";
+	facts = GS::ObjectState (
+		"projectErrorCode", static_cast<Int32> (native.projectError),
+		"windowErrorCode", static_cast<Int32> (native.windowError),
+		"databaseErrorCode", static_cast<Int32> (native.databaseError),
+		"storyErrorCode", static_cast<Int32> (native.storyError),
+		"savedSolo", native.savedSolo,
+		"taskOwnedCopyExact", taskCopy,
+		"processIdentityAvailable", processIdentity,
+		"addonLocationErrorCode", static_cast<Int32> (addonError),
+		"window", NativeDimensionAuditWindowIdentityFacts (native),
+		"database", NativeDimensionCreateWire::EmitObservedDatabaseIdentityObjectState (
+			native.databaseError == NoError ? static_cast<Int32> (native.database.typeID) : -1, context.currentDatabaseGuid),
+		"storyIndex", native.activeStory);
+	return taskCopy && processIdentity && addonError == NoError && databaseIdentity && windowValid && storyValid
+		&& native.savedSolo
+		&& context.windowIndex != "-1" && !context.fileScopeKey.empty () && !context.projectPath.empty ();
+}
+
+GS::ObjectState RadialDefaultsResponse (
+    const char* status,
+    const GS::UniString& runId,
+    const GS::UniString& requestedFileScopeKey,
+    const Int32 requestedStory,
+    const GS::ObjectState& contextBefore,
+    const GS::ObjectState& contextAfter,
+    const GS::ObjectState& defaults,
+    const GS::ObjectState& error)
+{
+    return GS::ObjectState (
+        "schemaVersion", "native-dimension-radial-defaults/v1",
+        "status", status,
+        "meaning", "sdk-defaults-only-not-existing-element-facts-source-proof-or-create-validity",
+        "request", GS::ObjectState ("runId", runId, "fileScopeKey", requestedFileScopeKey, "storyIndex", requestedStory),
+        "contextBefore", contextBefore,
+        "contextAfter", contextAfter,
+        "defaults", defaults,
+        "error", error);
+}
+
+GS::ObjectState RadialDefaultsError (const char* code, const GS::UniString& message, const Int32 nativeErrorCode = 0)
+{
+    return GS::ObjectState ("status", "present", "code", code, "message", message, "nativeErrorCode", nativeErrorCode);
+}
+
+GS::ObjectState RadialDefaultsNoError ()
+{
+    return GS::ObjectState ("status", "none");
+}
+
+GS::ObjectState RadialDefaultsNotRequested ()
+{
+    return GS::ObjectState ("status", "not-requested");
+}
+
+GS::ObjectState RadialDefaultsNotCheckedContext ()
+{
+    return GS::ObjectState ("status", "not-checked-before-defaults-call");
+}
+
+GS::ObjectState RadialDefaultsDiscardedContextChange ()
+{
+    return GS::ObjectState ("status", "discarded-after-context-change");
+}
+
+GS::ObjectState RadialDefaultsFixedBuffer (const char* buffer, const std::size_t capacity)
+{
+    std::size_t byteLength = 0;
+    while (byteLength < capacity && buffer[byteLength] != '\0') ++byteLength;
+    const std::string bytes (buffer, byteLength);
+    return GS::ObjectState (
+        "status", byteLength < capacity ? "bounded-nul-terminated-fixed-buffer" : "bounded-buffer-without-terminator",
+        "byteLength", static_cast<Int32> (byteLength),
+        "bufferCapacity", static_cast<Int32> (capacity),
+        "nulTerminated", byteLength < capacity,
+        "bytesHex", GS::UniString (FixtureByteHex (bytes).c_str (), CC_UTF8),
+        "encoding", "raw-bytes-encoding-unproven");
+}
+
+GS::ObjectState RadialDefaultsNoteDetails (const API_NoteType& note)
+{
+    return GS::ObjectState (
+        "noteUnicodePointer", GS::ObjectState (
+            "status", note.contentUStr == nullptr ? "absent" : "present-access-not-attempted",
+            "access", "unavailable-pointer-never-dereferenced-or-freed"),
+        "fixedContent", RadialDefaultsFixedBuffer (note.content, sizeof (note.content)),
+        "pen", static_cast<Int32> (note.notePen),
+        "font", static_cast<Int32> (note.noteFont),
+        "layerIndex", DimensionAttributeIndex (note.noteLayer),
+        "textHeight", note.noteSize,
+        "textHeightUnit", "millimeter-paper-size",
+        "angle", note.noteAngle,
+        "angleUnit", "radian",
+        "position", DimensionPoint2D (note.pos),
+        "contentType", static_cast<Int32> (note.contentType),
+        "fixPos", note.fixPos,
+        "styleBits", static_cast<Int32> (note.faceBits),
+        "opaque", note.opaque,
+        "frame", note.frame,
+        "backgroundPen", static_cast<Int32> (note.backgroundPen),
+        "framePen", static_cast<Int32> (note.framePen),
+        "useLeaderLine", note.useLeaderLine,
+        "anchorAtTextEnd", note.anchorAtTextEnd,
+        "leaderBegin", DimensionPoint2D (note.begC),
+        "leaderMiddle", DimensionPoint2D (note.midC),
+        "leaderEnd", DimensionPoint2D (note.endC),
+        "leaderPen", static_cast<Int32> (note.leaderPen),
+        "leaderLineType", DimensionAttributeIndex (note.leaderLineType),
+        "leaderShape", static_cast<Int32> (note.leaderShape),
+        "leaderArrowType", static_cast<Int32> (note.arrowData.arrowType),
+        "leaderArrowAtBegin", note.arrowData.begArrow,
+        "leaderArrowAtEnd", note.arrowData.endArrow,
+        "leaderArrowPen", static_cast<Int32> (note.arrowData.arrowPen),
+        "leaderArrowSize", note.arrowData.arrowSize,
+        "anchorPoint", static_cast<Int32> (note.anchorPoint),
+        "justification", static_cast<Int32> (note.just),
+        "widthFactor", note.widthFactor,
+        "spacingFactor", note.spacingFactor,
+        "rowAnchor", static_cast<Int32> (note.rowAnchor),
+        "effectBits", static_cast<Int32> (note.effectBits));
+}
+
+GS::ObjectState RadialDefaultsMemoDetails (const API_ElementMemo& memo)
+{
+    const bool fieldPresent = memo.dimElems != nullptr;
+    const bool handlePresent = fieldPresent && *memo.dimElems != nullptr;
+    GS::ObjectState dimensionElements;
+    dimensionElements.Add ("status", !fieldPresent ? "handle-field-absent" : handlePresent ? "handle-present" : "handle-null");
+    dimensionElements.Add ("applicability", "known-API_ElementMemo-dimElems-field-for-dimension-records");
+    if (handlePresent) {
+        const GSSize byteLength = BMhGetSize (reinterpret_cast<GSHandle> (memo.dimElems));
+        dimensionElements.Add ("byteLength", static_cast<Int64> (byteLength));
+        dimensionElements.Add ("entrySize", static_cast<Int32> (sizeof (API_DimElem)));
+        dimensionElements.Add ("byteLengthStatus", byteLength <= 16 * 1024 * 1024 ? "bounded-size-read" : "present-over-16MiB-diagnostic-limit");
+    }
+    return GS::ObjectState (
+        "status", "returned-sdk-memo-inspected-only-for-known-dimension-handle",
+        "ownership", "sdk-owned-handles-disposed-once-by-NativeMemoGuard",
+        "handles", GS::ObjectState ("dimElems", dimensionElements));
+}
+
+GS::ObjectState RadialDefaultsFacts (const API_Element& element, const API_ElementMemo& memo)
+{
+    const API_RadialDimensionType& dimension = element.radialDimension;
+    GS::ObjectState geometry (
+        "base", RadialDefaultsBaseDetails (dimension.base),
+        "location", DimensionPoint2D (dimension.base.loc),
+        "location3D", DimensionPoint3D (dimension.base.loc3D),
+        "endPosition", DimensionPoint2D (dimension.endC),
+        "measuredRadius", dimension.dimVal,
+        "measuredRadiusUnit", "project-meter",
+        "measurementSource", "default-API_RadialDimensionType.dimVal",
+        "linePen", static_cast<Int32> (dimension.linPen),
+        "textPosition", static_cast<Int32> (dimension.textPos),
+        "textDirection", static_cast<Int32> (dimension.textWay),
+        "showOrigin", dimension.showOrigo,
+        "onlyDimensionText", dimension.onlyDimensionText,
+        "marker", DimensionMarkerDetails (dimension.markerData),
+        "prefixFixedBuffer", RadialDefaultsFixedBuffer (dimension.prefix, sizeof (dimension.prefix)),
+        "prefixUnicodePointer", GS::ObjectState (
+            "status", dimension.prefixUStr == nullptr ? "absent" : "present-access-not-attempted",
+            "access", "unavailable-pointer-never-dereferenced-or-freed"),
+        "note", RadialDefaultsNoteDetails (dimension.note));
+    return GS::ObjectState (
+        "status", "available",
+        "elementType", "RadialDimension",
+        "nativeElementTypeId", static_cast<Int32> (API_RadialDimensionID),
+        "geometryAndSettings", geometry,
+        "memo", RadialDefaultsMemoDetails (memo));
+}
+
+constexpr std::size_t MaxNativeArcHotspots = 32;
+constexpr auto NativeArcHotspotsBudget = std::chrono::milliseconds (5000);
+constexpr double NativeArcHotspotCoordinateTolerance = 1.0e-8;
+
+struct ArcHotspotHostSnapshot {
+    GSErrCode error = APIERR_GENERAL;
+    API_Guid requestedGuid = APINULLGuid;
+    API_Guid returnedGuid = APINULLGuid;
+    API_ElemTypeID type = API_ZombieElemID;
+    short storyIndex = -1;
+    UInt64 modificationStamp = 0;
+    API_Coord center = {};
+    double radius = 0.0;
+    double axisAngle = 0.0;
+    double axisRatio = 0.0;
+    double beginAngle = 0.0;
+    double endAngle = 0.0;
+    bool reflected = false;
+    bool whole = false;
+};
+
+bool IsFiniteArcHost (const ArcHotspotHostSnapshot& host)
+{
+    return std::isfinite (host.center.x) && std::isfinite (host.center.y)
+        && std::isfinite (host.radius) && std::isfinite (host.axisAngle)
+        && std::isfinite (host.axisRatio) && std::isfinite (host.beginAngle)
+        && std::isfinite (host.endAngle);
+}
+
+ArcHotspotHostSnapshot ReadArcHotspotHost (const API_Guid& guid)
+{
+    ArcHotspotHostSnapshot snapshot;
+    snapshot.requestedGuid = guid;
+    API_Element element = {};
+    element.header.guid = guid;
+    snapshot.error = ACAPI_Element_Get (&element);
+    if (snapshot.error != NoError)
+        return snapshot;
+
+    snapshot.returnedGuid = element.header.guid;
+    snapshot.type = GetElemTypeId (element.header);
+    snapshot.storyIndex = element.header.floorInd;
+    snapshot.modificationStamp = element.header.modiStamp;
+    if (snapshot.returnedGuid == guid && snapshot.type == API_ArcID) {
+        const API_ArcType& arc = element.arc;
+        snapshot.center = arc.origC;
+        snapshot.radius = arc.r;
+        snapshot.axisAngle = arc.angle;
+        snapshot.axisRatio = arc.ratio;
+        snapshot.beginAngle = arc.begAng;
+        snapshot.endAngle = arc.endAng;
+        snapshot.reflected = arc.reflected;
+        snapshot.whole = arc.whole;
+    }
+    return snapshot;
+}
+
+bool SameArcHotspotHost (const ArcHotspotHostSnapshot& before, const ArcHotspotHostSnapshot& after)
+{
+    return before.error == NoError && after.error == NoError
+        && before.returnedGuid == before.requestedGuid && after.returnedGuid == after.requestedGuid
+        && before.returnedGuid == after.returnedGuid && before.type == API_ArcID && after.type == API_ArcID
+        && before.storyIndex == after.storyIndex
+        && before.storyIndex == after.storyIndex && before.modificationStamp == after.modificationStamp
+        && before.center.x == after.center.x && before.center.y == after.center.y
+        && before.radius == after.radius && before.axisAngle == after.axisAngle
+        && before.axisRatio == after.axisRatio && before.beginAngle == after.beginAngle
+        && before.endAngle == after.endAngle && before.reflected == after.reflected && before.whole == after.whole
+        && IsFiniteArcHost (before) && IsFiniteArcHost (after);
+}
+
+GS::ObjectState ArcHotspotRecheckConsistency (
+    const ArcHotspotHostSnapshot& before,
+    const ArcHotspotHostSnapshot& after,
+    const bool hostStable,
+    const bool contextStable,
+    const bool completeObservation)
+{
+    const bool stampsAvailable = before.error == NoError && after.error == NoError;
+    if (!stampsAvailable) {
+        return GS::ObjectState (
+            "status", "changed-or-unverified",
+            "hostStable", hostStable,
+            "contextStable", contextStable);
+    }
+
+    return GS::ObjectState (
+        "status", completeObservation ? "stable" : "changed-or-incomplete",
+        "hostStable", hostStable,
+        "contextStable", contextStable,
+        "initialModificationStamp", GS::UniString (std::to_string (before.modificationStamp).c_str (), CC_UTF8),
+        "finalModificationStamp", GS::UniString (std::to_string (after.modificationStamp).c_str (), CC_UTF8));
+}
+
+GS::ObjectState ArcHotspotHostDetails (const ArcHotspotHostSnapshot& host)
+{
+    if (host.error != NoError)
+        return GS::ObjectState (
+            "status", "unavailable",
+            "requestedGuid", CreateGuidObjectState (host.requestedGuid),
+            "nativeErrorCode", static_cast<Int32> (host.error));
+
+    GS::ObjectState details (
+        "status", host.type == API_ArcID && host.returnedGuid == host.requestedGuid ? "available" : "wrong-type-or-identity",
+        "requestedGuid", CreateGuidObjectState (host.requestedGuid),
+        "elementId", CreateGuidObjectState (host.returnedGuid),
+        "nativeElementTypeId", static_cast<Int32> (host.type),
+        "storyIndex", static_cast<Int32> (host.storyIndex),
+        "modificationStamp", GS::UniString (std::to_string (host.modificationStamp).c_str (), CC_UTF8));
+    if (host.type == API_ArcID && host.returnedGuid == host.requestedGuid && IsFiniteArcHost (host)) {
+        details.Add ("geometry", GS::ObjectState (
+            "center", DimensionPoint2D (host.center),
+            "radius", host.radius,
+            "radiusUnit", "project-meter",
+            "axisAngle", host.axisAngle,
+            "axisAngleUnit", "radian",
+            "axisRatio", host.axisRatio,
+            "beginAngle", host.beginAngle,
+            "endAngle", host.endAngle,
+            "angleUnit", "radian",
+            "reflected", host.reflected,
+            "whole", host.whole));
+    } else {
+        details.Add ("geometryStatus", "unavailable-or-nonfinite");
+    }
+    return details;
+}
+
+bool IsFiniteHotspotCoord (const API_Coord3D& coordinate)
+{
+    return std::isfinite (coordinate.x) && std::isfinite (coordinate.y) && std::isfinite (coordinate.z);
+}
+
+GS::ObjectState ArcHotspotNeigDetails (const API_Neig& neig)
+{
+    return GS::ObjectState (
+        "neigId", static_cast<Int32> (neig.neigID),
+        "guid", CreateGuidObjectState (neig.guid),
+        "inIndex", neig.inIndex,
+        "flags", neig.flags,
+        "elementPartType", static_cast<Int32> (neig.elemPartType),
+        "elementPartIndex", static_cast<Int64> (neig.elemPartIndex),
+        "subtype", static_cast<Int32> (neig.subType));
+}
+
+GS::ObjectState ArcHotspotError (const char* code, const GS::UniString& message, const Int32 nativeErrorCode = 0)
+{
+    return GS::ObjectState ("status", "present", "code", code, "message", message, "nativeErrorCode", nativeErrorCode);
+}
+
+GS::ObjectState ArcHotspotNoError ()
+{
+    return GS::ObjectState ("status", "none");
+}
+
+GS::ObjectState ArcHotspotResponse (
+    const char* status,
+    const GS::UniString& runId,
+    const GS::UniString& requestedProjectPath,
+    const GS::UniString& requestedFileScopeKey,
+    const Int32 requestedStory,
+    const API_Guid& hostGuid,
+    const GS::ObjectState& contextBefore,
+    const GS::ObjectState& contextAfter,
+    const GS::ObjectState& hostBefore,
+    const GS::ObjectState& hostAfter,
+    const GS::ObjectState& readConsistency,
+    const Int64 returnedCount,
+    const bool complete,
+    const bool conversionComplete,
+    const char* coverageReason,
+    const GS::Array<GS::ObjectState>& hotspots,
+    const GS::ObjectState& error)
+{
+    return GS::ObjectState (
+        "schemaVersion", "native-dimension-arc-hotspots/v1",
+        "status", status,
+        "meaning", "returned-Arc-hotspots-and-coordinate-conversion-only-not-dimension-anchor-or-create-proof",
+        "request", GS::ObjectState (
+            "runId", runId,
+            "expectedProjectPath", requestedProjectPath,
+            "fileScopeKey", requestedFileScopeKey,
+            "storyIndex", requestedStory,
+            "hostGuid", APIGuidToString (hostGuid)),
+        "contextBefore", contextBefore,
+        "contextAfter", contextAfter,
+        "hostBefore", hostBefore,
+        "hostAfter", hostAfter,
+        "readConsistency", readConsistency,
+        "hotspotCount", returnedCount,
+        "complete", complete,
+        "coverage", GS::ObjectState (
+            "status", complete ? "complete" : "partial",
+            "reason", coverageReason,
+            "coordinateTolerance", NativeArcHotspotCoordinateTolerance,
+            "coordinateToleranceUnit", "project-meter"),
+        "conversionCoverage", GS::ObjectState (
+            "status", conversionComplete ? "complete" : "partial",
+            "meaning", "per-returned-neig-conversion-attempts-are-reported-independently"),
+        "hotspots", hotspots,
+        "error", error);
+}
+
+bool ArcHotspotStopped (GS::ProcessControl& processControl, const std::chrono::steady_clock::time_point& started, bool& cancelled)
+{
+    cancelled = processControl.TestBreak ();
+    return cancelled || std::chrono::steady_clock::now () - started >= NativeArcHotspotsBudget;
+}
+
+GS::ObjectState ArcHotspotStoppedError (const bool cancelled)
+{
+    return cancelled
+        ? ArcHotspotError ("COOPERATIVE_CANCELLED", "The read-only Arc hotspot diagnostic stopped at a cooperative cancellation point.")
+        : ArcHotspotError ("COOPERATIVE_DEADLINE_REACHED", "The read-only Arc hotspot diagnostic reached its cooperative time budget between SDK calls.");
+}
+
+} // namespace
+
+GetNativeDimensionAuditCaptureCommand::GetNativeDimensionAuditCaptureCommand () : CommandBase (CommonSchema::NotUsed) {}
+GS::String GetNativeDimensionAuditCaptureCommand::GetName () const { return "GetNativeDimensionAuditCapture"; }
+GS::Optional<GS::UniString> GetNativeDimensionAuditCaptureCommand::GetInputParametersSchema () const
+{
+	return R"({"type":"object","properties":{"schemaVersion":{"type":"string","enum":["native-dimension-audit-capture-request/v1","native-dimension-audit-scope-request/v2"]},"expectedProjectPath":{"type":"string","minLength":1,"maxLength":1024},"fileScopeKey":{"type":"string","minLength":1,"maxLength":1100},"expectedDatabaseGuid":{"type":"string","format":"uuid"},"storyIndex":{"type":"integer","minimum":-32768,"maximum":32767},"bounds":{"type":"object","properties":{"xMin":{"type":"number"},"yMin":{"type":"number"},"xMax":{"type":"number"},"yMax":{"type":"number"}},"required":["xMin","yMin","xMax","yMax"],"additionalProperties":false}},"required":["schemaVersion","expectedProjectPath","fileScopeKey","storyIndex","bounds"],"additionalProperties":false})";
+}
+GS::Optional<GS::UniString> GetNativeDimensionAuditCaptureCommand::GetResponseSchema () const { return {}; }
+GS::ObjectState GetNativeDimensionAuditCaptureCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const
+{
+#if TAPIR_AC_VERSION == 25
+	constexpr Int32 NativeDimensionAuditArchicadMajor = 25;
+#else
+	constexpr Int32 NativeDimensionAuditArchicadMajor = 28;
+#endif
+	GS::UniString schemaVersion, expectedProjectPath, fileScopeKey, databaseGuidText;
+	bool scopeRequestV2 = false;
+	Int32 requestedStory = 0;
+	GS::ObjectState requestedBoundsState;
+	GS::ObjectState request;
+	GS::ObjectState scopeRequest;
+	API_Guid requestedDatabaseGuid = APINULLGuid;
+	NativeDimensionAuditPolicy::Bounds2D requestedBounds = {};
+	if (!parameters.Get ("schemaVersion", schemaVersion)) {
+		return GS::ObjectState ("schemaVersion", "native-dimension-audit-capture/v1", "status", "refused", "reason", "invalid-closed-request");
+	}
+	scopeRequestV2 = schemaVersion == "native-dimension-audit-scope-request/v2";
+	const bool requestV1 = schemaVersion == "native-dimension-audit-capture-request/v1";
+	const UInt32 expectedFieldCount = requestV1 ? 6 : 5;
+	if ((!requestV1 && !scopeRequestV2) || parameters.GetFieldNames ().GetSize () != expectedFieldCount
+		|| !parameters.Get ("expectedProjectPath", expectedProjectPath) || expectedProjectPath.IsEmpty ()
+		|| !parameters.Get ("fileScopeKey", fileScopeKey) || fileScopeKey.IsEmpty ()
+		|| (requestV1 && !parameters.Get ("expectedDatabaseGuid", databaseGuidText))
+		|| !parameters.Get ("storyIndex", requestedStory)
+		|| !parameters.Get ("bounds", requestedBoundsState)
+		|| requestedBoundsState.GetFieldNames ().GetSize () != 4
+		|| !requestedBoundsState.Get ("xMin", requestedBounds.xMin)
+		|| !requestedBoundsState.Get ("yMin", requestedBounds.yMin)
+		|| !requestedBoundsState.Get ("xMax", requestedBounds.xMax)
+		|| !requestedBoundsState.Get ("yMax", requestedBounds.yMax)
+		|| !NativeDimensionAuditPolicy::IsFiniteOrderedBounds (requestedBounds)) {
+		return GS::ObjectState ("schemaVersion", "native-dimension-audit-capture/v1", "status", "refused", "reason", "invalid-closed-request");
+	}
+	scopeRequest = GS::ObjectState (
+		"schemaVersion", "native-dimension-audit-scope-request/v2",
+		"expectedProjectPath", expectedProjectPath,
+		"fileScopeKey", fileScopeKey,
+		"storyIndex", requestedStory,
+		"bounds", GS::ObjectState ("xMin", requestedBounds.xMin, "yMin", requestedBounds.yMin, "xMax", requestedBounds.xMax, "yMax", requestedBounds.yMax));
+	if (requestV1) {
+		requestedDatabaseGuid = APIGuidFromString (databaseGuidText.ToCStr ());
+		if (requestedDatabaseGuid == APINULLGuid)
+			return GS::ObjectState ("schemaVersion", "native-dimension-audit-capture/v1", "status", "refused", "reason", "invalid-database-guid");
+		request = GS::ObjectState (
+			"schemaVersion", schemaVersion,
+			"expectedProjectPath", expectedProjectPath,
+			"fileScopeKey", fileScopeKey,
+			"expectedDatabaseGuid", APIGuidToString (requestedDatabaseGuid),
+			"storyIndex", requestedStory,
+			"bounds", GS::ObjectState ("xMin", requestedBounds.xMin, "yMin", requestedBounds.yMin, "xMax", requestedBounds.xMax, "yMax", requestedBounds.yMax));
+	}
+
+	const auto started = std::chrono::steady_clock::now ();
+	RadialDefaultsContext contextBefore;
+	ReadNativeDimensionAuditContext (contextBefore);
+	if (scopeRequestV2 && contextBefore.databaseError == NoError)
+		requestedDatabaseGuid = contextBefore.database.databaseUnId.elemSetId;
+	const bool resolvedDatabaseAvailable = requestedDatabaseGuid != APINULLGuid;
+	if (scopeRequestV2 && resolvedDatabaseAvailable) {
+		request = GS::ObjectState (
+			"schemaVersion", "native-dimension-audit-capture-request/v1",
+			"expectedProjectPath", expectedProjectPath,
+			"fileScopeKey", fileScopeKey,
+			"expectedDatabaseGuid", APIGuidToString (requestedDatabaseGuid),
+			"storyIndex", requestedStory,
+			"bounds", GS::ObjectState ("xMin", requestedBounds.xMin, "yMin", requestedBounds.yMin, "xMax", requestedBounds.xMax, "yMax", requestedBounds.yMax));
+	}
+	const GS::ObjectState preferencesBefore = NativeDimensionAuditPreferences ();
+	const GS::ObjectState contextBeforeFacts = NativeDimensionAuditContextFacts (contextBefore, preferencesBefore);
+	RadialDefaultsContext contextAfter;
+	GS::ObjectState preferencesAfter;
+	GS::ObjectState contextAfterFacts;
+	bool finalContextRead = false;
+	bool finalContextFactsAvailable = false;
+	auto makeResponse = [&] (const char* status, const char* reason, const GS::ObjectState& facts, const char* factsStatus, const std::uint64_t factBytes) {
+		GS::ObjectState budget (
+			"rawCandidateLimit", static_cast<Int64> (NativeDimensionAuditPolicy::MaxRawCandidates),
+			"matchedParentLimit", static_cast<Int64> (NativeDimensionAuditPolicy::MaxMatchedParents),
+			"batchParentLimit", static_cast<Int64> (NativeDimensionAuditPolicy::MaxBatchParents),
+			"storedNoteLimit", static_cast<Int64> (NativeDimensionAuditPolicy::MaxStoredNotes),
+			"serializedFactByteLimit", static_cast<Int64> (NativeDimensionAuditPolicy::MaxSerializedFactBytes),
+			"serializedFactBytes", static_cast<Int64> (factBytes),
+			"allocationBound", "SDK-family-arrays-are-materialized-before-post-call-candidate-cap-check",
+			"deadline", "30-second-cooperative-between-stage-and-batch-check-not-hard-SDK-call-timeout");
+		GS::ObjectState response (
+			"schemaVersion", "native-dimension-audit-capture/v1",
+			"archicadMajor", NativeDimensionAuditArchicadMajor,
+			"status", status,
+			"reason", reason,
+			"request", request,
+			"contextBefore", contextBeforeFacts,
+			"factsStatus", factsStatus,
+			"budget", budget,
+			"coverage", GS::ObjectState (
+				"inventory", "complete-only-if-both-four-family-manifests-match",
+				"readerFacts", "partial-or-complete-per-row",
+				"memo", "preflighted-without-child-truncation",
+				"unicodeAccess", "copied-native-reader-coverage-only",
+				"sourceFidelity", "unproven",
+				"display", "unavailable-unless-independently-observed",
+				"noteCorrespondence", "unproven",
+				"inverseClosure", "unavailable"));
+		if (scopeRequestV2) {
+			response = GS::ObjectState (
+				"schemaVersion", "native-dimension-audit-capture/v2",
+				"archicadMajor", NativeDimensionAuditArchicadMajor,
+				"status", status,
+				"reason", reason,
+				"request", scopeRequest,
+				"resolvedDatabaseGuid", APIGuidToString (requestedDatabaseGuid),
+				"contextBefore", contextBeforeFacts,
+				"windowIdentityBefore", NativeDimensionAuditWindowIdentityFacts (contextBefore),
+				"factsStatus", factsStatus,
+				"budget", budget,
+				"coverage", GS::ObjectState (
+					"inventory", "complete-only-if-both-four-family-manifests-match",
+					"readerFacts", "partial-or-complete-per-row",
+					"memo", "preflighted-without-child-truncation",
+					"unicodeAccess", "copied-native-reader-coverage-only",
+					"sourceFidelity", "unproven",
+					"display", "unavailable-unless-independently-observed",
+					"noteCorrespondence", "unproven",
+					"inverseClosure", "unavailable"));
+			if (resolvedDatabaseAvailable) response.Add ("captureRequest", request);
+			if (finalContextRead && finalContextFactsAvailable) {
+				response.Add ("contextAfter", contextAfterFacts);
+				response.Add ("windowIdentityAfter", NativeDimensionAuditWindowIdentityFacts (contextAfter));
+			} else if (factsStatus[0] != 'n') {
+				response.Add ("contextAfter", GS::ObjectState ("status", "not-read"));
+				response.Add ("windowIdentityAfter", GS::ObjectState ("status", "not-read"));
+			}
+		}
+		if (factsStatus[0] == 'i') response.Add ("facts", facts);
+		return response;
+	};
+
+	if (scopeRequestV2 && !resolvedDatabaseAvailable)
+		return makeResponse ("refused", "scope-database-floorplan-or-story-mismatch-before-inventory", GS::ObjectState (), "not-read", 0);
+	if (!NativeDimensionAuditContextMatchesRequest (contextBefore, expectedProjectPath, fileScopeKey, requestedDatabaseGuid, requestedStory))
+		return makeResponse ("refused", "scope-database-floorplan-or-story-mismatch-before-inventory", GS::ObjectState (), "not-read", 0);
+	if (NativeDimensionAuditExpired (started, processControl))
+		return makeResponse (processControl.TestBreak () ? "partial" : "refused", processControl.TestBreak () ? "cooperative-cancelled-before-inventory" : "cooperative-deadline-before-inventory", GS::ObjectState (), "not-read", 0);
+
+	NativeDimensionAuditManifest manifestBefore = ReadNativeDimensionAuditManifest (requestedBounds, requestedStory, started, processControl);
+	std::vector<GS::ObjectState> parentRows;
+	std::vector<GS::ObjectState> preflightRows;
+	std::vector<GS::ObjectState> errors;
+	UInt64 estimatedStoredNotes = 0;
+	bool notePreflightComplete = manifestBefore.complete;
+	const bool parentBudgetOk = NativeDimensionAuditPolicy::WithinMatchedParentLimit (manifestBefore.matchedCount);
+	if (!parentBudgetOk) notePreflightComplete = false;
+	if (manifestBefore.complete && parentBudgetOk) {
+		for (const NativeDimensionAuditCandidate& candidate : manifestBefore.candidates) {
+			if (NativeDimensionAuditExpired (started, processControl)) {
+				notePreflightComplete = false;
+				errors.push_back (GS::ObjectState ("stage", "note-cardinality-preflight", "status", processControl.TestBreak () ? "cancelled" : "deadline-exceeded"));
+				break;
+			}
+			GS::ObjectState row;
+			row.Add ("elementId", CreateGuidObjectState (candidate.guid));
+			row.Add ("nativeElementTypeId", static_cast<Int32> (candidate.type));
+			row.Add ("expectedModificationStamp", static_cast<Int64> (candidate.modificationStamp));
+			API_Element element = {};
+			element.header.guid = candidate.guid;
+			const GSErrCode getError = ACAPI_Element_Get (&element);
+			row.Add ("elementGetErrorCode", static_cast<Int32> (getError));
+			UInt64 noteCount = 0;
+			bool parentCountAvailable = false;
+			if (getError == NoError && element.header.guid == candidate.guid && GetElemTypeId (element.header) == candidate.type
+				&& element.header.modiStamp == candidate.modificationStamp && static_cast<Int32> (element.header.floorInd) == requestedStory) {
+				if (candidate.type == API_DimensionID) {
+					const Int32 count = element.dimension.nDimElem;
+					if (count >= 0 && count <= 100000) { noteCount = static_cast<UInt64> (count) + 1; parentCountAvailable = true; }
+					else notePreflightComplete = false;
+				} else if (candidate.type == API_LevelDimensionID) { noteCount = 2; parentCountAvailable = true; }
+				else { noteCount = 1; parentCountAvailable = true; }
+			} else {
+				notePreflightComplete = false;
+			}
+			row.Add ("status", parentCountAvailable ? "available" : "unavailable");
+			if (!parentCountAvailable) {
+				row.Add ("reason", "exact-element-count-or-identity-unavailable");
+				errors.push_back (GS::ObjectState ("stage", "note-cardinality-preflight", "status", "parent-count-unavailable", "elementId", CreateGuidObjectState (candidate.guid)));
+			}
+			row.Add ("estimatedStoredNoteCount", static_cast<Int64> (noteCount));
+			row.Add ("countBasis", "fixed-family-note-slots-from-exact-element-read-including-default-and-inactive-level-note");
+			preflightRows.push_back (row);
+			estimatedStoredNotes += noteCount;
+			if (!NativeDimensionAuditPolicy::WithinStoredNoteLimit (estimatedStoredNotes)) {
+				notePreflightComplete = false;
+				errors.push_back (GS::ObjectState ("stage", "note-cardinality-preflight", "status", "stored-note-limit-exceeded-no-parent-memos-read"));
+				break;
+			}
+		}
+	}
+	const bool mayReadDetails = manifestBefore.complete && notePreflightComplete && parentBudgetOk
+		&& NativeDimensionAuditPolicy::WithinStoredNoteLimit (estimatedStoredNotes);
+	if (mayReadDetails) {
+		for (std::size_t offset = 0; offset < manifestBefore.candidates.size (); offset += NativeDimensionAuditPolicy::MaxBatchParents) {
+			if (NativeDimensionAuditExpired (started, processControl)) {
+				GS::ObjectState stop ("status", processControl.TestBreak () ? "cancelled" : "deadline-exceeded", "stage", "parent-reader-batch");
+				errors.push_back (stop);
+				for (std::size_t remaining = offset; remaining < manifestBefore.candidates.size (); ++remaining)
+					parentRows.push_back (GS::ObjectState ("status", "not-read", "reason", processControl.TestBreak () ? "cooperative-cancelled-before-parent-reader-batch" : "deadline-exceeded-before-parent-reader-batch", "elementId", CreateGuidObjectState (manifestBefore.candidates[remaining].guid)));
+				break;
+			}
+			GS::Array<GS::UniString> batchGuids;
+			const std::size_t end = std::min (manifestBefore.candidates.size (), offset + static_cast<std::size_t> (NativeDimensionAuditPolicy::MaxBatchParents));
+			for (std::size_t index = offset; index < end; ++index) batchGuids.Push (manifestBefore.candidates[index].guidText);
+			GS::ObjectState readerRequest;
+			readerRequest.Add ("guids", batchGuids);
+			const GS::ObjectState readerResponse = GetNativeDimensionDetailsCommand ().Execute (readerRequest, processControl);
+			GS::Array<GS::ObjectState> batchRows;
+			if (!readerResponse.Get ("elements", batchRows) || batchRows.GetSize () != batchGuids.GetSize ()) {
+				errors.push_back (GS::ObjectState ("stage", "exact-parent-reader", "status", "batch-response-invalid", "batchOffset", static_cast<Int64> (offset)));
+				for (std::size_t index = offset; index < end; ++index)
+					parentRows.push_back (GS::ObjectState ("status", "not-read", "reason", "exact-parent-reader-batch-response-invalid", "elementId", CreateGuidObjectState (manifestBefore.candidates[index].guid)));
+				continue;
+			}
+			for (UInt32 index = 0; index < batchRows.GetSize (); ++index) {
+				GS::ObjectState row = batchRows[index];
+				GS::ObjectState id;
+				GS::UniString returnedGuid;
+				const bool hasGuid = row.Get ("elementId", id) && id.Get ("guid", returnedGuid);
+				if (!hasGuid || NativeDimensionAuditPathKey (returnedGuid) != NativeDimensionAuditPathKey (batchGuids[index])) {
+					const NativeDimensionAuditCandidate& expected = manifestBefore.candidates[offset + index];
+					errors.push_back (GS::ObjectState (
+						"stage", "exact-parent-reader", "status", "returned-guid-mismatch",
+						"expectedGuid", batchGuids[index], "returnedRow", row));
+					parentRows.push_back (GS::ObjectState (
+						"status", "error", "elementType", FixtureElementTypeName (expected.type),
+						"elementId", CreateGuidObjectState (expected.guid),
+						"errorCode", static_cast<Int32> (APIERR_BADID),
+						"error", "The exact reader returned a different GUID; raw mismatched row is preserved in readerCoverage.errors."));
+					continue;
+				}
+				const NativeDimensionAuditCandidate& expected = manifestBefore.candidates[offset + index];
+				GS::UniString rowMismatchReason;
+				if (!NativeDimensionAuditRowMatchesCandidate (row, expected, requestedDatabaseGuid, static_cast<Int32> (contextBefore.database.typeID), requestedStory, preferencesBefore, rowMismatchReason)) {
+					errors.push_back (GS::ObjectState (
+						"stage", "exact-parent-reader-correlation", "status", "reader-facts-differ-from-independent-audit-context",
+						"expectedGuid", batchGuids[index], "reason", rowMismatchReason, "returnedRow", row));
+					parentRows.push_back (GS::ObjectState (
+						"status", "error", "elementType", FixtureElementTypeName (expected.type),
+						"elementId", CreateGuidObjectState (expected.guid),
+						"nativeElementTypeId", static_cast<Int32> (expected.type),
+						"errorCode", static_cast<Int32> (APIERR_BADID),
+						"error", "The exact reader row did not agree with the independent family, scope, bounds, revision, units, and preferences facts."));
+					continue;
+				}
+				parentRows.push_back (row);
+			}
+		}
+	} else {
+		for (const NativeDimensionAuditCandidate& candidate : manifestBefore.candidates)
+			parentRows.push_back (GS::ObjectState ("status", "not-read", "reason", "inventory-or-stored-note-preflight-incomplete", "elementId", CreateGuidObjectState (candidate.guid)));
+	}
+
+	const bool stoppedBeforeFinal = NativeDimensionAuditExpired (started, processControl);
+	NativeDimensionAuditManifest manifestAfter;
+	if (!stoppedBeforeFinal) {
+		manifestAfter = ReadNativeDimensionAuditManifest (requestedBounds, requestedStory, started, processControl);
+	} else {
+		manifestAfter.state = GS::ObjectState ("status", "not-read", "reason", processControl.TestBreak () ? "cooperative-cancelled" : "cooperative-deadline-exceeded");
+		manifestAfter.complete = false;
+	}
+	// The final context must bracket the enumeration itself.  Read it only after
+	// the final manifest and refuse a coherent result if that last SDK stage has
+	// exhausted the cooperative command budget.
+	const bool stoppedAfterFinalManifest = NativeDimensionAuditExpired (started, processControl);
+	const bool stoppedBeforeFinalContext = stoppedBeforeFinal || stoppedAfterFinalManifest;
+	if (!stoppedBeforeFinalContext) {
+		ReadNativeDimensionAuditContext (contextAfter);
+		preferencesAfter = NativeDimensionAuditPreferences ();
+		finalContextRead = true;
+	}
+	const bool stoppedAtFinal = stoppedBeforeFinalContext || NativeDimensionAuditExpired (started, processControl);
+	finalContextFactsAvailable = !stoppedAtFinal && finalContextRead;
+	contextAfterFacts = stoppedAtFinal ? GS::ObjectState ("status", "not-read") : NativeDimensionAuditContextFacts (contextAfter, preferencesAfter);
+	GS::UniString beforeContextText, afterContextText, beforeManifestText, afterManifestText;
+	std::uint64_t ignoredBytes = 0;
+	const bool contextSerialized = NativeDimensionAuditFactsText (contextBeforeFacts, beforeContextText, ignoredBytes)
+		&& !stoppedAtFinal && NativeDimensionAuditFactsText (contextAfterFacts, afterContextText, ignoredBytes);
+	const bool manifestSerialized = NativeDimensionAuditFactsText (manifestBefore.state, beforeManifestText, ignoredBytes)
+		&& !stoppedAtFinal && NativeDimensionAuditFactsText (manifestAfter.state, afterManifestText, ignoredBytes);
+	const bool contextStable = contextSerialized && beforeContextText == afterContextText
+		&& NativeDimensionAuditPreferencesAvailable (preferencesBefore) && NativeDimensionAuditPreferencesAvailable (preferencesAfter)
+		&& NativeDimensionAuditContextMatchesRequest (contextAfter, expectedProjectPath, fileScopeKey, requestedDatabaseGuid, requestedStory)
+		&& (!scopeRequestV2 || SameNativeDimensionAuditWindowIdentity (contextBefore, contextAfter));
+	const bool inventoryStable = manifestSerialized && manifestBefore.complete && manifestAfter.complete
+		&& beforeManifestText == afterManifestText;
+
+	GS::Array<GS::ObjectState> parents;
+	for (const GS::ObjectState& row : parentRows) parents.Push (row);
+	GS::Array<GS::ObjectState> preflight;
+	for (const GS::ObjectState& row : preflightRows) preflight.Push (row);
+	GS::Array<GS::ObjectState> errorRows;
+	for (const GS::ObjectState& row : errors) errorRows.Push (row);
+	UInt64 readerErrorCount = 0;
+	UInt64 unicodeCompleteCount = 0;
+	UInt64 unicodePartialCount = 0;
+	UInt64 unicodeNotReadCount = 0;
+	for (const GS::ObjectState& row : parentRows) {
+		GS::UniString rowStatus;
+		if (!row.Get ("status", rowStatus) || rowStatus != "success") {
+			readerErrorCount++;
+			unicodeNotReadCount++;
+			continue;
+		}
+		GS::ObjectState rowUnicode;
+		GS::UniString unicodeStatus;
+		if (row.Get ("unicodeAccessCoverage", rowUnicode) && rowUnicode.Get ("status", unicodeStatus) && unicodeStatus == "complete") unicodeCompleteCount++;
+		else unicodePartialCount++;
+	}
+	if (parentRows.size () < manifestBefore.candidates.size ())
+		unicodeNotReadCount += manifestBefore.candidates.size () - parentRows.size ();
+	const bool allParentRowsCaptured = mayReadDetails && parentRows.size () == manifestBefore.candidates.size () && readerErrorCount == 0;
+	const char* unicodeCoverageStatus = unicodePartialCount == 0 && unicodeNotReadCount == 0 ? "complete" : "partial";
+	GS::ObjectState facts (
+		"contextBefore", contextBeforeFacts,
+		"contextAfter", contextAfterFacts,
+		"preferencesBefore", preferencesBefore,
+		"preferencesAfter", stoppedAtFinal ? GS::ObjectState ("status", "not-read") : preferencesAfter,
+		"contextStable", contextStable,
+		"inventoryCoverage", GS::ObjectState ("status", inventoryStable ? "complete" : "partial", "before", manifestBefore.state, "after", manifestAfter.state),
+		"readerPreflight", GS::ObjectState ("status", notePreflightComplete ? "complete" : "partial", "estimatedStoredNoteCount", static_cast<Int64> (estimatedStoredNotes), "parents", preflight),
+		"readerCoverage", GS::ObjectState ("status", allParentRowsCaptured ? "captured" : "partial", "returnedRowCount", static_cast<Int64> (parentRows.size ()), "readerErrorCount", static_cast<Int64> (readerErrorCount), "parents", parents, "errors", errorRows),
+		"fieldCoverage", GS::ObjectState ("status", allParentRowsCaptured ? "all-requested-reader-rows-retained" : "partial-or-not-read", "meaning", "T1-versioned-native-reader-fields-preserved-without-grouping-or-inference"),
+		"memoCoverage", GS::ObjectState ("status", notePreflightComplete && mayReadDetails ? "preflighted-no-truncation" : "partial-or-not-read", "storedNoteCountLowerBound", static_cast<Int64> (estimatedStoredNotes)),
+		"unicodeAccessCoverage", GS::ObjectState (
+			"status", unicodeCoverageStatus,
+			"meaning", "exact-reader-Unicode-pointer-access-only-original-source-unproven",
+			"expectedParentCount", static_cast<Int64> (manifestBefore.matchedCount),
+			"completeParentCount", static_cast<Int64> (unicodeCompleteCount),
+			"partialParentCount", static_cast<Int64> (unicodePartialCount),
+			"notReadParentCount", static_cast<Int64> (unicodeNotReadCount)),
+		"sourceFidelity", GS::ObjectState ("status", "unproven", "reason", "unicode-content-and-drawing-observations-do-not-prove-original-source"),
+		"displayCoverage", GS::ObjectState ("status", "unavailable-unless-independently-observed"),
+		"noteCorrespondence", GS::ObjectState ("status", "unproven"),
+		"revisionCoverage", GS::ObjectState ("status", inventoryStable && contextStable ? "stable-manifests-and-project-context" : "partial-or-changed"),
+		"counts", GS::ObjectState (
+			"rawCandidates", static_cast<Int64> (manifestBefore.rawCandidateCount),
+			"matchedParents", static_cast<Int64> (manifestBefore.matchedCount),
+			"estimatedStoredNotes", static_cast<Int64> (estimatedStoredNotes),
+			"candidatePoolCompleteBeforeRectangle", manifestBefore.complete));
+	GS::UniString serializedFacts;
+	std::uint64_t serializedFactBytes = 0;
+	const bool serialized = NativeDimensionAuditFactsText (facts, serializedFacts, serializedFactBytes);
+	const bool factsWithinLimit = serialized && NativeDimensionAuditPolicy::WithinSerializedFactLimit (serializedFactBytes);
+	const bool expiredAfterFactSerialization = NativeDimensionAuditExpired (started, processControl);
+	const bool complete = !expiredAfterFactSerialization && contextStable && inventoryStable && allParentRowsCaptured
+		&& errors.empty () && factsWithinLimit;
+	const bool resourceRefusal = !manifestBefore.withinCandidateLimit || !parentBudgetOk
+		|| !NativeDimensionAuditPolicy::WithinStoredNoteLimit (estimatedStoredNotes)
+		|| (serialized && !factsWithinLimit);
+	const char* outcome = complete ? "complete" : resourceRefusal ? "refused" : "partial";
+	const char* reason = complete ? "complete-bounded-capture" : expiredAfterFactSerialization ? (processControl.TestBreak () ? "cooperative-cancelled-during-response-finalization" : "cooperative-deadline-during-response-finalization") : resourceRefusal ? "fixed-resource-limit-exceeded-no-successful-prefix" : !contextStable ? "context-or-preferences-changed-or-unavailable" : !inventoryStable ? "initial-final-manifest-incomplete-or-changed" : !mayReadDetails ? "reader-preflight-or-coverage-incomplete" : "reader-or-fact-serialization-incomplete";
+	const char* factsStatus = factsWithinLimit ? "included" : serialized ? "omitted-over-16MiB-limit" : "omitted-serialization-failed";
+	GS::ObjectState response = makeResponse (outcome, reason, facts, factsStatus, serializedFactBytes);
+	GS::UniString serializedResponse;
+	std::uint64_t ignoredResponseBytes = 0;
+	const bool responseSerialized = NativeDimensionAuditFactsText (response, serializedResponse, ignoredResponseBytes);
+	if (responseSerialized && NativeDimensionAuditExpired (started, processControl) && complete)
+		response = makeResponse ("partial", processControl.TestBreak () ? "cooperative-cancelled-during-response-finalization" : "cooperative-deadline-during-response-finalization", facts, factsStatus, serializedFactBytes);
+	else if (!responseSerialized && complete)
+		response = makeResponse ("partial", "response-serialization-unavailable-after-fact-capture", facts, factsStatus, serializedFactBytes);
+	return response;
+}
+
+namespace {
+
+constexpr const char* NativeDimensionLayerControlSchema = "native-dimension-layer-control/v2";
+constexpr const char* NativeDimensionLayerControlPreparationPolicy = "absent-owned-entry-flags-0-or-1-class-1/v2";
+constexpr std::uint64_t NativeDimensionLayerControlBudgetSeconds = 30;
+
+struct NativeDimensionLayerEntryFact {
+	Int32 layerIndex = 0;
+	GS::UniString layerGuid;
+	GS::UniString resolution;
+	GSErrCode lookupError = NoError;
+	Int32 rawFlags = 0;
+	Int32 connectionClass = 0;
+};
+
+struct NativeDimensionLayerFact {
+	GS::UniString guid;
+	Int32 index = 0;
+	Int32 typeId = static_cast<Int32> (API_LayerID);
+	Int32 flags = 0;
+	GS::UniString name;
+	Int32 connectionClass = 0;
+	UInt64 modificationTime = 0;
+};
+
+struct NativeDimensionLayerCombinationFact {
+	GS::UniString guid;
+	Int32 index = 0;
+	Int32 typeId = static_cast<Int32> (API_LayerCombID);
+	Int32 flags = 0;
+	GS::UniString name;
+	UInt64 modificationTime = 0;
+	Int32 declaredLayerCount = 0;
+	bool inEffect = false;
+	std::vector<NativeDimensionLayerEntryFact> entries;
+};
+
+struct NativeDimensionLayerSlotFact {
+	Int32 index = 0;
+	NativeDimensionLayerControlPolicy::SlotState state = NativeDimensionLayerControlPolicy::SlotState::Live;
+	GSErrCode errorCode = NoError;
+	NativeDimensionLayerFact layer;
+};
+
+struct NativeDimensionLayerCombinationSlotFact {
+	Int32 index = 0;
+	NativeDimensionLayerControlPolicy::SlotState state = NativeDimensionLayerControlPolicy::SlotState::Live;
+	GSErrCode errorCode = NoError;
+	NativeDimensionLayerCombinationFact combination;
+};
+
+struct NativeDimensionLayerInventory {
+	GS::ObjectState facts;
+	std::vector<NativeDimensionLayerFact> layers;
+	std::vector<NativeDimensionLayerSlotFact> layerSlots;
+	std::vector<NativeDimensionLayerCombinationFact> combinations;
+	std::vector<NativeDimensionLayerCombinationSlotFact> combinationSlots;
+	UInt64 layerReportedCount = 0;
+	UInt64 combinationReportedCount = 0;
+	UInt64 layerMaximumIndex = 0;
+	UInt64 combinationMaximumIndex = 0;
+	GS::UniString countSemantics;
+	GS::UniString serialized;
+	UInt64 serializedBytes = 0;
+	GSErrCode currentCombinationError = APIERR_GENERAL;
+	Int32 currentCombinationIndex = -1;
+	bool complete = false;
+	GS::UniString error;
+};
+
+struct NativeDimensionLayerControlRun {
+	bool active = false;
+	GS::UniString preparationPolicy;
+	NativeDimensionLayerControlPolicy::Phase phase = NativeDimensionLayerControlPolicy::Phase::Empty;
+	GS::UniString runId;
+	std::string runIdUtf8;
+	GS::UniString runRef;
+	GS::UniString nextNonce;
+	GS::UniString projectPath;
+	GS::UniString fileScopeKey;
+	API_Guid databaseGuid = APINULLGuid;
+	Int32 storyIndex = -1;
+	UInt32 processId = 0;
+	GS::UniString layerName;
+	API_Guid layerGuid = APINULLGuid;
+	API_AttributeIndex layerIndex = APIInvalidAttributeIndex;
+	API_Guid parentGuid = APINULLGuid;
+	UInt64 parentModificationStamp = 0;
+	std::string initialLayerFacts;
+	std::string initialCombinationFacts;
+	std::string preparedCombinationFacts;
+	std::string preparedOtherLayerFacts;
+	std::vector<NativeDimensionLayerFact> initialLayers;
+	std::vector<NativeDimensionLayerSlotFact> initialLayerSlots;
+	std::vector<NativeDimensionLayerCombinationFact> initialCombinations;
+	std::vector<NativeDimensionLayerCombinationSlotFact> initialCombinationSlots;
+	GSErrCode initialCurrentCombinationError = APIERR_GENERAL;
+	Int32 initialCurrentCombinationIndex = -1;
+	std::vector<NativeDimensionLayerFact> preparedLayers;
+	std::vector<NativeDimensionLayerSlotFact> preparedLayerSlots;
+	std::vector<NativeDimensionLayerCombinationFact> preparedCombinations;
+	std::vector<NativeDimensionLayerCombinationSlotFact> preparedCombinationSlots;
+	GSErrCode preparedCurrentCombinationError = APIERR_GENERAL;
+	Int32 preparedCurrentCombinationIndex = -1;
+	std::string preparedParentFacts;
+	std::string initialFocusFacts;
+	GS::ObjectState initialFocus;
+	GS::ObjectState beginFacts;
+	GS::ObjectState prepareFacts;
+	std::chrono::steady_clock::time_point started;
+};
+
+struct NativeDimensionLayerFocusSnapshot {
+	GS::ObjectState facts;
+	std::string serialized;
+	bool complete = false;
+};
+
+NativeDimensionLayerFocusSnapshot ReadNativeDimensionLayerFocus ()
+{
+	NativeDimensionLayerFocusSnapshot snapshot;
+	API_SelectionInfo selection = {};
+	GS::Array<API_Neig> neigs;
+	const GSErrCode error = ACAPI_Selection_Get (&selection, &neigs, false);
+	const GS::OnExit selectionGuard ([&selection] () { ReleaseSelectionInfoHandles (selection); });
+	if (error != NoError && error != APIERR_NOSEL) {
+		snapshot.facts = GS::ObjectState ("status", "unavailable", "errorCode", static_cast<Int32> (error));
+		return snapshot;
+	}
+	const bool empty = error == APIERR_NOSEL;
+	const Int32 returnedSelectionCount = empty ? 0 : neigs.GetSize ();
+	if (selection.sel_nElem < 0 || selection.sel_nElem != returnedSelectionCount) {
+		snapshot.facts = GS::ObjectState ("status", "unavailable", "reason", "selection-count-does-not-match-exact-neig-list",
+			"selectionErrorCode", static_cast<Int32> (error), "reportedCount", selection.sel_nElem,
+			"returnedNeigCount", returnedSelectionCount);
+		return snapshot;
+	}
+	GS::ObjectState focus ("status", "available", "selectionType", static_cast<Int32> (empty ? API_SelEmpty : selection.typeID),
+		"selectedElementCount", returnedSelectionCount, "selectionErrorCode", static_cast<Int32> (error));
+	const auto& selected = focus.AddList<GS::ObjectState> ("selectedElements");
+	if (!empty) {
+		if (neigs.GetSize () > 4096) {
+			snapshot.facts = GS::ObjectState ("status", "refused", "reason", "selection-element-budget-exceeded", "selectedElementCount", static_cast<Int32> (neigs.GetSize ()));
+			return snapshot;
+		}
+		for (const API_Neig& neig : neigs) selected (GS::ObjectState (
+			"guid", APIGuidToString (neig.guid), "neigId", static_cast<Int32> (neig.neigID),
+			"inIndex", neig.inIndex, "flags", neig.flags, "elementPartType", static_cast<Int32> (neig.elemPartType),
+			"elementPartIndex", static_cast<Int64> (neig.elemPartIndex), "subtype", static_cast<Int32> (neig.subType)));
+	}
+	const bool marquee = !empty && (selection.typeID == API_MarqueePoly || selection.typeID == API_MarqueeHorBox || selection.typeID == API_MarqueeRotBox);
+	if (marquee) {
+		if (!std::isfinite (selection.marquee.box.xMin) || !std::isfinite (selection.marquee.box.yMin)
+			|| !std::isfinite (selection.marquee.box.xMax) || !std::isfinite (selection.marquee.box.yMax)
+			|| !std::isfinite (selection.marquee.boxRotAngle)) {
+			snapshot.facts = GS::ObjectState ("status", "unavailable", "reason", "marquee-coordinates-nonfinite");
+			return snapshot;
+		}
+		GS::ObjectState marqueeFacts ("multiStory", selection.multiStory, "rotation", selection.marquee.boxRotAngle,
+			"bounds", GS::ObjectState ("xMin", selection.marquee.box.xMin, "yMin", selection.marquee.box.yMin,
+				"xMax", selection.marquee.box.xMax, "yMax", selection.marquee.box.yMax));
+		if (selection.typeID == API_MarqueePoly) {
+			const GSSize bytes = selection.marquee.coords != nullptr && *selection.marquee.coords != nullptr
+				? BMhGetSize (reinterpret_cast<GSHandle> (selection.marquee.coords)) : 0;
+			if (selection.marquee.coords == nullptr || *selection.marquee.coords == nullptr || selection.marquee.nCoords < 1
+				|| selection.marquee.nCoords > 200000 || bytes < static_cast<GSSize> (selection.marquee.nCoords + 1) * sizeof (API_Coord)) {
+				snapshot.facts = GS::ObjectState ("status", "unavailable", "reason", "marquee-polygon-storage-unavailable-or-out-of-bounds");
+				return snapshot;
+			}
+			const auto& points = marqueeFacts.AddList<GS::ObjectState> ("polygonPoints");
+			for (Int32 index = 1; index <= selection.marquee.nCoords; ++index) {
+				const API_Coord& point = (*selection.marquee.coords)[index];
+				if (!std::isfinite (point.x) || !std::isfinite (point.y)) {
+					snapshot.facts = GS::ObjectState ("status", "unavailable", "reason", "marquee-polygon-coordinate-nonfinite");
+					return snapshot;
+				}
+				points (GS::ObjectState ("x", point.x, "y", point.y));
+			}
+		}
+		focus.Add ("marquee", marqueeFacts);
+	}
+	snapshot.facts = focus;
+	GS::UniString serialized;
+	if (JSON::CreateFromObjectState (snapshot.facts, serialized, false) != NoError) {
+		snapshot.facts = GS::ObjectState ("status", "unavailable", "reason", "focus-serialization-failed");
+		return snapshot;
+	}
+	snapshot.serialized = FixtureUtf8 (serialized);
+	snapshot.complete = true;
+	return snapshot;
+}
+
+bool NativeDimensionLayerFactEqual (const NativeDimensionLayerFact& left, const NativeDimensionLayerFact& right)
+{
+	return left.guid == right.guid && left.index == right.index && left.typeId == right.typeId
+		&& left.flags == right.flags && left.name == right.name && left.connectionClass == right.connectionClass
+		&& left.modificationTime == right.modificationTime;
+}
+
+bool NativeDimensionLayerEntryEqual (const NativeDimensionLayerEntryFact& left, const NativeDimensionLayerEntryFact& right)
+{
+	return left.layerIndex == right.layerIndex && left.layerGuid == right.layerGuid && left.resolution == right.resolution
+		&& left.lookupError == right.lookupError
+		&& left.rawFlags == right.rawFlags && left.connectionClass == right.connectionClass;
+}
+
+bool NativeDimensionLayerCombinationEqual (const NativeDimensionLayerCombinationFact& left,
+	const NativeDimensionLayerCombinationFact& right, const bool allowCreateTimeAndOneLayer);
+
+bool NativeDimensionLayerSlotEqual (const NativeDimensionLayerSlotFact& left, const NativeDimensionLayerSlotFact& right)
+{
+	return left.index == right.index && left.state == right.state && left.errorCode == right.errorCode
+		&& (left.state != NativeDimensionLayerControlPolicy::SlotState::Live || NativeDimensionLayerFactEqual (left.layer, right.layer));
+}
+
+bool NativeDimensionLayerCombinationSlotEqual (const NativeDimensionLayerCombinationSlotFact& left, const NativeDimensionLayerCombinationSlotFact& right)
+{
+	return left.index == right.index && left.state == right.state && left.errorCode == right.errorCode
+		&& (left.state != NativeDimensionLayerControlPolicy::SlotState::Live
+			|| NativeDimensionLayerCombinationEqual (left.combination, right.combination, false));
+}
+
+bool NativeDimensionLayerCombinationEqual (const NativeDimensionLayerCombinationFact& left,
+	const NativeDimensionLayerCombinationFact& right, const bool allowCreateTimeAndOneLayer)
+{
+	if (left.guid != right.guid || left.index != right.index || left.typeId != right.typeId || left.flags != right.flags
+		|| left.name != right.name || left.inEffect != right.inEffect
+		|| left.declaredLayerCount != right.declaredLayerCount + (allowCreateTimeAndOneLayer ? 1 : 0)
+		|| (!allowCreateTimeAndOneLayer && left.modificationTime != right.modificationTime)) return false;
+	if (allowCreateTimeAndOneLayer) {
+		if (left.entries.size () != right.entries.size () + 1) return false;
+		std::size_t added = 0;
+		for (const auto& entry : left.entries) {
+			const auto old = std::find_if (right.entries.begin (), right.entries.end (), [&entry] (const auto& previous) { return NativeDimensionLayerEntryEqual (entry, previous); });
+			if (old == right.entries.end ()) {
+				++added;
+				if ((entry.rawFlags & (APILay_Hidden | APILay_Locked)) != 0) return false;
+			}
+		}
+		return added == 1;
+	}
+	if (left.entries.size () != right.entries.size ()) return false;
+	for (std::size_t index = 0; index < left.entries.size (); ++index)
+		if (!NativeDimensionLayerEntryEqual (left.entries[index], right.entries[index])) return false;
+	return true;
+}
+
+bool NativeDimensionLayerCombinationPreparationDeltaExact (const NativeDimensionLayerCombinationFact& after,
+	const NativeDimensionLayerCombinationFact& before, const Int32 ownedIndex, const GS::UniString& ownedGuid)
+{
+	if (after.guid != before.guid || after.index != before.index || after.typeId != before.typeId || after.flags != before.flags
+		|| after.name != before.name || after.inEffect != before.inEffect) return false;
+	const auto oldOwned = std::find_if (before.entries.begin (), before.entries.end (), [ownedIndex] (const auto& entry) { return entry.layerIndex == ownedIndex; });
+	const auto newOwned = std::find_if (after.entries.begin (), after.entries.end (), [ownedIndex] (const auto& entry) { return entry.layerIndex == ownedIndex; });
+	if (newOwned == after.entries.end () || newOwned->resolution != "live-guid"
+		|| NativeDimensionAuditPathKey (newOwned->layerGuid) != NativeDimensionAuditPathKey (ownedGuid)) return false;
+	const bool oldIndexWasLive = oldOwned != before.entries.end () && oldOwned->resolution == "live-guid";
+	const bool oldEntryPresent = oldOwned != before.entries.end ();
+	const auto oldEntryState = !oldEntryPresent ? NativeDimensionLayerControlPolicy::SlotState::Absent
+		: oldOwned->resolution == "tombstone" ? NativeDimensionLayerControlPolicy::SlotState::Tombstone
+		: oldOwned->resolution == "absent-from-live-enumeration" ? NativeDimensionLayerControlPolicy::SlotState::Absent
+		: NativeDimensionLayerControlPolicy::SlotState::Live;
+	const bool oldEntryFactsPreserved = oldEntryPresent && oldOwned->rawFlags == newOwned->rawFlags
+		&& oldOwned->connectionClass == newOwned->connectionClass;
+	const bool newEntryLive = newOwned->resolution == "live-guid";
+	const auto change = NativeDimensionLayerControlPolicy::ClassifyOwnedEntryChange (oldIndexWasLive, oldEntryPresent,
+		oldEntryState, oldEntryFactsPreserved, newEntryLive);
+	if (change == NativeDimensionLayerControlPolicy::OwnedEntryChange::Invalid) return false;
+	if (change == NativeDimensionLayerControlPolicy::OwnedEntryChange::Add) {
+		if (!NativeDimensionLayerControlPolicy::IsValidAbsentOwnedEntryAddition (newOwned->rawFlags, newOwned->connectionClass)
+			|| after.entries.size () != before.entries.size () + 1
+			|| after.declaredLayerCount != before.declaredLayerCount + 1) return false;
+	} else if (after.entries.size () != before.entries.size () || after.declaredLayerCount != before.declaredLayerCount
+		|| !NativeDimensionLayerControlPolicy::IsVisibleUnlockedStoredEntry (newOwned->rawFlags)) return false;
+	for (const auto& oldEntry : before.entries) {
+		if (oldEntry.layerIndex == ownedIndex) continue;
+		const auto current = std::find_if (after.entries.begin (), after.entries.end (), [&oldEntry] (const auto& entry) { return entry.layerIndex == oldEntry.layerIndex; });
+		if (current == after.entries.end () || !NativeDimensionLayerEntryEqual (*current, oldEntry)) return false;
+	}
+	return true;
+}
+
+bool NativeDimensionLayerInventoryMatchesInitial (const NativeDimensionLayerControlRun& run, const NativeDimensionLayerInventory& current)
+{
+	if (!current.complete || current.layers.size () != run.initialLayers.size () || current.combinations.size () != run.initialCombinations.size ()) return false;
+	if (current.layerSlots.size () != run.initialLayerSlots.size () || current.combinationSlots.size () != run.initialCombinationSlots.size ()) return false;
+	for (std::size_t index = 0; index < run.initialLayerSlots.size (); ++index)
+		if (!NativeDimensionLayerSlotEqual (current.layerSlots[index], run.initialLayerSlots[index])) return false;
+	for (std::size_t index = 0; index < run.initialCombinationSlots.size (); ++index)
+		if (!NativeDimensionLayerCombinationSlotEqual (current.combinationSlots[index], run.initialCombinationSlots[index])) return false;
+	if (current.currentCombinationError != run.initialCurrentCombinationError || current.currentCombinationIndex != run.initialCurrentCombinationIndex) return false;
+	for (std::size_t index = 0; index < run.initialLayers.size (); ++index)
+		if (!NativeDimensionLayerFactEqual (current.layers[index], run.initialLayers[index])) return false;
+	for (std::size_t index = 0; index < run.initialCombinations.size (); ++index)
+		if (!NativeDimensionLayerCombinationEqual (current.combinations[index], run.initialCombinations[index], false)) return false;
+	return true;
+}
+
+bool NativeDimensionLayerPreparationDeltaExact (const NativeDimensionLayerInventory& before,
+	const NativeDimensionLayerInventory& after, const API_Guid ownedGuid)
+{
+	if (!before.complete || !after.complete || after.layers.size () != before.layers.size () + 1
+		|| after.combinations.size () != before.combinations.size () || after.combinationSlots.size () != before.combinationSlots.size ()
+		|| after.combinationReportedCount != before.combinationReportedCount || after.countSemantics != before.countSemantics
+		|| before.currentCombinationError != after.currentCombinationError
+		|| before.currentCombinationIndex != after.currentCombinationIndex) return false;
+	const GS::UniString ownedGuidText = APIGuidToString (ownedGuid);
+	if (std::any_of (before.layers.begin (), before.layers.end (), [&ownedGuidText] (const auto& item) {
+		return NativeDimensionAuditPathKey (item.guid) == NativeDimensionAuditPathKey (ownedGuidText);
+	})) return false;
+	std::size_t matched = 0;
+	for (const auto& oldLayer : before.layers) {
+		const auto found = std::find_if (after.layers.begin (), after.layers.end (), [&oldLayer] (const auto& item) { return item.guid == oldLayer.guid; });
+		if (found == after.layers.end () || !NativeDimensionLayerFactEqual (*found, oldLayer)) return false;
+		++matched;
+	}
+	const auto addedLayer = std::find_if (after.layers.begin (), after.layers.end (), [&ownedGuidText] (const auto& item) { return item.guid == ownedGuidText; });
+	if (addedLayer == after.layers.end () || matched != before.layers.size ()
+		|| !NativeDimensionLayerControlPolicy::IsExactNewOwnedLayerState (addedLayer->flags, addedLayer->connectionClass)) return false;
+	const auto oldOwnedSlot = std::find_if (before.layerSlots.begin (), before.layerSlots.end (), [&addedLayer] (const auto& slot) { return slot.index == addedLayer->index; });
+	if (oldOwnedSlot != before.layerSlots.end () && oldOwnedSlot->state == NativeDimensionLayerControlPolicy::SlotState::Live) return false;
+	if (oldOwnedSlot != before.layerSlots.end () && oldOwnedSlot->state != NativeDimensionLayerControlPolicy::SlotState::Tombstone) return false;
+	const UInt64 expectedSlotDelta = before.countSemantics == "actual-live-count" || oldOwnedSlot == before.layerSlots.end () ? 1 : 0;
+	if (after.layerSlots.size () != before.layerSlots.size () + expectedSlotDelta
+		|| after.layerReportedCount != before.layerReportedCount + expectedSlotDelta) return false;
+	const auto newOwnedSlot = std::find_if (after.layerSlots.begin (), after.layerSlots.end (), [&addedLayer] (const auto& slot) { return slot.index == addedLayer->index; });
+	if (newOwnedSlot == after.layerSlots.end () || newOwnedSlot->state != NativeDimensionLayerControlPolicy::SlotState::Live
+		|| !NativeDimensionLayerFactEqual (newOwnedSlot->layer, *addedLayer)) return false;
+	for (const auto& oldSlot : before.layerSlots) {
+		if (oldSlot.index == addedLayer->index) continue;
+		const auto current = std::find_if (after.layerSlots.begin (), after.layerSlots.end (), [&oldSlot] (const auto& slot) { return slot.index == oldSlot.index; });
+		if (current == after.layerSlots.end () || !NativeDimensionLayerSlotEqual (*current, oldSlot)) return false;
+	}
+	for (const auto& oldCombo : before.combinations) {
+		const auto found = std::find_if (after.combinations.begin (), after.combinations.end (), [&oldCombo] (const auto& item) { return item.guid == oldCombo.guid; });
+		if (found == after.combinations.end () || !NativeDimensionLayerCombinationPreparationDeltaExact (*found, oldCombo, addedLayer->index, addedLayer->guid)) return false;
+	}
+	for (std::size_t index = 0; index < before.combinationSlots.size (); ++index) {
+		const auto& oldSlot = before.combinationSlots[index];
+		const auto current = std::find_if (after.combinationSlots.begin (), after.combinationSlots.end (), [&oldSlot] (const auto& slot) { return slot.index == oldSlot.index; });
+		if (current == after.combinationSlots.end ()) return false;
+		if (oldSlot.state != NativeDimensionLayerControlPolicy::SlotState::Live) {
+			if (!NativeDimensionLayerCombinationSlotEqual (*current, oldSlot)) return false;
+		} else {
+			const auto priorCombo = std::find_if (before.combinations.begin (), before.combinations.end (), [&oldSlot] (const auto& combo) { return combo.guid == oldSlot.combination.guid; });
+			if (priorCombo == before.combinations.end ()) return false;
+			const auto updated = std::find_if (after.combinations.begin (), after.combinations.end (), [&priorCombo] (const auto& combo) { return combo.guid == priorCombo->guid; });
+			if (updated == after.combinations.end () || updated->index != oldSlot.index) return false;
+		}
+	}
+	return true;
+}
+
+bool NativeDimensionLayerStageFactsUnchanged (const NativeDimensionLayerControlRun& run,
+	const NativeDimensionLayerInventory& current, const bool expectedHidden, const bool expectedLocked)
+{
+	if (!current.complete || current.layers.size () != run.preparedLayers.size ()
+		|| current.combinations.size () != run.preparedCombinations.size ()
+		|| current.layerSlots.size () != run.preparedLayerSlots.size () || current.combinationSlots.size () != run.preparedCombinationSlots.size ()
+		|| current.currentCombinationError != run.preparedCurrentCombinationError
+		|| current.currentCombinationIndex != run.preparedCurrentCombinationIndex) return false;
+	for (std::size_t index = 0; index < run.preparedLayerSlots.size (); ++index) {
+		const auto& expected = run.preparedLayerSlots[index];
+		const auto& observed = current.layerSlots[index];
+		if (expected.index != observed.index || expected.state != observed.state) return false;
+		if (expected.state == NativeDimensionLayerControlPolicy::SlotState::Tombstone && expected.errorCode != observed.errorCode) return false;
+		if (expected.state == NativeDimensionLayerControlPolicy::SlotState::Live && expected.layer.guid != APIGuidToString (run.layerGuid)
+			&& !NativeDimensionLayerFactEqual (expected.layer, observed.layer)) return false;
+	}
+	for (std::size_t index = 0; index < run.preparedCombinationSlots.size (); ++index)
+		if (!NativeDimensionLayerCombinationSlotEqual (current.combinationSlots[index], run.preparedCombinationSlots[index])) return false;
+	for (std::size_t index = 0; index < run.preparedLayers.size (); ++index) {
+		const auto& expected = run.preparedLayers[index];
+		const auto& observed = current.layers[index];
+		if (expected.guid != observed.guid || expected.index != observed.index || expected.typeId != observed.typeId
+			|| expected.name != observed.name || expected.connectionClass != observed.connectionClass) return false;
+		const Int32 expectedFlags = static_cast<Int32> (expected.flags & ~(APILay_Hidden | APILay_Locked))
+			| (expected.guid == APIGuidToString (run.layerGuid) ? (expectedHidden ? APILay_Hidden : 0) | (expectedLocked ? APILay_Locked : 0)
+				: (expected.flags & (APILay_Hidden | APILay_Locked)));
+		if (observed.flags != expectedFlags) return false;
+		if (expected.guid != APIGuidToString (run.layerGuid) && observed.modificationTime != expected.modificationTime) return false;
+	}
+	for (std::size_t index = 0; index < run.preparedCombinations.size (); ++index)
+		if (!NativeDimensionLayerCombinationEqual (current.combinations[index], run.preparedCombinations[index], false)) return false;
+	return true;
+}
+
+NativeDimensionLayerControlRun gNativeDimensionLayerControlRun;
+std::set<std::string> gUsedNativeDimensionLayerControlNonces;
+std::atomic<std::uint64_t> gNativeDimensionLayerControlCounter { 0 };
+
+bool NativeDimensionLayerControlExpired (const std::chrono::steady_clock::time_point& started, GS::ProcessControl& processControl)
+{
+	return processControl.TestBreak () || std::chrono::steady_clock::now () - started >= std::chrono::seconds (NativeDimensionLayerControlBudgetSeconds);
+}
+
+GS::UniString NativeDimensionLayerControlToken ()
+{
+	const auto now = std::chrono::steady_clock::now ().time_since_epoch ().count ();
+	const auto counter = gNativeDimensionLayerControlCounter.fetch_add (1, std::memory_order_relaxed) + 1;
+	const std::string token = std::to_string (GetCurrentProcessId ()) + "-" + std::to_string (now) + "-" + std::to_string (counter);
+	return GS::UniString (token.c_str (), CC_UTF8);
+}
+
+bool NativeDimensionLayerControlAttributeCount (const API_AttrTypeID typeId, UInt64& count, GSErrCode& error)
+{
+#ifdef ServerMainVers_2800
+	UInt32 rawCount = 0;
+	error = ACAPI_Attribute_GetNum (typeId, rawCount);
+	count = rawCount;
+#else
+	API_AttributeIndex rawCount = 0;
+	error = ACAPI_Attribute_GetNum (typeId, &rawCount);
+	count = static_cast<UInt64> (GetAttributeIndex (rawCount));
+#endif
+	return error == NoError;
+}
+
+GS::ObjectState NativeDimensionLayerEntryState (const NativeDimensionLayerEntryFact& entry)
+{
+	GS::ObjectState state ("layerIndex", entry.layerIndex, "resolution", entry.resolution,
+		"rawFlags", entry.rawFlags, "isHidden", (entry.rawFlags & APILay_Hidden) != 0,
+		"isLocked", (entry.rawFlags & APILay_Locked) != 0, "isWireframe", (entry.rawFlags & APILay_ForceToWire) != 0,
+		"connectionClass", entry.connectionClass);
+	if (entry.resolution == "live-guid") state.Add ("layerGuid", entry.layerGuid);
+	else state.Add ("lookupErrorCode", static_cast<Int32> (entry.lookupError));
+	return state;
+}
+
+GS::ObjectState NativeDimensionLayerFactState (const NativeDimensionLayerFact& layer)
+{
+	return GS::ObjectState ("attributeGuid", layer.guid, "attributeIndex", layer.index, "typeId", layer.typeId,
+		"flags", layer.flags, "isHidden", (layer.flags & APILay_Hidden) != 0,
+		"isLocked", (layer.flags & APILay_Locked) != 0, "isWireframe", (layer.flags & APILay_ForceToWire) != 0,
+		"name", layer.name, "connectionClass", layer.connectionClass, "modificationTime", static_cast<Int64> (layer.modificationTime));
+}
+
+GS::ObjectState NativeDimensionLayerCombinationFactState (const NativeDimensionLayerCombinationFact& combination)
+{
+	GS::ObjectState state ("attributeGuid", combination.guid, "attributeIndex", combination.index,
+		"typeId", combination.typeId, "flags", combination.flags, "name", combination.name,
+		"modificationTime", static_cast<Int64> (combination.modificationTime),
+		"declaredLayerCount", combination.declaredLayerCount, "inEffect", combination.inEffect);
+	const auto& entries = state.AddList<GS::ObjectState> ("entries");
+	for (const NativeDimensionLayerEntryFact& entry : combination.entries) entries (NativeDimensionLayerEntryState (entry));
+	return state;
+}
+
+GS::ObjectState NativeDimensionLayerInventoryState (const NativeDimensionLayerInventory& inventory,
+	const GS::UniString& status, const GS::UniString& reason = GS::UniString ())
+{
+	const UInt64 layerTombstones = static_cast<UInt64> (std::count_if (inventory.layerSlots.begin (), inventory.layerSlots.end (), [] (const auto& slot) {
+		return slot.state == NativeDimensionLayerControlPolicy::SlotState::Tombstone;
+	}));
+	const UInt64 combinationTombstones = static_cast<UInt64> (std::count_if (inventory.combinationSlots.begin (), inventory.combinationSlots.end (), [] (const auto& slot) {
+		return slot.state == NativeDimensionLayerControlPolicy::SlotState::Tombstone;
+	}));
+	GS::ObjectState facts ("status", status, "schemaVersion", "native-dimension-layer-inventory-facts/v2",
+		"sdkMajor", TAPIR_AC_VERSION, "layerInventory", GS::ObjectState ("reportedCount", static_cast<Int64> (inventory.layerReportedCount),
+			"countSemantics", inventory.countSemantics, "liveCount", static_cast<Int64> (inventory.layers.size ()),
+			"maximumObservedIndex", static_cast<Int64> (inventory.layerMaximumIndex), "tombstoneCount", static_cast<Int64> (layerTombstones)),
+		"combinationInventory", GS::ObjectState ("reportedCount", static_cast<Int64> (inventory.combinationReportedCount),
+			"countSemantics", inventory.countSemantics, "liveCount", static_cast<Int64> (inventory.combinations.size ()),
+			"maximumObservedIndex", static_cast<Int64> (inventory.combinationMaximumIndex), "tombstoneCount", static_cast<Int64> (combinationTombstones)),
+		"entryCount", static_cast<Int64> (std::accumulate (inventory.combinations.begin (), inventory.combinations.end (), UInt64 (0), [] (UInt64 total, const auto& combo) { return total + combo.entries.size (); })),
+		"currentCombination", GS::ObjectState ("status", inventory.currentCombinationError == NoError ? "available" : "unavailable",
+			"errorCode", static_cast<Int32> (inventory.currentCombinationError), "index", inventory.currentCombinationError == NoError ? inventory.currentCombinationIndex : -1));
+	if (!reason.IsEmpty ()) facts.Add ("reason", reason);
+	const auto& layerSlots = facts.AddList<GS::ObjectState> ("layerSlots");
+	for (const auto& slot : inventory.layerSlots) {
+		GS::ObjectState state ("index", slot.index, "status", slot.state == NativeDimensionLayerControlPolicy::SlotState::Live ? "live" : "tombstone");
+		if (slot.state == NativeDimensionLayerControlPolicy::SlotState::Live) state.Add ("layer", NativeDimensionLayerFactState (slot.layer));
+		else state.Add ("errorCode", static_cast<Int32> (slot.errorCode));
+		layerSlots (state);
+	}
+	const auto& combinationSlots = facts.AddList<GS::ObjectState> ("combinationSlots");
+	for (const auto& slot : inventory.combinationSlots) {
+		GS::ObjectState state ("index", slot.index, "status", slot.state == NativeDimensionLayerControlPolicy::SlotState::Live ? "live" : "tombstone");
+		if (slot.state == NativeDimensionLayerControlPolicy::SlotState::Live) state.Add ("combination", NativeDimensionLayerCombinationFactState (slot.combination));
+		else state.Add ("errorCode", static_cast<Int32> (slot.errorCode));
+		combinationSlots (state);
+	}
+	return facts;
+}
+
+NativeDimensionLayerInventory ReadNativeDimensionLayerInventory (const std::chrono::steady_clock::time_point& started, GS::ProcessControl& processControl)
+{
+	NativeDimensionLayerInventory inventory;
+	if (NativeDimensionLayerControlExpired (started, processControl)) {
+		inventory.error = "cooperative-deadline-before-inventory";
+		inventory.facts = GS::ObjectState ("status", "refused", "reason", inventory.error);
+		return inventory;
+	}
+	UInt64 layerCount = 0, combinationCount = 0;
+	GSErrCode layerCountError = NoError, combinationCountError = NoError;
+	if (!NativeDimensionLayerControlAttributeCount (API_LayerID, layerCount, layerCountError)
+		|| !NativeDimensionLayerControlAttributeCount (API_LayerCombID, combinationCount, combinationCountError)) {
+		inventory.error = "attribute-count-read-failed";
+		inventory.facts = GS::ObjectState ("status", "unavailable", "layerCountErrorCode", static_cast<Int32> (layerCountError), "combinationCountErrorCode", static_cast<Int32> (combinationCountError));
+		return inventory;
+	}
+	if (!NativeDimensionLayerControlPolicy::IsValidReadCount (layerCount, NativeDimensionLayerControlPolicy::MaxLayers)
+		|| !NativeDimensionLayerControlPolicy::IsValidReadCount (combinationCount, NativeDimensionLayerControlPolicy::MaxCombinations)) {
+		inventory.error = "attribute-count-limit-exceeded-no-prefix";
+		inventory.facts = GS::ObjectState ("status", "refused", "layerCount", static_cast<Int64> (layerCount), "combinationCount", static_cast<Int64> (combinationCount));
+		return inventory;
+	}
+	inventory.layerReportedCount = layerCount;
+	inventory.combinationReportedCount = combinationCount;
+#if TAPIR_AC_VERSION == 25
+	inventory.countSemantics = "highest-index-slot-bound";
+	inventory.layerMaximumIndex = layerCount;
+	inventory.combinationMaximumIndex = combinationCount;
+#else
+	inventory.countSemantics = "actual-live-count";
+#endif
+	std::map<Int32, GS::UniString> guidByLayerIndex;
+	std::map<Int32, NativeDimensionLayerControlPolicy::SlotState> layerStateByIndex;
+	std::set<std::string> layerGuids;
+#if TAPIR_AC_VERSION == 25
+	for (UInt64 rawIndex = 1; rawIndex <= layerCount; ++rawIndex) {
+		if (NativeDimensionLayerControlExpired (started, processControl)) {
+			inventory.error = "cooperative-deadline-during-layer-inventory-no-prefix-success";
+			inventory.facts = GS::ObjectState ("status", "partial", "stage", "layer-enumeration", "observedCount", static_cast<Int64> (inventory.layers.size ()), "expectedCount", static_cast<Int64> (layerCount));
+			return inventory;
+		}
+		API_Attribute attribute = {};
+		GS::UniString name;
+		attribute.header.typeID = API_LayerID;
+		attribute.header.index = ACAPI_CreateAttributeIndex (static_cast<Int32> (rawIndex));
+		attribute.header.uniStringNamePtr = &name;
+		const GSErrCode getError = ACAPI_Attribute_Get (&attribute);
+		const GS::OnExit attributeGuard ([&attribute] () { DisposeAttribute (attribute); });
+		const Int32 index = GetAttributeIndex (attribute.header.index);
+		if (getError == APIERR_DELETED) {
+			NativeDimensionLayerSlotFact slot;
+			slot.index = static_cast<Int32> (rawIndex);
+			slot.state = NativeDimensionLayerControlPolicy::SlotState::Tombstone;
+			slot.errorCode = getError;
+			inventory.layerSlots.push_back (slot);
+			layerStateByIndex.emplace (slot.index, slot.state);
+			continue;
+		}
+		const GS::UniString guid = APIGuidToString (attribute.header.guid);
+		if (getError != NoError || attribute.header.typeID != API_LayerID || index != static_cast<Int32> (rawIndex)
+			|| attribute.header.guid == APINULLGuid || name.IsEmpty () || !layerGuids.insert (NativeDimensionAuditPathKey (guid)).second) {
+			inventory.error = "layer-enumeration-incomplete-or-duplicate";
+			inventory.facts = GS::ObjectState ("status", "partial", "stage", "layer-enumeration", "errorCode", static_cast<Int32> (getError), "index", static_cast<Int32> (rawIndex));
+			return inventory;
+		}
+		NativeDimensionLayerFact fact;
+		fact.guid = guid;
+		fact.index = index;
+		fact.flags = attribute.header.flags;
+		fact.name = name;
+		fact.connectionClass = attribute.layer.conClassId;
+		fact.modificationTime = attribute.header.modiTime;
+		NativeDimensionLayerSlotFact slot;
+		slot.index = index;
+		slot.layer = fact;
+		inventory.layerSlots.push_back (slot);
+		layerStateByIndex.emplace (index, NativeDimensionLayerControlPolicy::SlotState::Live);
+		guidByLayerIndex.emplace (index, guid);
+		inventory.layers.push_back (fact);
+	}
+#else
+	GS::Array<API_Attribute> enumeratedLayers;
+	const GSErrCode layerEnumerationError = ACAPI_Attribute_GetAttributesByType (API_LayerID, enumeratedLayers);
+	const GS::OnExit enumeratedLayerGuard ([&enumeratedLayers] () { for (API_Attribute& item : enumeratedLayers) DisposeAttribute (item); });
+	if (layerEnumerationError != NoError || static_cast<UInt64> (enumeratedLayers.GetSize ()) != layerCount) {
+		inventory.error = "layer-by-type-count-disagreement";
+		inventory.facts = GS::ObjectState ("status", "partial", "stage", "layer-by-type-enumeration",
+			"errorCode", static_cast<Int32> (layerEnumerationError), "reportedCount", static_cast<Int64> (layerCount),
+			"returnedCount", enumeratedLayers.GetSize ());
+		return inventory;
+	}
+	std::vector<std::pair<Int32, API_Guid>> layerIdentities;
+	std::set<Int32> enumeratedLayerIndices;
+	for (const API_Attribute& item : enumeratedLayers) {
+		const Int32 index = GetAttributeIndex (item.header.index);
+		if (item.header.typeID != API_LayerID || index < 1 || item.header.guid == APINULLGuid
+			|| !enumeratedLayerIndices.insert (index).second || !layerGuids.insert (NativeDimensionAuditPathKey (APIGuidToString (item.header.guid))).second) {
+			inventory.error = "layer-by-type-identity-duplicate-or-invalid";
+			inventory.facts = GS::ObjectState ("status", "partial", "stage", "layer-by-type-enumeration", "index", index);
+			return inventory;
+		}
+		layerIdentities.emplace_back (index, item.header.guid);
+	}
+	std::sort (layerIdentities.begin (), layerIdentities.end (), [] (const auto& left, const auto& right) { return left.first < right.first; });
+	for (const auto& identity : layerIdentities) {
+		const Int32 index = identity.first;
+		const API_Guid expectedGuid = identity.second;
+		if (NativeDimensionLayerControlExpired (started, processControl)) {
+			inventory.error = "cooperative-deadline-during-layer-details-no-prefix-success";
+			inventory.facts = GS::ObjectState ("status", "partial", "stage", "layer-details", "observedCount", static_cast<Int64> (inventory.layers.size ()), "expectedCount", static_cast<Int64> (layerCount));
+			return inventory;
+		}
+		API_Attribute attribute = {};
+		GS::UniString name;
+		attribute.header.typeID = API_LayerID;
+		attribute.header.index = ACAPI_CreateAttributeIndex (index);
+		attribute.header.uniStringNamePtr = &name;
+		const GSErrCode getError = ACAPI_Attribute_Get (&attribute);
+		const GS::OnExit attributeGuard ([&attribute] () { DisposeAttribute (attribute); });
+		if (getError != NoError || attribute.header.typeID != API_LayerID || GetAttributeIndex (attribute.header.index) != index
+			|| attribute.header.guid != expectedGuid || name.IsEmpty ()) {
+			inventory.error = "layer-by-type-detail-identity-drift";
+			inventory.facts = GS::ObjectState ("status", "partial", "stage", "layer-details", "errorCode", static_cast<Int32> (getError), "index", index);
+			return inventory;
+		}
+		NativeDimensionLayerFact fact;
+		fact.guid = APIGuidToString (attribute.header.guid); fact.index = index; fact.flags = attribute.header.flags;
+		fact.name = name; fact.connectionClass = attribute.layer.conClassId; fact.modificationTime = attribute.header.modiTime;
+		NativeDimensionLayerSlotFact slot; slot.index = index; slot.layer = fact;
+		inventory.layerSlots.push_back (slot); layerStateByIndex.emplace (index, NativeDimensionLayerControlPolicy::SlotState::Live);
+		guidByLayerIndex.emplace (index, fact.guid); inventory.layers.push_back (fact);
+		inventory.layerMaximumIndex = std::max (inventory.layerMaximumIndex, static_cast<UInt64> (index));
+	}
+#endif
+	UInt64 totalEntries = 0;
+	std::set<std::string> combinationGuids;
+	std::vector<std::pair<Int32, API_Guid>> combinationIdentities;
+#if TAPIR_AC_VERSION == 25
+	for (UInt64 rawIndex = 1; rawIndex <= combinationCount; ++rawIndex) {
+		if (NativeDimensionLayerControlExpired (started, processControl)) {
+			inventory.error = "cooperative-deadline-during-combination-inventory-no-prefix-success";
+			inventory.facts = GS::ObjectState ("status", "partial", "stage", "combination-enumeration", "observedCount", static_cast<Int64> (inventory.combinations.size ()), "expectedCount", static_cast<Int64> (combinationCount));
+			return inventory;
+		}
+		API_Attribute attribute = {};
+		attribute.header.typeID = API_LayerCombID;
+		attribute.header.index = ACAPI_CreateAttributeIndex (static_cast<Int32> (rawIndex));
+		const GSErrCode getError = ACAPI_Attribute_Get (&attribute);
+		const Int32 index = GetAttributeIndex (attribute.header.index);
+		if (getError == APIERR_DELETED) {
+			NativeDimensionLayerCombinationSlotFact slot; slot.index = static_cast<Int32> (rawIndex);
+			slot.state = NativeDimensionLayerControlPolicy::SlotState::Tombstone; slot.errorCode = getError;
+			inventory.combinationSlots.push_back (slot);
+			continue;
+		}
+		if (getError != NoError || attribute.header.typeID != API_LayerCombID || index != static_cast<Int32> (rawIndex)
+			|| attribute.header.guid == APINULLGuid
+			|| !combinationGuids.insert (NativeDimensionAuditPathKey (APIGuidToString (attribute.header.guid))).second) {
+			inventory.error = "combination-enumeration-incomplete-or-duplicate";
+			inventory.facts = GS::ObjectState ("status", "partial", "stage", "combination-header", "errorCode", static_cast<Int32> (getError), "index", static_cast<Int32> (rawIndex));
+			return inventory;
+		}
+		combinationIdentities.emplace_back (index, attribute.header.guid);
+	}
+#else
+	GS::Array<API_Attribute> enumeratedCombinations;
+	const GSErrCode combinationEnumerationError = ACAPI_Attribute_GetAttributesByType (API_LayerCombID, enumeratedCombinations);
+	const GS::OnExit enumeratedCombinationGuard ([&enumeratedCombinations] () { for (API_Attribute& item : enumeratedCombinations) DisposeAttribute (item); });
+	if (combinationEnumerationError != NoError || static_cast<UInt64> (enumeratedCombinations.GetSize ()) != combinationCount) {
+		inventory.error = "combination-by-type-count-disagreement";
+		inventory.facts = GS::ObjectState ("status", "partial", "stage", "combination-by-type-enumeration",
+			"errorCode", static_cast<Int32> (combinationEnumerationError), "reportedCount", static_cast<Int64> (combinationCount),
+			"returnedCount", enumeratedCombinations.GetSize ());
+		return inventory;
+	}
+	std::set<Int32> enumeratedCombinationIndices;
+	for (const API_Attribute& item : enumeratedCombinations) {
+		const Int32 index = GetAttributeIndex (item.header.index);
+		if (item.header.typeID != API_LayerCombID || index < 1 || item.header.guid == APINULLGuid
+			|| !enumeratedCombinationIndices.insert (index).second
+			|| !combinationGuids.insert (NativeDimensionAuditPathKey (APIGuidToString (item.header.guid))).second) {
+			inventory.error = "combination-by-type-identity-duplicate-or-invalid";
+			inventory.facts = GS::ObjectState ("status", "partial", "stage", "combination-by-type-enumeration", "index", index);
+			return inventory;
+		}
+		combinationIdentities.emplace_back (index, item.header.guid);
+	}
+	std::sort (combinationIdentities.begin (), combinationIdentities.end (), [] (const auto& left, const auto& right) { return left.first < right.first; });
+#endif
+	for (const auto& identity : combinationIdentities) {
+		const Int32 requestedIndex = identity.first;
+	const API_Guid expectedGuid = identity.second;
+		if (NativeDimensionLayerControlExpired (started, processControl)) {
+			inventory.error = "cooperative-deadline-during-combination-inventory-no-prefix-success";
+			inventory.facts = GS::ObjectState ("status", "partial", "stage", "combination-enumeration", "observedCount", static_cast<Int64> (inventory.combinations.size ()), "expectedCount", static_cast<Int64> (combinationCount));
+			return inventory;
+		}
+		API_Attribute attribute = {};
+		GS::UniString name;
+		attribute.header.typeID = API_LayerCombID;
+		attribute.header.index = ACAPI_CreateAttributeIndex (requestedIndex);
+		attribute.header.uniStringNamePtr = &name;
+		const GSErrCode getError = ACAPI_Attribute_Get (&attribute);
+		const GS::OnExit attributeGuard ([&attribute] () { DisposeAttribute (attribute); });
+		const Int32 index = GetAttributeIndex (attribute.header.index);
+		if (getError != NoError || attribute.header.typeID != API_LayerCombID || index != requestedIndex
+			|| attribute.header.guid != expectedGuid || name.IsEmpty ()) {
+			inventory.error = "combination-detail-identity-drift";
+			inventory.facts = GS::ObjectState ("status", "partial", "stage", "combination-details", "errorCode", static_cast<Int32> (getError), "index", requestedIndex);
+			return inventory;
+		}
+		API_AttributeDef definition = {};
+		const GS::OnExit definitionGuard ([&definition] () { ACAPI_DisposeAttrDefsHdls (&definition); });
+		const GSErrCode definitionError = ACAPI_Attribute_GetDef (API_LayerCombID, attribute.header.index, &definition);
+		if (definitionError != NoError || attribute.layerComb.lNumb < 0
+			|| !NativeDimensionLayerControlPolicy::IsValidEntryCount (static_cast<UInt64> (attribute.layerComb.lNumb), NativeDimensionLayerControlPolicy::MaxLayers)) {
+			inventory.error = "combination-entry-count-or-definition-unavailable";
+			inventory.facts = GS::ObjectState ("status", "partial", "stage", "combination-definition", "errorCode", static_cast<Int32> (definitionError), "index", index, "declaredLayerCount", attribute.layerComb.lNumb, "maximumEntryCount", static_cast<Int64> (NativeDimensionLayerControlPolicy::MaxLayers));
+			return inventory;
+		}
+		NativeDimensionLayerCombinationFact fact;
+		fact.guid = APIGuidToString (attribute.header.guid);
+		fact.index = index;
+		fact.flags = attribute.header.flags;
+		fact.name = name;
+		fact.modificationTime = attribute.header.modiTime;
+		fact.declaredLayerCount = attribute.layerComb.lNumb;
+		fact.inEffect = attribute.layerComb.inEffect;
+		std::set<Int32> seenEntryIndices;
+		bool unresolvedReference = false;
+		auto appendEntry = [&] (const Int32 entryIndex, const Int32 rawFlags, const Int32 connectionClass) {
+			if (!seenEntryIndices.insert (entryIndex).second) return false;
+			NativeDimensionLayerEntryFact entry;
+			entry.layerIndex = entryIndex; entry.rawFlags = rawFlags; entry.connectionClass = connectionClass;
+			const auto live = guidByLayerIndex.find (entryIndex);
+			if (live != guidByLayerIndex.end ()) {
+				entry.layerGuid = live->second; entry.resolution = "live-guid";
+			} else {
+#if TAPIR_AC_VERSION == 25
+				const auto slot = layerStateByIndex.find (entryIndex);
+				if (slot != layerStateByIndex.end () && slot->second == NativeDimensionLayerControlPolicy::SlotState::Tombstone) {
+					entry.resolution = "tombstone"; entry.lookupError = APIERR_DELETED;
+				} else {
+					API_Attribute lookup = {};
+					lookup.header.typeID = API_LayerID; lookup.header.index = ACAPI_CreateAttributeIndex (entryIndex);
+					entry.lookupError = ACAPI_Attribute_Get (&lookup);
+					const GS::OnExit lookupGuard ([&lookup] () { DisposeAttribute (lookup); });
+					entry.resolution = "unresolved-reference"; unresolvedReference = true;
+				}
+#else
+				API_Attribute lookup = {};
+				lookup.header.typeID = API_LayerID; lookup.header.index = ACAPI_CreateAttributeIndex (entryIndex);
+				entry.lookupError = ACAPI_Attribute_Get (&lookup);
+				const GS::OnExit lookupGuard ([&lookup] () { DisposeAttribute (lookup); });
+				if (entry.lookupError == APIERR_BADINDEX || entry.lookupError == APIERR_DELETED) entry.resolution = "absent-from-live-enumeration";
+				else { entry.resolution = "unresolved-reference"; unresolvedReference = true; }
+#endif
+			}
+			fact.entries.push_back (entry);
+			return true;
+		};
+#ifdef ServerMainVers_2800
+		if (definition.layer_statItems == nullptr && fact.declaredLayerCount != 0) {
+			inventory.error = "combination-layer-map-absent";
+			inventory.facts = GS::ObjectState ("status", "partial", "stage", "combination-definition", "index", index);
+			return inventory;
+		}
+		if (definition.layer_statItems != nullptr) {
+			for (auto iterator = definition.layer_statItems->BeginPairs (); iterator != nullptr; ++iterator) {
+				if (NativeDimensionLayerControlExpired (started, processControl)) {
+					inventory.error = "cooperative-deadline-during-entry-inventory-no-prefix-success";
+					inventory.facts = GS::ObjectState ("status", "partial", "stage", "combination-entry", "index", index);
+					return inventory;
+				}
+				const Int32 entryIndex = GetAttributeIndex (iterator->key);
+				if (entryIndex < 1 || !appendEntry (entryIndex, iterator->value.lFlags, iterator->value.conClassId)) {
+					inventory.error = "combination-entry-index-unmapped-or-duplicate";
+					inventory.facts = GS::ObjectState ("status", "partial", "stage", "combination-entry", "index", index, "entryIndex", entryIndex);
+					return inventory;
+				}
+			}
+		}
+#else
+		if (fact.declaredLayerCount > 0 && (definition.layer_statItems == nullptr || *definition.layer_statItems == nullptr)) {
+			inventory.error = "combination-layer-array-absent";
+			inventory.facts = GS::ObjectState ("status", "partial", "stage", "combination-definition", "index", index);
+			return inventory;
+		}
+		// layer_statItems is the SDK-owned handle (API_LayerStat**), not the
+		// dereferenced payload.  Measure the handle before indexing its entries.
+		if (fact.declaredLayerCount > 0 && !NativeDimensionLayerControlPolicy::HasStorageForEntries (
+			static_cast<UInt64> (BMGetHandleSize (reinterpret_cast<GSHandle> (definition.layer_statItems))),
+			static_cast<UInt64> (fact.declaredLayerCount), sizeof (API_LayerStat))) {
+			inventory.error = "combination-layer-array-shorter-than-declared-count";
+			inventory.facts = GS::ObjectState ("status", "partial", "stage", "combination-definition", "index", index,
+				"declaredLayerCount", fact.declaredLayerCount,
+				"minimumBytes", static_cast<Int64> (fact.declaredLayerCount) * static_cast<Int64> (sizeof (API_LayerStat)));
+			return inventory;
+		}
+		for (Int32 entry = 0; entry < fact.declaredLayerCount; ++entry) {
+			if (NativeDimensionLayerControlExpired (started, processControl)) {
+				inventory.error = "cooperative-deadline-during-entry-inventory-no-prefix-success";
+				inventory.facts = GS::ObjectState ("status", "partial", "stage", "combination-entry", "index", index);
+				return inventory;
+			}
+			const API_LayerStat& layerStat = (*definition.layer_statItems)[entry];
+			const Int32 entryIndex = GetAttributeIndex (layerStat.lInd);
+			if (entryIndex < 1 || !appendEntry (entryIndex, layerStat.lFlags, layerStat.conClassId)) {
+				inventory.error = "combination-entry-index-unmapped-or-duplicate";
+				inventory.facts = GS::ObjectState ("status", "partial", "stage", "combination-entry", "index", index, "entryIndex", entryIndex);
+				return inventory;
+			}
+		}
+#endif
+		if (unresolvedReference || fact.entries.size () != static_cast<std::size_t> (fact.declaredLayerCount)
+			|| !NativeDimensionLayerControlPolicy::IsValidEntryCount (fact.entries.size (), NativeDimensionLayerControlPolicy::MaxLayers)) {
+			inventory.error = "combination-entry-enumeration-incomplete";
+			inventory.combinations.push_back (fact);
+			NativeDimensionLayerCombinationSlotFact observedSlot; observedSlot.index = index; observedSlot.combination = fact;
+			inventory.combinationSlots.push_back (observedSlot);
+			inventory.facts = NativeDimensionLayerInventoryState (inventory, "partial", inventory.error);
+			inventory.facts.Add ("stage", "combination-entry");
+			inventory.facts.Add ("index", index);
+			inventory.facts.Add ("observedEntryCount", static_cast<Int64> (fact.entries.size ()));
+			inventory.facts.Add ("declaredEntryCount", fact.declaredLayerCount);
+			inventory.facts.Add ("unresolvedReference", unresolvedReference);
+			return inventory;
+		}
+		std::sort (fact.entries.begin (), fact.entries.end (), [] (const auto& left, const auto& right) { return left.layerIndex < right.layerIndex; });
+		totalEntries += fact.entries.size ();
+		if (!NativeDimensionLayerControlPolicy::IsValidReadCount (totalEntries, NativeDimensionLayerControlPolicy::MaxLayerEntries)) {
+			inventory.error = "combination-entry-budget-exceeded";
+			inventory.facts = GS::ObjectState ("status", "refused", "reason", inventory.error);
+			return inventory;
+		}
+		NativeDimensionLayerCombinationSlotFact slot; slot.index = index; slot.combination = fact;
+		inventory.combinationSlots.push_back (slot);
+		inventory.combinationMaximumIndex = std::max (inventory.combinationMaximumIndex, static_cast<UInt64> (index));
+		inventory.combinations.push_back (std::move (fact));
+	}
+	API_AttributeIndex currentCombination = APIInvalidAttributeIndex;
+#if TAPIR_AC_VERSION == 25
+	const GSErrCode currentCombinationError = ACAPI_Environment (APIEnv_GetCurrLayerCombID, &currentCombination);
+#else
+	const GSErrCode currentCombinationError = ACAPI_Navigator_GetCurrLayerComb (&currentCombination);
+#endif
+	inventory.currentCombinationError = currentCombinationError;
+	inventory.currentCombinationIndex = currentCombinationError == NoError ? GetAttributeIndex (currentCombination) : -1;
+	std::sort (inventory.layerSlots.begin (), inventory.layerSlots.end (), [] (const auto& left, const auto& right) { return left.index < right.index; });
+	std::sort (inventory.combinationSlots.begin (), inventory.combinationSlots.end (), [] (const auto& left, const auto& right) { return left.index < right.index; });
+	const UInt64 layerTombstones = static_cast<UInt64> (std::count_if (inventory.layerSlots.begin (), inventory.layerSlots.end (), [] (const auto& slot) { return slot.state == NativeDimensionLayerControlPolicy::SlotState::Tombstone; }));
+	const UInt64 combinationTombstones = static_cast<UInt64> (std::count_if (inventory.combinationSlots.begin (), inventory.combinationSlots.end (), [] (const auto& slot) { return slot.state == NativeDimensionLayerControlPolicy::SlotState::Tombstone; }));
+	const bool highestIndexIsBound = TAPIR_AC_VERSION == 25;
+	if (!NativeDimensionLayerControlPolicy::IsConsistentSparseCount (highestIndexIsBound, layerCount,
+		static_cast<UInt64> (inventory.layers.size ()), layerTombstones, static_cast<UInt64> (inventory.layerSlots.size ()), inventory.layerMaximumIndex)
+		|| !NativeDimensionLayerControlPolicy::IsConsistentSparseCount (highestIndexIsBound, combinationCount,
+			static_cast<UInt64> (inventory.combinations.size ()), combinationTombstones, static_cast<UInt64> (inventory.combinationSlots.size ()), inventory.combinationMaximumIndex)) {
+		inventory.error = "sparse-inventory-count-semantics-inconsistent";
+		inventory.facts = GS::ObjectState ("status", "partial", "stage", "inventory-count-validation",
+			"layerReportedCount", static_cast<Int64> (layerCount), "layerLiveCount", static_cast<Int64> (inventory.layers.size ()),
+			"layerTombstoneCount", static_cast<Int64> (layerTombstones), "layerSlotCount", static_cast<Int64> (inventory.layerSlots.size ()),
+			"combinationReportedCount", static_cast<Int64> (combinationCount), "combinationLiveCount", static_cast<Int64> (inventory.combinations.size ()),
+			"combinationTombstoneCount", static_cast<Int64> (combinationTombstones), "combinationSlotCount", static_cast<Int64> (inventory.combinationSlots.size ()));
+		return inventory;
+	}
+	GS::ObjectState facts = NativeDimensionLayerInventoryState (inventory, "complete");
+	GS::UniString serialized;
+	if (JSON::CreateFromObjectState (facts, serialized, false) != NoError) {
+		inventory.error = "inventory-serialization-failed";
+		inventory.facts = GS::ObjectState ("status", "unavailable", "reason", inventory.error);
+		return inventory;
+	}
+	if (NativeDimensionLayerControlExpired (started, processControl)) {
+		inventory.error = "cooperative-deadline-after-inventory-serialization";
+		inventory.facts = GS::ObjectState ("status", "partial", "reason", inventory.error, "serializedFactBytes", static_cast<Int64> (FixtureUtf8 (serialized).size ()));
+		return inventory;
+	}
+	inventory.serializedBytes = FixtureUtf8 (serialized).size ();
+	if (inventory.serializedBytes > NativeDimensionLayerControlPolicy::MaxSerializedFactBytes) {
+		inventory.error = "inventory-serialized-limit-exceeded-no-successful-prefix";
+		inventory.facts = GS::ObjectState ("status", "refused", "reason", inventory.error, "serializedFactBytes", static_cast<Int64> (inventory.serializedBytes));
+		return inventory;
+	}
+	inventory.facts = facts;
+	inventory.serialized = serialized;
+	inventory.complete = true;
+	return inventory;
+}
+
+bool NativeDimensionLayerControlGuidEqual (const GS::UniString& left, const GS::UniString& right)
+{
+	return NativeDimensionAuditPathKey (left) == NativeDimensionAuditPathKey (right);
+}
+
+const char* NativeDimensionLayerControlPhaseName (const NativeDimensionLayerControlPolicy::Phase phase)
+{
+	switch (phase) {
+		case NativeDimensionLayerControlPolicy::Phase::Empty: return "empty";
+		case NativeDimensionLayerControlPolicy::Phase::Registered: return "registered";
+		case NativeDimensionLayerControlPolicy::Phase::Prepared: return "prepared";
+		case NativeDimensionLayerControlPolicy::Phase::Hidden: return "hidden";
+		case NativeDimensionLayerControlPolicy::Phase::Locked: return "locked";
+		case NativeDimensionLayerControlPolicy::Phase::Unknown: return "unknown";
+	}
+	return "unknown";
+}
+
+GS::ObjectState NativeDimensionLayerControlResponse (const char* status, const char* reason, const GS::UniString& action,
+	const GS::UniString& runRef, const GS::UniString& phase, const GS::ObjectState& facts)
+{
+	return GS::ObjectState ("schemaVersion", NativeDimensionLayerControlSchema, "status", status, "reason", reason,
+		"preparationPolicy", NativeDimensionLayerControlPreparationPolicy,
+		"action", action, "runRef", runRef, "phase", phase, "facts", facts);
+}
+
+} // namespace
+
+NativeDimensionLayerControlCommand::NativeDimensionLayerControlCommand () : CommandBase (CommonSchema::NotUsed) {}
+GS::String NativeDimensionLayerControlCommand::GetName () const { return "NativeDimensionLayerControl"; }
+GS::Optional<GS::UniString> NativeDimensionLayerControlCommand::GetInputParametersSchema () const
+{
+	return R"({"type":"object","properties":{"schemaVersion":{"type":"string","enum":["native-dimension-layer-control/v2"]},"preparationPolicy":{"type":"string","enum":["absent-owned-entry-flags-0-or-1-class-1/v2"]},"action":{"type":"string","enum":["begin","prepare","setHidden","setLocked","inspect"]},"runId":{"type":"string","minLength":1,"maxLength":32,"pattern":"^[A-Za-z0-9][A-Za-z0-9_-]*$"},"initialNonce":{"type":"string","minLength":16,"maxLength":96,"pattern":"^[A-Za-z0-9_-]+$"},"runRef":{"type":"string","minLength":1,"maxLength":96},"stageNonce":{"type":"string","minLength":1,"maxLength":96},"expectedProjectPath":{"type":"string","minLength":1,"maxLength":1024},"fileScopeKey":{"type":"string","minLength":1,"maxLength":1100},"storyIndex":{"type":"integer"}},"required":["schemaVersion","preparationPolicy","action"],"additionalProperties":false})";
+}
+GS::Optional<GS::UniString> NativeDimensionLayerControlCommand::GetResponseSchema () const { return {}; }
+GS::ObjectState NativeDimensionLayerControlCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const
+{
+	GS::UniString schemaVersion, preparationPolicy, action, runId, initialNonce, runRef, stageNonce, expectedProjectPath, fileScopeKey;
+	Int32 requestedStory = -1;
+	if (!parameters.Get ("schemaVersion", schemaVersion) || schemaVersion != NativeDimensionLayerControlSchema
+		|| !parameters.Get ("preparationPolicy", preparationPolicy) || preparationPolicy != NativeDimensionLayerControlPreparationPolicy
+		|| !parameters.Get ("action", action) || (action != "begin" && action != "prepare" && action != "setHidden" && action != "setLocked" && action != "inspect"))
+		return NativeDimensionLayerControlResponse ("refused", "invalid-closed-action", action, GS::UniString (), "empty", GS::ObjectState ());
+	if (action == "begin") {
+		if (parameters.GetFieldNames ().GetSize () != 8 || !parameters.Get ("runId", runId) || !parameters.Get ("initialNonce", initialNonce)
+			|| !parameters.Get ("expectedProjectPath", expectedProjectPath) || !parameters.Get ("fileScopeKey", fileScopeKey)
+			|| !parameters.Get ("storyIndex", requestedStory))
+			return NativeDimensionLayerControlResponse ("refused", "begin-request-shape-invalid", action, GS::UniString (), "empty", GS::ObjectState ());
+	} else {
+		const UInt32 expectedFields = action == "inspect" ? 4 : 5;
+		if (parameters.GetFieldNames ().GetSize () != expectedFields || !parameters.Get ("runRef", runRef)
+			|| (action == "inspect" ? false : !parameters.Get ("stageNonce", stageNonce)))
+			return NativeDimensionLayerControlResponse ("refused", "stage-request-shape-invalid", action, runRef, "unknown", GS::ObjectState ());
+	}
+	const auto started = std::chrono::steady_clock::now ();
+	if (action == "begin") {
+		const std::string runUtf8 = FixtureUtf8 (runId), nonceUtf8 = FixtureUtf8 (initialNonce);
+		if (runUtf8.empty () || runUtf8.size () > 32 || !std::all_of (runUtf8.begin (), runUtf8.end (), [] (unsigned char c) { return std::isalnum (c) || c == '_' || c == '-'; })
+			|| nonceUtf8.size () < 16 || nonceUtf8.size () > 96 || !std::all_of (nonceUtf8.begin (), nonceUtf8.end (), [] (unsigned char c) { return std::isalnum (c) || c == '_' || c == '-'; })
+			|| expectedProjectPath.IsEmpty () || FixtureUtf8 (expectedProjectPath).size () > 1024
+			|| fileScopeKey.IsEmpty () || FixtureUtf8 (fileScopeKey).size () > 1100
+			|| requestedStory < std::numeric_limits<short>::min () || requestedStory > std::numeric_limits<short>::max ())
+			return NativeDimensionLayerControlResponse ("refused", "begin-values-out-of-bounds", action, GS::UniString (), "empty", GS::ObjectState ());
+		if (gNativeDimensionLayerControlRun.active || gUsedNativeDimensionLayerControlNonces.count (nonceUtf8) != 0)
+			return NativeDimensionLayerControlResponse ("refused", gNativeDimensionLayerControlRun.active ? "one-run-limit" : "initial-nonce-replay", action, GS::UniString (), "empty", GS::ObjectState ());
+		if (gUsedNativeDimensionLayerControlNonces.size () >= 512)
+			return NativeDimensionLayerControlResponse ("refused", "finite-replay-ledger-full", action, GS::UniString (), "empty", GS::ObjectState ());
+		RadialDefaultsContext context;
+		ReadNativeDimensionAuditContext (context);
+		if (!IsExactTaskOwnedRadialDefaultsCopy (runId, expectedProjectPath, fileScopeKey, context)
+			|| context.window.typeID != APIWind_FloorPlanID || context.database.typeID != APIWind_FloorPlanID
+			|| context.activeStory != requestedStory || context.database.databaseUnId.elemSetId == APINULLGuid)
+			return NativeDimensionLayerControlResponse ("refused", "saved-copy-floor-plan-database-story-or-path-mismatch", action, GS::UniString (), "empty", RadialDefaultsContextDetails (context));
+		NativeDimensionLayerFocusSnapshot initialFocus = ReadNativeDimensionLayerFocus ();
+		if (!initialFocus.complete)
+			return NativeDimensionLayerControlResponse ("refused", "selection-or-marquee-focus-unavailable-before-begin", action, GS::UniString (), "empty", initialFocus.facts);
+		NativeDimensionLayerInventory inventory = ReadNativeDimensionLayerInventory (started, processControl);
+		if (!inventory.complete)
+			return NativeDimensionLayerControlResponse ("refused", "protected-layer-combination-manifest-incomplete", action, GS::UniString (), "empty", inventory.facts);
+		NativeDimensionLayerControlRun run;
+		run.active = true;
+		run.preparationPolicy = preparationPolicy;
+		run.phase = NativeDimensionLayerControlPolicy::Phase::Registered;
+		run.runId = runId;
+		run.runIdUtf8 = runUtf8;
+		run.runRef = NativeDimensionLayerControlToken ();
+		run.nextNonce = NativeDimensionLayerControlToken ();
+		run.projectPath = context.projectPath;
+		run.fileScopeKey = fileScopeKey;
+		run.databaseGuid = context.database.databaseUnId.elemSetId;
+		run.storyIndex = requestedStory;
+		run.processId = GetCurrentProcessId ();
+		run.started = started;
+		run.initialLayers = inventory.layers;
+		run.initialLayerSlots = inventory.layerSlots;
+		run.initialCombinations = inventory.combinations;
+		run.initialCombinationSlots = inventory.combinationSlots;
+		run.initialCurrentCombinationError = inventory.currentCombinationError;
+		run.initialCurrentCombinationIndex = inventory.currentCombinationIndex;
+		run.initialFocus = initialFocus.facts;
+		run.initialFocusFacts = initialFocus.serialized;
+		const std::string suffix = FixtureUtf8 (NativeDimensionLayerControlToken ());
+		const std::string asciiName = "T3I_" + suffix.substr (suffix.size () > 12 ? suffix.size () - 12 : 0);
+		run.layerName = GS::UniString (asciiName.c_str (), CC_UTF8);
+		run.initialLayerFacts = "";
+		run.initialCombinationFacts = "";
+		GS::ObjectState initialLayerFactState;
+		const auto& layerFacts = initialLayerFactState.AddList<GS::ObjectState> ("layers");
+		for (const auto& layer : inventory.layers) layerFacts (NativeDimensionLayerFactState (layer));
+		GS::ObjectState initialComboFactState;
+		const auto& comboFacts = initialComboFactState.AddList<GS::ObjectState> ("combinations");
+		for (const auto& combo : inventory.combinations) comboFacts (NativeDimensionLayerCombinationFactState (combo));
+		GS::UniString layerText, comboText;
+		if (JSON::CreateFromObjectState (initialLayerFactState, layerText, false) != NoError || JSON::CreateFromObjectState (initialComboFactState, comboText, false) != NoError)
+			return NativeDimensionLayerControlResponse ("refused", "protected-manifest-serialization-failed", action, GS::UniString (), "empty", inventory.facts);
+		run.initialLayerFacts = FixtureUtf8 (layerText);
+		run.initialCombinationFacts = FixtureUtf8 (comboText);
+		run.beginFacts = inventory.facts;
+		GS::ObjectState facts ("runId", runId, "runRef", run.runRef, "preparationPolicy", run.preparationPolicy,
+			"nextAction", "prepare", "nextStageNonce", run.nextNonce,
+			"processId", static_cast<Int32> (run.processId), "fileScopeKey", fileScopeKey,
+			"databaseGuid", APIGuidToString (run.databaseGuid), "storyIndex", requestedStory,
+			"layerNamePrefix", "T3I_", "runTokenStatus", "process-local-single-use",
+			"context", RadialDefaultsContextDetails (context), "focus", initialFocus.facts, "originalManifest", inventory.facts);
+		gUsedNativeDimensionLayerControlNonces.insert (nonceUtf8);
+		gNativeDimensionLayerControlRun = std::move (run);
+		return NativeDimensionLayerControlResponse ("registered", "read-only-begin-complete", action, gNativeDimensionLayerControlRun.runRef, "registered", facts);
+	}
+
+	NativeDimensionLayerControlRun& run = gNativeDimensionLayerControlRun;
+	if (!run.active || run.runRef != runRef || run.preparationPolicy != preparationPolicy || GetCurrentProcessId () != run.processId)
+		return NativeDimensionLayerControlResponse ("refused", "unknown-run-or-process-restart", action, runRef, "unknown", GS::ObjectState ());
+	if (action == "inspect") {
+		RadialDefaultsContext context;
+		ReadNativeDimensionAuditContext (context);
+		NativeDimensionLayerInventory inventory = ReadNativeDimensionLayerInventory (started, processControl);
+		NativeDimensionLayerFocusSnapshot focus = ReadNativeDimensionLayerFocus ();
+		GS::ObjectState facts ("context", RadialDefaultsContextDetails (context), "focus", focus.facts, "inventory", inventory.facts,
+			"ownedLayerGuid", run.layerGuid == APINULLGuid ? GS::UniString () : APIGuidToString (run.layerGuid),
+			"ownedParentGuid", run.parentGuid == APINULLGuid ? GS::UniString () : APIGuidToString (run.parentGuid),
+			"prepareFacts", run.prepareFacts,
+			"phase", NativeDimensionLayerControlPhaseName (run.phase), "permission", "read-only-inspect-never-restores-write-permission");
+		return NativeDimensionLayerControlResponse ("observed", inventory.complete ? "inspection-read-only" : "inspection-incomplete", action, run.runRef, "inspection", facts);
+	}
+	if (run.phase == NativeDimensionLayerControlPolicy::Phase::Unknown || run.nextNonce != stageNonce)
+		return NativeDimensionLayerControlResponse ("refused", "wrong-replayed-or-terminal-stage-token", action, run.runRef, "unknown", GS::ObjectState ("tokenConsumed", true));
+	const NativeDimensionLayerControlPolicy::Action requestedStage = action == "prepare" ? NativeDimensionLayerControlPolicy::Action::Prepare
+		: action == "setHidden" ? NativeDimensionLayerControlPolicy::Action::SetHidden : NativeDimensionLayerControlPolicy::Action::SetLocked;
+	const bool expectedAction = NativeDimensionLayerControlPolicy::NextPhase (run.phase, requestedStage) != NativeDimensionLayerControlPolicy::Phase::Unknown;
+	if (!expectedAction)
+		return NativeDimensionLayerControlResponse ("refused", "out-of-order-stage", action, run.runRef, "registered", GS::ObjectState ("tokenConsumed", false));
+	RadialDefaultsContext beforeContext;
+	ReadNativeDimensionAuditContext (beforeContext);
+	if (!IsExactTaskOwnedRadialDefaultsCopy (run.runId, run.projectPath, run.fileScopeKey, beforeContext)
+		|| beforeContext.window.typeID != APIWind_FloorPlanID || beforeContext.database.typeID != APIWind_FloorPlanID
+		|| beforeContext.database.databaseUnId.elemSetId != run.databaseGuid || beforeContext.activeStory != run.storyIndex
+		|| NativeDimensionLayerControlExpired (started, processControl))
+		return NativeDimensionLayerControlResponse ("refused", "fresh-scope-or-deadline-guard-failed-before-write", action, run.runRef, "unchanged", RadialDefaultsContextDetails (beforeContext));
+	NativeDimensionLayerInventory beforeInventory = ReadNativeDimensionLayerInventory (started, processControl);
+	if (!beforeInventory.complete)
+		return NativeDimensionLayerControlResponse ("refused", "fresh-layer-combination-inventory-incomplete-before-write", action, run.runRef, "unchanged", beforeInventory.facts);
+	if ((action == "prepare" && !NativeDimensionLayerInventoryMatchesInitial (run, beforeInventory))
+		|| (action != "prepare" && !NativeDimensionLayerStageFactsUnchanged (run, beforeInventory,
+			run.phase == NativeDimensionLayerControlPolicy::Phase::Hidden,
+			run.phase == NativeDimensionLayerControlPolicy::Phase::Locked)))
+		return NativeDimensionLayerControlResponse ("refused", "protected-layer-or-combination-facts-changed-before-write", action, run.runRef, "unchanged", beforeInventory.facts);
+	GS::ObjectState parentBeforeRaw;
+	if (action != "prepare") {
+		parentBeforeRaw = ReadNativeDimensionFixtureRow (run.parentGuid, processControl);
+		GS::ObjectState parentBeforeRow;
+		GS::UniString parentBeforeText;
+		UInt64 parentBeforeBytes = 0;
+		if (!ExtractExactNativeDimensionFixtureRow (parentBeforeRaw, run.parentGuid, parentBeforeRow)
+			|| !NativeDimensionAuditFactsText (parentBeforeRow, parentBeforeText, parentBeforeBytes)
+			|| FixtureUtf8 (parentBeforeText) != run.preparedParentFacts)
+			return NativeDimensionLayerControlResponse ("refused", "parent-facts-or-revision-changed-before-write", action, run.runRef, "unchanged", parentBeforeRaw);
+	}
+	if ((action == "setHidden" || action == "setLocked") && (run.layerGuid == APINULLGuid || run.parentGuid == APINULLGuid))
+		return NativeDimensionLayerControlResponse ("refused", "owned-layer-or-parent-identity-unavailable", action, run.runRef, "unchanged", GS::ObjectState ());
+	if (action == "setHidden" || action == "setLocked") {
+		const bool expectedVisible = run.phase != NativeDimensionLayerControlPolicy::Phase::Hidden;
+		const bool expectedEditable = run.phase == NativeDimensionLayerControlPolicy::Phase::Prepared;
+		const bool onActualFloor = ACAPI_Element_Filter (run.parentGuid, APIFilt_OnActFloor);
+		const bool onVisibleLayer = ACAPI_Element_Filter (run.parentGuid, APIFilt_OnVisLayer);
+		const bool isEditable = ACAPI_Element_Filter (run.parentGuid, APIFilt_IsEditable);
+		if (!onActualFloor || onVisibleLayer != expectedVisible || isEditable != expectedEditable)
+			return NativeDimensionLayerControlResponse ("refused", "parent-current-filter-facts-changed-before-write", action, run.runRef, "unchanged",
+				GS::ObjectState ("onActualFloor", onActualFloor, "onVisibleLayer", onVisibleLayer, "isEditable", isEditable,
+					"expectedOnVisibleLayer", expectedVisible, "expectedIsEditable", expectedEditable));
+	}
+	NativeDimensionLayerFocusSnapshot focusBeforeWrite = ReadNativeDimensionLayerFocus ();
+	if (!focusBeforeWrite.complete || focusBeforeWrite.serialized != run.initialFocusFacts)
+		return NativeDimensionLayerControlResponse ("refused", "selection-or-marquee-focus-changed-before-write", action, run.runRef, "unchanged", GS::ObjectState ("focus", focusBeforeWrite.facts, "expectedFocus", run.initialFocus));
+
+	// Stage nonce is consumed immediately before the first SDK write. A timeout
+	// or error after this point can never issue a retry token.
+	const GS::UniString consumedToken = run.nextNonce;
+	GS::ObjectState stageFacts;
+	if (action == "prepare") {
+		for (const auto& layer : beforeInventory.layers) {
+			if (NativeDimensionAuditPathKey (layer.name) == NativeDimensionAuditPathKey (run.layerName))
+				return NativeDimensionLayerControlResponse ("refused", "fixed-layer-name-collision-before-write", action, run.runRef, "registered", NativeDimensionLayerFactState (layer));
+		}
+		PreparedLinearStaticFixtureDefaults defaults;
+		GS::ObjectState defaultsFacts;
+		if (!ReadLinearStaticFixtureDefaultFacts (defaultsFacts, defaults) || defaults.linear.dimension.defNote.contentUStr != nullptr
+			|| defaults.memo.dimElems != nullptr || defaults.linear.dimension.nDimElem != 0)
+			return NativeDimensionLayerControlResponse ("refused", "linear-default-or-memo-ownership-not-proven-before-first-write", action, run.runRef, "registered", defaultsFacts);
+		if (NativeDimensionLayerControlExpired (started, processControl))
+			return NativeDimensionLayerControlResponse ("refused", "cooperative-stop-before-first-write", action, run.runRef, "registered", defaultsFacts);
+		NativeDimensionLayerFocusSnapshot focusAtFirstWrite = ReadNativeDimensionLayerFocus ();
+		if (!focusAtFirstWrite.complete || focusAtFirstWrite.serialized != run.initialFocusFacts || NativeDimensionLayerControlExpired (started, processControl))
+			return NativeDimensionLayerControlResponse ("refused", "selection-or-marquee-focus-changed-before-layer-create", action, run.runRef, "registered", GS::ObjectState ("focus", focusAtFirstWrite.facts, "expectedFocus", run.initialFocus));
+		run.nextNonce.Clear ();
+		run.phase = NativeDimensionLayerControlPolicy::Phase::Unknown;
+		API_Attribute newLayer = {};
+		newLayer.header.typeID = API_LayerID;
+		newLayer.header.uniStringNamePtr = &run.layerName;
+		const GSErrCode layerCreateError = ACAPI_Attribute_Create (&newLayer, nullptr);
+		stageFacts.Add ("layerCreate", GS::ObjectState ("status", layerCreateError == NoError ? "returned" : "error", "errorCode", static_cast<Int32> (layerCreateError), "guid", APIGuidToString (newLayer.header.guid), "index", GetAttributeIndex (newLayer.header.index), "name", run.layerName, "undoable", false));
+		if (layerCreateError != NoError || newLayer.header.guid == APINULLGuid) {
+			run.phase = NativeDimensionLayerControlPolicy::Phase::Unknown;
+			run.prepareFacts = stageFacts;
+			return NativeDimensionLayerControlResponse ("unknown", "nonundoable-layer-create-outcome-not-qualified", action, run.runRef, "unknown", stageFacts);
+		}
+		run.layerGuid = newLayer.header.guid;
+		run.layerIndex = newLayer.header.index;
+		// Exact owned identity is retained in process state before any following SDK write.
+		API_Attribute verifyLayer = {};
+		GS::UniString verifiedName;
+		verifyLayer.header.typeID = API_LayerID;
+		verifyLayer.header.guid = run.layerGuid;
+		verifyLayer.header.uniStringNamePtr = &verifiedName;
+		const GSErrCode verifyLayerError = ACAPI_Attribute_Get (&verifyLayer);
+		const bool layerIdentityExact = verifyLayerError == NoError && verifyLayer.header.guid == run.layerGuid
+			&& GetAttributeIndex (verifyLayer.header.index) == GetAttributeIndex (run.layerIndex)
+			&& verifiedName == run.layerName
+			&& NativeDimensionLayerControlPolicy::IsExactNewOwnedLayerState (verifyLayer.header.flags, verifyLayer.layer.conClassId);
+		stageFacts.Add ("layerReadback", GS::ObjectState ("status", layerIdentityExact ? "exact-flags0-class0-owned-layer" : "identity-or-default-state-unavailable", "errorCode", static_cast<Int32> (verifyLayerError), "guid", APIGuidToString (verifyLayer.header.guid), "index", GetAttributeIndex (verifyLayer.header.index), "flags", verifyLayer.header.flags, "connectionClass", verifyLayer.layer.conClassId, "name", verifiedName));
+		if (!layerIdentityExact || NativeDimensionLayerControlExpired (started, processControl)) {
+			run.prepareFacts = stageFacts;
+			return NativeDimensionLayerControlResponse ("unknown", "created-layer-identity-or-default-state-unverified", action, run.runRef, "unknown", stageFacts);
+		}
+		// Attribute_Create is non-undoable.  Before the separate parent write,
+		// retain and inspect a fresh complete inventory and independently prove
+		// the exact one-layer/one-entry-per-combination delta.
+		NativeDimensionLayerInventory afterLayerCreate = ReadNativeDimensionLayerInventory (started, processControl);
+		RadialDefaultsContext afterLayerContext;
+		ReadNativeDimensionAuditContext (afterLayerContext);
+		NativeDimensionLayerFocusSnapshot afterLayerFocus = ReadNativeDimensionLayerFocus ();
+		const bool layerCreateContextStable = IsExactTaskOwnedRadialDefaultsCopy (run.runId, run.projectPath, run.fileScopeKey, afterLayerContext)
+			&& afterLayerContext.window.typeID == APIWind_FloorPlanID && afterLayerContext.database.typeID == APIWind_FloorPlanID
+			&& afterLayerContext.database.databaseUnId.elemSetId == run.databaseGuid && afterLayerContext.activeStory == run.storyIndex
+			&& beforeContext.database.databaseUnId.elemSetId == afterLayerContext.database.databaseUnId.elemSetId
+			&& beforeContext.activeStory == afterLayerContext.activeStory;
+		stageFacts.Add ("postLayerCreateInventory", afterLayerCreate.facts);
+		stageFacts.Add ("contextAfterLayerCreate", RadialDefaultsContextDetails (afterLayerContext));
+		stageFacts.Add ("focusAfterLayerCreate", afterLayerFocus.facts);
+		stageFacts.Add ("layerCreateContextStable", layerCreateContextStable);
+		const bool layerPreparationExact = afterLayerCreate.complete
+			&& NativeDimensionLayerPreparationDeltaExact (beforeInventory, afterLayerCreate, run.layerGuid)
+			&& layerCreateContextStable && afterLayerFocus.complete && afterLayerFocus.serialized == run.initialFocusFacts
+			&& !NativeDimensionLayerControlExpired (started, processControl);
+		stageFacts.Add ("layerPreparationDeltaExactBeforeParentWrite", layerPreparationExact);
+		run.prepareFacts = stageFacts;
+		if (!layerPreparationExact)
+			return NativeDimensionLayerControlResponse ("unknown", "nonundoable-layer-delta-or-context-unproven-parent-write-stopped", action, run.runRef, "unknown", stageFacts);
+		defaults.linear.header.floorInd = static_cast<short> (run.storyIndex);
+		defaults.linear.header.layer = run.layerIndex;
+		defaults.linear.dimension.dimAppear = APIApp_Normal;
+		defaults.linear.dimension.textPos = APIPos_Above;
+		defaults.linear.dimension.textWay = APIDir_Horizontal;
+		defaults.linear.dimension.defStaticDim = true;
+		defaults.linear.dimension.usedIn3D = false;
+		defaults.linear.dimension.horizontalText = false;
+		defaults.linear.dimension.pushNeighborEnabled = false;
+		defaults.linear.dimension.refC = { 20.0, 20.0 };
+		defaults.linear.dimension.direction = { 1.0, 0.0 };
+		defaults.linear.dimension.defNote.contentType = API_NoteContent_Measured;
+		defaults.linear.dimension.defNote.contentUStr = nullptr;
+		std::fill (defaults.linear.dimension.defNote.content, defaults.linear.dimension.defNote.content + sizeof (defaults.linear.dimension.defNote.content), '\0');
+		defaults.linear.dimension.defNote.fixPos = false;
+		defaults.linear.dimension.defNote.useLeaderLine = false;
+		API_DimElem** memoElems = reinterpret_cast<API_DimElem**> (BMhAllClear (2 * sizeof (API_DimElem)));
+		if (memoElems == nullptr || *memoElems == nullptr) {
+			if (memoElems != nullptr) BMKillHandle (reinterpret_cast<GSHandle*> (&memoElems));
+			run.prepareFacts = stageFacts;
+			return NativeDimensionLayerControlResponse ("unknown", "parent-memo-allocation-failed-after-layer-create", action, run.runRef, "unknown", stageFacts);
+		}
+		defaults.memo.dimElems = memoElems;
+		defaults.linear.dimension.nDimElem = 2;
+		for (Int32 index = 0; index < 2; ++index) {
+			API_DimElem& point = (*defaults.memo.dimElems)[index];
+			point.base.loc = { 20.0 + 4.0 * index, 15.0 };
+			point.pos = { 20.0 + 4.0 * index, 20.0 };
+			point.note = defaults.linear.dimension.defNote;
+			point.note.contentType = API_NoteContent_Measured;
+			point.note.contentUStr = nullptr;
+			std::fill (point.note.content, point.note.content + sizeof (point.note.content), '\0');
+			point.note.fixPos = false;
+			point.note.useLeaderLine = false;
+			point.witnessVal = defaults.linear.dimension.defWitnessVal;
+			point.witnessForm = defaults.linear.dimension.defWitnessForm;
+			point.fixedPos = true;
+		}
+		if (NativeDimensionLayerControlExpired (started, processControl)) {
+			run.prepareFacts = stageFacts;
+			return NativeDimensionLayerControlResponse ("unknown", "cooperative-stop-after-nonundoable-layer-create-before-parent-create", action, run.runRef, "unknown", stageFacts);
+		}
+		NativeDimensionLayerFocusSnapshot focusAtParentCreate;
+		bool parentCreateFocusAccepted = false;
+		GSErrCode parentCreateError = APIERR_GENERAL;
+		parentCreateError = ACAPI_CallUndoableCommand ("Create T3i Layer Inventory Dimension Fixture", [&] () -> GSErrCode {
+			if (NativeDimensionLayerControlExpired (started, processControl)) return APIERR_CANCEL;
+			focusAtParentCreate = ReadNativeDimensionLayerFocus ();
+			parentCreateFocusAccepted = focusAtParentCreate.complete && focusAtParentCreate.serialized == run.initialFocusFacts
+				&& !NativeDimensionLayerControlExpired (started, processControl);
+			if (!parentCreateFocusAccepted) return APIERR_CANCEL;
+			return ACAPI_Element_Create (&defaults.linear, &defaults.memo);
+		});
+		stageFacts.Add ("focusAtParentCreate", focusAtParentCreate.facts);
+		stageFacts.Add ("parentCreateFocusAccepted", parentCreateFocusAccepted);
+		stageFacts.Add ("parentCreate", GS::ObjectState ("status", parentCreateError == NoError && defaults.linear.header.guid != APINULLGuid ? "created" : "error-or-unknown", "errorCode", static_cast<Int32> (parentCreateError), "guid", APIGuidToString (defaults.linear.header.guid), "nativeTypeId", static_cast<Int32> (GetElemTypeId (defaults.linear.header)), "layerIndex", GetAttributeIndex (defaults.linear.header.layer), "undoable", true));
+		if (parentCreateError != NoError || defaults.linear.header.guid == APINULLGuid) {
+			run.prepareFacts = stageFacts;
+			return NativeDimensionLayerControlResponse ("unknown", "parent-create-outcome-not-qualified-layer-remains-no-compensation", action, run.runRef, "unknown", stageFacts);
+		}
+		run.parentGuid = defaults.linear.header.guid;
+		const NativeDimensionLayerInventory afterInventory = ReadNativeDimensionLayerInventory (started, processControl);
+		GS::ObjectState parentRaw = ReadNativeDimensionFixtureRow (run.parentGuid, processControl);
+		GS::UniString parentText;
+		UInt64 parentBytes = 0;
+		const bool parentSerialized = NativeDimensionAuditFactsText (parentRaw, parentText, parentBytes);
+		stageFacts.Add ("postPrepareInventory", afterInventory.facts);
+		stageFacts.Add ("parentReader", parentRaw);
+		stageFacts.Add ("parentReaderStatus", parentSerialized ? "raw-preserved" : "serialization-unavailable");
+		stageFacts.Add ("contextAtPrepare", RadialDefaultsContextDetails (beforeContext));
+		RadialDefaultsContext afterPrepareContext;
+		ReadNativeDimensionAuditContext (afterPrepareContext);
+		const bool prepareContextStable = IsExactTaskOwnedRadialDefaultsCopy (run.runId, run.projectPath, run.fileScopeKey, afterPrepareContext)
+			&& afterPrepareContext.window.typeID == APIWind_FloorPlanID && afterPrepareContext.database.typeID == APIWind_FloorPlanID
+			&& afterPrepareContext.database.databaseUnId.elemSetId == run.databaseGuid && afterPrepareContext.activeStory == run.storyIndex
+			&& beforeContext.database.databaseUnId.elemSetId == afterPrepareContext.database.databaseUnId.elemSetId
+			&& beforeContext.activeStory == afterPrepareContext.activeStory;
+		stageFacts.Add ("contextAfterPrepare", RadialDefaultsContextDetails (afterPrepareContext));
+		stageFacts.Add ("contextStable", prepareContextStable);
+		GS::ObjectState parentRow;
+		const bool parentEnvelopeExact = ExtractExactNativeDimensionFixtureRow (parentRaw, run.parentGuid, parentRow);
+		GS::UniString parentRowText;
+		UInt64 parentRowBytes = 0;
+		const bool parentRowSerialized = parentEnvelopeExact && NativeDimensionAuditFactsText (parentRow, parentRowText, parentRowBytes);
+		if (!afterInventory.complete || !parentSerialized || !parentRowSerialized
+			|| !NativeDimensionLayerPreparationDeltaExact (beforeInventory, afterInventory, run.layerGuid)
+			|| !prepareContextStable || NativeDimensionLayerControlExpired (started, processControl)) {
+			stageFacts.Add ("preparationDeltaExact", false);
+			run.prepareFacts = stageFacts;
+			return NativeDimensionLayerControlResponse ("unknown", "post-prepare-facts-incomplete-or-protected-delta", action, run.runRef, "unknown", stageFacts);
+		}
+		stageFacts.Add ("preparationDeltaExact", true);
+		run.preparedCombinationFacts = FixtureUtf8 (afterInventory.serialized);
+		run.preparedLayers = afterInventory.layers;
+		run.preparedLayerSlots = afterInventory.layerSlots;
+		run.preparedCombinations = afterInventory.combinations;
+		run.preparedCombinationSlots = afterInventory.combinationSlots;
+		run.preparedCurrentCombinationError = afterInventory.currentCombinationError;
+		run.preparedCurrentCombinationIndex = afterInventory.currentCombinationIndex;
+		run.preparedParentFacts = parentRowSerialized ? FixtureUtf8 (parentRowText) : std::string ();
+		GS::ObjectState otherLayers;
+		const auto& oldLayerList = otherLayers.AddList<GS::ObjectState> ("layers");
+		for (const auto& layer : afterInventory.layers) if (layer.guid != APIGuidToString (run.layerGuid)) oldLayerList (NativeDimensionLayerFactState (layer));
+		GS::UniString oldLayersText;
+		if (JSON::CreateFromObjectState (otherLayers, oldLayersText, false) != NoError) {
+			run.prepareFacts = stageFacts;
+			return NativeDimensionLayerControlResponse ("unknown", "post-prepare-protected-layer-serialization-failed", action, run.runRef, "unknown", stageFacts);
+		}
+		run.preparedOtherLayerFacts = FixtureUtf8 (oldLayersText);
+		GS::UniString returnedParentGuid;
+		Int32 returnedType = -1;
+		Int32 returnedLayerIndex = -1;
+		Int32 returnedStory = -1;
+		GS::ObjectState rowId;
+		GS::ObjectState rowDatabase, rowDatabaseId;
+		GS::UniString returnedDatabaseGuid;
+		Int32 returnedDatabaseType = -1;
+		const bool rowExact = parentRowSerialized && parentRow.Get ("elementId", rowId) && rowId.Get ("guid", returnedParentGuid)
+			&& NativeDimensionLayerControlGuidEqual (returnedParentGuid, APIGuidToString (run.parentGuid))
+			&& parentRow.Get ("nativeElementTypeId", returnedType) && returnedType == static_cast<Int32> (API_DimensionID)
+			&& parentRow.Get ("layerIndex", returnedLayerIndex) && returnedLayerIndex == GetAttributeIndex (run.layerIndex)
+			&& parentRow.Get ("storyIndex", returnedStory) && returnedStory == run.storyIndex
+			&& parentRow.Get ("database", rowDatabase) && rowDatabase.Get ("databaseType", returnedDatabaseType)
+			&& returnedDatabaseType == static_cast<Int32> (APIWind_FloorPlanID)
+			&& rowDatabase.Get ("databaseId", rowDatabaseId) && rowDatabaseId.Get ("guid", returnedDatabaseGuid)
+			&& NativeDimensionLayerControlGuidEqual (returnedDatabaseGuid, APIGuidToString (run.databaseGuid))
+			&& [&] () {
+				Int64 stamp = 0;
+				if (!parentRow.Get ("modificationStamp", stamp) || stamp <= 0) return false;
+				run.parentModificationStamp = static_cast<UInt64> (stamp);
+				return true;
+			} ();
+		stageFacts.Add ("parentExactIdentity", rowExact);
+		if (!rowExact) {
+			run.prepareFacts = stageFacts;
+			return NativeDimensionLayerControlResponse ("unknown", "created-parent-reader-identity-not-exact", action, run.runRef, "unknown", stageFacts);
+		}
+		run.prepareFacts = stageFacts;
+		run.phase = NativeDimensionLayerControlPolicy::Phase::Prepared;
+		run.nextNonce = NativeDimensionLayerControlToken ();
+		GS::ObjectState facts ("stageNonceConsumed", consumedToken, "createdLayerGuid", APIGuidToString (run.layerGuid),
+			"createdLayerIndex", GetAttributeIndex (run.layerIndex), "createdParentGuid", APIGuidToString (run.parentGuid),
+			"nextAction", "setHidden", "nextStageNonce", run.nextNonce, "rawStageFacts", stageFacts,
+			"inventoryStatus", afterInventory.complete ? "complete" : "partial", "preparationDelta", "one-owned-layer-plus-one-parent-and-layer-entry-per-combination");
+		return NativeDimensionLayerControlResponse ("prepared", "nonundoable-layer-then-separate-undoable-parent-created", action, run.runRef, "prepared-visible", facts);
+	}
+
+	const bool settingHidden = action == "setHidden";
+	const GS::UniString expectedGuid = APIGuidToString (run.layerGuid);
+	API_Attribute layer = {};
+	GS::UniString layerName;
+	layer.header.typeID = API_LayerID;
+	layer.header.guid = run.layerGuid;
+	layer.header.uniStringNamePtr = &layerName;
+	const GSErrCode layerReadError = ACAPI_Attribute_Get (&layer);
+	const bool layerIdentityExact = layerReadError == NoError && layer.header.guid == run.layerGuid
+		&& GetAttributeIndex (layer.header.index) == GetAttributeIndex (run.layerIndex) && layerName == run.layerName;
+	const Int32 expectedFlags = settingHidden ? APILay_Hidden : APILay_Locked;
+	const bool expectedPriorFlags = layerIdentityExact
+		&& (((layer.header.flags & APILay_Hidden) != 0) == (run.phase == NativeDimensionLayerControlPolicy::Phase::Hidden))
+		&& (((layer.header.flags & APILay_Locked) != 0) == (run.phase == NativeDimensionLayerControlPolicy::Phase::Locked));
+	if (!layerIdentityExact || !expectedPriorFlags
+		|| NativeDimensionLayerControlExpired (started, processControl))
+		return NativeDimensionLayerControlResponse ("refused", "owned-layer-identity-or-expected-prior-flags-changed-before-write", action, run.runRef, "unchanged", GS::ObjectState ("errorCode", static_cast<Int32> (layerReadError), "guid", APIGuidToString (layer.header.guid), "index", GetAttributeIndex (layer.header.index), "flags", layer.header.flags, "expectedPriorFlags", expectedPriorFlags));
+	NativeDimensionLayerFocusSnapshot focusAtFlagWrite = ReadNativeDimensionLayerFocus ();
+	if (!focusAtFlagWrite.complete || focusAtFlagWrite.serialized != run.initialFocusFacts || NativeDimensionLayerControlExpired (started, processControl))
+		return NativeDimensionLayerControlResponse ("refused", "selection-or-marquee-focus-changed-before-attribute-modify", action, run.runRef, "unchanged", GS::ObjectState ("focus", focusAtFlagWrite.facts, "expectedFocus", run.initialFocus));
+	// Preserve every non-hidden/locked flag and set both target bits explicitly.
+	layer.header.flags = static_cast<short> ((layer.header.flags & ~(APILay_Hidden | APILay_Locked)) | expectedFlags);
+	run.nextNonce.Clear ();
+	run.phase = NativeDimensionLayerControlPolicy::Phase::Unknown;
+	const GSErrCode modifyError = ACAPI_Attribute_Modify (&layer, nullptr);
+	stageFacts.Add ("attributeModify", GS::ObjectState ("status", modifyError == NoError ? "returned" : "error", "errorCode", static_cast<Int32> (modifyError), "guid", APIGuidToString (layer.header.guid), "index", GetAttributeIndex (layer.header.index), "flags", layer.header.flags, "requestedHidden", settingHidden, "requestedLocked", !settingHidden));
+	if (modifyError != NoError) {
+		run.prepareFacts.Add ("lastStageFacts", stageFacts);
+		return NativeDimensionLayerControlResponse ("unknown", "attribute-modify-outcome-unknown-no-next-stage", action, run.runRef, "unknown", stageFacts);
+	}
+	API_Attribute changed = {};
+	GS::UniString changedName;
+	changed.header.typeID = API_LayerID;
+	changed.header.guid = run.layerGuid;
+	changed.header.uniStringNamePtr = &changedName;
+	const GSErrCode changedReadError = ACAPI_Attribute_Get (&changed);
+	const bool exactChangedLayer = changedReadError == NoError && changed.header.guid == run.layerGuid
+		&& GetAttributeIndex (changed.header.index) == GetAttributeIndex (run.layerIndex) && changedName == run.layerName
+		&& ((changed.header.flags & APILay_Hidden) != 0) == settingHidden
+		&& ((changed.header.flags & APILay_Locked) != 0) == !settingHidden
+		&& (changed.header.flags & ~(APILay_Hidden | APILay_Locked)) == (layer.header.flags & ~(APILay_Hidden | APILay_Locked));
+	stageFacts.Add ("layerReadback", GS::ObjectState ("status", exactChangedLayer ? "exact" : "mismatch-or-unavailable", "errorCode", static_cast<Int32> (changedReadError), "guid", APIGuidToString (changed.header.guid), "index", GetAttributeIndex (changed.header.index), "flags", changed.header.flags, "name", changedName));
+	NativeDimensionLayerInventory afterInventory = ReadNativeDimensionLayerInventory (started, processControl);
+	GS::ObjectState parentRaw = ReadNativeDimensionFixtureRow (run.parentGuid, processControl);
+	stageFacts.Add ("inventory", afterInventory.facts);
+	stageFacts.Add ("parentReader", parentRaw);
+	GS::ObjectState parentRow;
+	const bool parentEnvelopeExact = ExtractExactNativeDimensionFixtureRow (parentRaw, run.parentGuid, parentRow);
+	bool parentIdentityMatches = false;
+	GS::ObjectState parentId;
+	GS::UniString parentGuid;
+	Int32 parentType = -1;
+	Int64 parentStamp = -1;
+	parentIdentityMatches = parentEnvelopeExact && parentRow.Get ("elementId", parentId) && parentId.Get ("guid", parentGuid)
+		&& NativeDimensionLayerControlGuidEqual (parentGuid, APIGuidToString (run.parentGuid))
+		&& parentRow.Get ("nativeElementTypeId", parentType) && parentType == static_cast<Int32> (API_DimensionID)
+		&& parentRow.Get ("modificationStamp", parentStamp) && parentStamp > 0
+		&& static_cast<UInt64> (parentStamp) == run.parentModificationStamp;
+	GS::ObjectState parentElementFilter;
+	parentElementFilter.Add ("onActFloor", ACAPI_Element_Filter (run.parentGuid, APIFilt_OnActFloor));
+	parentElementFilter.Add ("onVisibleLayer", ACAPI_Element_Filter (run.parentGuid, APIFilt_OnVisLayer));
+	parentElementFilter.Add ("isEditable", ACAPI_Element_Filter (run.parentGuid, APIFilt_IsEditable));
+	stageFacts.Add ("parentFilterControls", parentElementFilter);
+	GS::ObjectState afterParentIdentity = parentRow;
+	GS::UniString parentSerialized;
+	UInt64 parentBytes = 0;
+	const bool parentSerializedOk = NativeDimensionAuditFactsText (afterParentIdentity, parentSerialized, parentBytes);
+	const bool parentFactsUnchanged = parentSerializedOk && FixtureUtf8 (parentSerialized) == run.preparedParentFacts;
+	const bool layerAndCombinationFactsUnchanged = NativeDimensionLayerStageFactsUnchanged (run, afterInventory, settingHidden, !settingHidden);
+	RadialDefaultsContext afterContext;
+	ReadNativeDimensionAuditContext (afterContext);
+	const bool scopeStable = IsExactTaskOwnedRadialDefaultsCopy (run.runId, run.projectPath, run.fileScopeKey, afterContext)
+		&& afterContext.window.typeID == APIWind_FloorPlanID && afterContext.database.typeID == APIWind_FloorPlanID
+		&& afterContext.database.databaseUnId.elemSetId == run.databaseGuid && afterContext.activeStory == run.storyIndex
+		&& beforeContext.database.databaseUnId.elemSetId == afterContext.database.databaseUnId.elemSetId
+		&& beforeContext.activeStory == afterContext.activeStory;
+	stageFacts.Add ("parentFactsUnchanged", parentFactsUnchanged);
+	stageFacts.Add ("originalLayerAndCombinationFactsUnchanged", layerAndCombinationFactsUnchanged);
+	stageFacts.Add ("contextBefore", RadialDefaultsContextDetails (beforeContext));
+	stageFacts.Add ("contextAfter", RadialDefaultsContextDetails (afterContext));
+	stageFacts.Add ("scopeStable", scopeStable);
+	const bool stageFactsCoherent = exactChangedLayer && afterInventory.complete && parentIdentityMatches && parentFactsUnchanged && layerAndCombinationFactsUnchanged && scopeStable
+		&& (settingHidden ? (!ACAPI_Element_Filter (run.parentGuid, APIFilt_OnVisLayer) && !ACAPI_Element_Filter (run.parentGuid, APIFilt_IsEditable) && ACAPI_Element_Filter (run.parentGuid, APIFilt_OnActFloor))
+			: (ACAPI_Element_Filter (run.parentGuid, APIFilt_OnVisLayer) && !ACAPI_Element_Filter (run.parentGuid, APIFilt_IsEditable) && ACAPI_Element_Filter (run.parentGuid, APIFilt_OnActFloor)));
+	if (!stageFactsCoherent || NativeDimensionLayerControlExpired (started, processControl)) {
+		run.phase = NativeDimensionLayerControlPolicy::Phase::Unknown;
+		return NativeDimensionLayerControlResponse ("unknown", "postcondition-or-cooperative-deadline-unproven-no-next-write", action, run.runRef, "unknown", stageFacts);
+	}
+	if (settingHidden) run.phase = NativeDimensionLayerControlPolicy::Phase::Hidden;
+	else run.phase = NativeDimensionLayerControlPolicy::Phase::Locked;
+	run.nextNonce = NativeDimensionLayerControlToken ();
+	GS::ObjectState facts ("stageNonceConsumed", consumedToken, "layerGuid", expectedGuid,
+		"nextAction", settingHidden ? "setLocked" : "inspect", "nextStageNonce", run.nextNonce,
+		"rawStageFacts", stageFacts, "storedCombinations", "re-read-complete-not-mutated-by-command");
+	return NativeDimensionLayerControlResponse ("stage-complete", settingHidden ? "hidden-state-observed" : "locked-state-observed", action, run.runRef, settingHidden ? "hidden" : "locked", facts);
+}
+
+GetNativeDimensionCreateCandidateContextCommand::GetNativeDimensionCreateCandidateContextCommand () : CommandBase (CommonSchema::NotUsed) {}
+GS::String GetNativeDimensionCreateCandidateContextCommand::GetName () const { return "GetNativeDimensionCreateCandidateContext"; }
+GS::Optional<GS::UniString> GetNativeDimensionCreateCandidateContextCommand::GetInputParametersSchema () const
+{
+	return R"({"type":"object","properties":{"schemaVersion":{"type":"string","enum":["native-dimension-create-context-request/v1"]},"runId":{"type":"string","pattern":"^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$"},"expectedProjectPath":{"type":"string","minLength":1,"maxLength":1024},"fileScopeKey":{"type":"string","minLength":1,"maxLength":1100},"storyIndex":{"type":"integer"}},"required":["schemaVersion","runId","expectedProjectPath","fileScopeKey","storyIndex"],"additionalProperties":false})";
+}
+GS::Optional<GS::UniString> GetNativeDimensionCreateCandidateContextCommand::GetResponseSchema () const { return {}; }
+GS::ObjectState GetNativeDimensionCreateCandidateContextCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl&) const
+{
+	GS::UniString schema, runId, expectedProjectPath, fileScopeKey;
+	Int32 expectedStory = 0;
+	if (parameters.GetFieldNames ().GetSize () != 5
+		|| !parameters.Get ("schemaVersion", schema) || schema != "native-dimension-create-context-request/v1"
+		|| !parameters.Get ("runId", runId) || !parameters.Get ("expectedProjectPath", expectedProjectPath)
+		|| !parameters.Get ("fileScopeKey", fileScopeKey) || !parameters.Get ("storyIndex", expectedStory))
+		return GS::ObjectState ("schemaVersion", "native-dimension-create-context-response/v1", "status", "refused", "reason", "invalid-closed-context-request");
+	NativeDimensionCreateWire::Context context;
+	GS::ObjectState observed;
+	const bool available = CaptureNativeDimensionCreateContext (runId, expectedProjectPath, fileScopeKey, context, observed)
+		&& context.storyIndex == std::to_string (expectedStory);
+	Int32 windowIndex = -1;
+	try { windowIndex = static_cast<Int32> (std::stol (context.windowIndex)); } catch (...) { windowIndex = -1; }
+	Int32 observedStoryIndex = -1;
+	try {
+		const long parsedStory = std::stol (context.storyIndex);
+		if (parsedStory >= std::numeric_limits<Int32>::min () && parsedStory <= std::numeric_limits<Int32>::max ()
+			&& std::to_string (parsedStory) == context.storyIndex) observedStoryIndex = static_cast<Int32> (parsedStory);
+	} catch (...) {}
+	GS::ObjectState contextState = NativeDimensionCreateWire::EmitContextObjectState (context, windowIndex, observedStoryIndex);
+	return GS::ObjectState (
+		"schemaVersion", "native-dimension-create-context-response/v1",
+		"status", available ? "available" : "unavailable",
+		"reason", available ? "exact-owned-saved-solo-floor-plan-context" : "owned-path-process-window-database-or-story-context-unavailable",
+		"requestedStoryIndex", expectedStory,
+		"context", contextState,
+		"observed", observed);
+}
+
+namespace {
+
+GS::ObjectState NativeDimensionCreateContextObject (const NativeDimensionCreateWire::Context& context)
+{
+	Int32 windowIndex = -1, storyIndex = -1;
+	try { windowIndex = static_cast<Int32> (std::stol (context.windowIndex)); } catch (...) {}
+	try { storyIndex = static_cast<Int32> (std::stol (context.storyIndex)); } catch (...) {}
+	return NativeDimensionCreateWire::EmitContextObjectState (context, windowIndex, storyIndex);
+}
+
+GS::ObjectState NativeDimensionCreateCandidateResult (
+	const char* status,
+	const char* reason,
+	const NativeDimensionCreateWire::Request* request,
+	const NativeDimensionCreateWire::Context* expected,
+	const NativeDimensionCreateWire::Context* before,
+	const NativeDimensionCreateWire::Context* insideBefore,
+	const NativeDimensionCreateWire::Context* after,
+	const GS::ObjectState* rawReadback,
+	const GS::ObjectState* inputWire,
+	const GSErrCode callbackError,
+	const GSErrCode transactionError,
+	const bool dispatchAttempted,
+	const bool postCreateFaultInjected,
+	const API_Guid* knownGuid)
+{
+	GS::ObjectState result (
+		"schemaVersion", "native-dimension-create-candidate-result/v1",
+		"kind", "dimensionCreateCandidateResult",
+		"status", status,
+		"reason", reason,
+		"dispatchAttempted", dispatchAttempted,
+		"callbackErrorCode", static_cast<Int32> (callbackError),
+		"transactionErrorCode", static_cast<Int32> (transactionError),
+		"postCreateFaultInjected", postCreateFaultInjected);
+	if (request != nullptr) {
+		NativeDimensionCreateWire::AddCandidateResultCorrelation (result, *request, static_cast<Int32> (std::stol (request->storyIndex)));
+	}
+	if (expected != nullptr) result.Add ("expectedContext", NativeDimensionCreateContextObject (*expected));
+	if (before != nullptr) result.Add ("contextBefore", NativeDimensionCreateContextObject (*before));
+	if (insideBefore != nullptr) result.Add ("contextInsideBefore", NativeDimensionCreateContextObject (*insideBefore));
+	if (after != nullptr) result.Add ("contextAfter", NativeDimensionCreateContextObject (*after));
+	if (rawReadback != nullptr) result.Add ("rawReadback", *rawReadback);
+	if (inputWire != nullptr) {
+		result.Add ("inputWire", *inputWire);
+		GS::UniString wireHash;
+		if (inputWire->Get ("wireHash", wireHash)) result.Add ("wireHash", wireHash);
+	}
+	if (knownGuid != nullptr && *knownGuid != APINULLGuid) {
+		const auto& guids = result.AddList<GS::UniString> ("knownGuids");
+		guids (APIGuidToString (*knownGuid));
+	}
+	return result;
+}
+
+}
+
+GS::ObjectState ExecuteNativeDimensionCreateCandidate (const GS::ObjectState& parameters, GS::ProcessControl& processControl)
+{
+	static_cast<void> (processControl); // Used only in the separately compiled candidate branch.
+	const char* invalid = "rejected";
+	if (parameters.GetFieldNames ().GetSize () != 8) return NativeDimensionCreateCandidateResult (invalid, "closed-native-envelope-required", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, APIERR_BADPARS, APIERR_BADPARS, false, false, nullptr);
+	std::string contract, operation, elementType, operationId, fileScope, outerHash, description;
+	GS::Array<GS::ObjectState> items;
+	if (!NativeDimensionCreateWire::ReadExactString (parameters, "contractVersion", contract) || contract != "native-crud-v2"
+		|| !NativeDimensionCreateWire::ReadExactString (parameters, "operation", operation) || operation != "create"
+		|| !NativeDimensionCreateWire::ReadExactString (parameters, "elementType", elementType) || elementType != "Dimension"
+		|| !NativeDimensionCreateWire::ReadExactString (parameters, "operationId", operationId) || operationId.empty ()
+		|| !NativeDimensionCreateWire::ReadExactString (parameters, "expectedFileScopeKey", fileScope) || fileScope.empty ()
+		|| !NativeDimensionCreateWire::ReadExactString (parameters, "requestHash", outerHash)
+		|| !NativeDimensionCreateWire::ReadExactString (parameters, "description", description) || description.empty ()
+		|| !parameters.Get ("items", items) || items.GetSize () != 1)
+		return NativeDimensionCreateCandidateResult (invalid, "invalid-closed-candidate-envelope", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, APIERR_BADPARS, APIERR_BADPARS, false, false, nullptr);
+	const GS::ObjectState inputWire = items[0];
+	NativeDimensionCreateWire::Request request;
+	NativeDimensionCreateWire::Context expected;
+	std::string wireHash;
+	if (!NativeDimensionCreateWire::ParseEnvelope (inputWire, request, expected, wireHash)
+		|| request.operationId != operationId
+		|| request.fileScopeKey != fileScope
+		|| request.requestHash != outerHash
+		|| request.description != description)
+		return NativeDimensionCreateCandidateResult (invalid, "wire-request-or-outer-identity-invalid", nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, &inputWire, APIERR_BADPARS, APIERR_BADPARS, false, false, nullptr);
+#if !TAPIR_ENABLE_NATIVE_DIMENSION_CREATE_CANDIDATE
+	return NativeDimensionCreateCandidateResult (invalid, "native-candidate-profile-disabled", &request, &expected, nullptr, nullptr, nullptr, nullptr, &inputWire, APIERR_BADPARS, APIERR_BADPARS, false, false, nullptr);
+#else
+	if (!NativeDimensionCreateWire::CompiledProfileMatches (expected))
+		return NativeDimensionCreateCandidateResult (invalid, "compiled-native-candidate-policy-mismatch", &request, &expected, nullptr, nullptr, nullptr, nullptr, &inputWire, APIERR_BADPARS, APIERR_BADPARS, false, false, nullptr);
+	const GS::UniString expectedRunId (expected.runId.c_str (), CC_UTF8);
+	const GS::UniString expectedProjectPath (expected.projectPath.c_str (), CC_UTF8);
+	const GS::UniString expectedFileScopeKey (expected.fileScopeKey.c_str (), CC_UTF8);
+	NativeDimensionCreateWire::Context contextBefore;
+	GS::ObjectState contextBeforeFacts;
+	if (!CaptureNativeDimensionCreateContext (expectedRunId, expectedProjectPath, expectedFileScopeKey, contextBefore, contextBeforeFacts)
+		|| !NativeDimensionCreateWire::ValidateExpectedContext (expected, contextBefore).accepted
+		|| !NativeDimensionCreateWire::RequestMatchesContext (request, contextBefore))
+		return NativeDimensionCreateCandidateResult (invalid, "pretransaction-native-context-refused", &request, &expected, &contextBefore, nullptr, nullptr, nullptr, &inputWire, APIERR_BADPARS, APIERR_BADPARS, false, false, nullptr);
+	const long requestedStoryLong = std::stol (request.storyIndex);
+	if (requestedStoryLong < std::numeric_limits<Int16>::min () || requestedStoryLong > std::numeric_limits<Int16>::max ())
+		return NativeDimensionCreateCandidateResult (invalid, "story-index-outside-native-floor-index-range", &request, &expected, &contextBefore, nullptr, nullptr, nullptr, &inputWire, APIERR_BADPARS, APIERR_BADPARS, false, false, nullptr);
+	GS::ObjectState defaultFacts;
+	PreparedLinearStaticFixtureDefaults defaults;
+	if (!ReadLinearStaticFixtureDefaultFacts (defaultFacts, defaults)) {
+		GS::ObjectState refused = NativeDimensionCreateCandidateResult (invalid, "default-or-memo-ownership-unavailable", &request, &expected, &contextBefore, nullptr, nullptr, nullptr, &inputWire, APIERR_BADPARS, APIERR_BADPARS, false, false, nullptr);
+		refused.Add ("defaultAvailability", defaultFacts);
+		return refused;
+	}
+	defaults.linear.header.floorInd = static_cast<Int16> (requestedStoryLong);
+	GS::ObjectState rawReadback;
+	NativeDimensionCreateWire::Context contextInsideBefore, contextAfter;
+	GS::ObjectState contextInsideFacts, contextAfterFacts;
+	GSErrCode callbackError = APIERR_CANCEL, transactionError = APIERR_CANCEL;
+	bool dispatchAttempted = false, injectedFault = false, exactReadback = false, createdInCallback = false;
+	API_Guid knownGuid = APINULLGuid;
+	transactionError = ACAPI_CallUndoableCommand ("Create Native Static Measured Dimension Candidate", [&] () -> GSErrCode {
+		if (!CaptureNativeDimensionCreateContext (expectedRunId, expectedProjectPath, expectedFileScopeKey, contextInsideBefore, contextInsideFacts)
+			|| !NativeDimensionCreateWire::ValidateExpectedContext (expected, contextInsideBefore).accepted
+			|| !NativeDimensionCreateWire::ValidateExpectedContext (contextBefore, contextInsideBefore).accepted)
+			return callbackError = APIERR_CANCEL;
+		if (defaults.linear.dimension.defNote.contentUStr != nullptr || defaults.linear.dimension.nDimElem != 0 || defaults.memo.dimElems != nullptr)
+			return callbackError = APIERR_BADPARS;
+		GSErrCode prepareError = BuildFixedStaticMeasuredTwoPointDimension (defaults.linear, defaults.memo,
+			static_cast<Int16> (std::stoi (request.storyIndex)));
+		if (prepareError != NoError) return callbackError = prepareError;
+		dispatchAttempted = true;
+		GSErrCode createError = ACAPI_Element_Create (&defaults.linear, &defaults.memo);
+		callbackError = createError;
+		if (defaults.linear.header.guid != APINULLGuid) knownGuid = defaults.linear.header.guid;
+		if (createError != NoError) return createError;
+		createdInCallback = true;
+#if TAPIR_ENABLE_NATIVE_DIMENSION_CREATE_POST_CREATE_FAULT
+		injectedFault = true;
+		callbackError = APIERR_GENERAL;
+		return callbackError;
+#endif
+		rawReadback = ReadNativeDimensionFixtureRow (knownGuid, processControl);
+		GS::ObjectState row;
+		const API_Guid expectedDatabaseGuid = APIGuidFromString (GS::UniString (contextInsideBefore.currentDatabaseGuid.c_str (), CC_UTF8).ToCStr ());
+		UInt64 observedModificationStamp = 0;
+		exactReadback = ExtractExactNativeDimensionFixtureRow (rawReadback, knownGuid, row)
+			&& expectedDatabaseGuid != APINULLGuid
+			&& IsNativeDimensionMaskedPositionStage (rawReadback, knownGuid, expectedDatabaseGuid,
+				static_cast<Int32> (requestedStoryLong), 20.0, observedModificationStamp)
+			&& NativeDimensionCreateWire::FixedCandidateReaderRowMatches (row, APIGuidToString (knownGuid),
+				APIGuidToString (expectedDatabaseGuid), static_cast<Int32> (requestedStoryLong));
+		if (!exactReadback) return callbackError = APIERR_BADID;
+		if (!CaptureNativeDimensionCreateContext (expectedRunId, expectedProjectPath, expectedFileScopeKey, contextAfter, contextAfterFacts)
+			|| !NativeDimensionCreateWire::ValidateExpectedContext (expected, contextAfter).accepted
+			|| !NativeDimensionCreateWire::ValidateExpectedContext (contextInsideBefore, contextAfter).accepted)
+			return callbackError = APIERR_CANCEL;
+		callbackError = NoError;
+		return NoError;
+	});
+	if (transactionError == NoError && callbackError == NoError && dispatchAttempted && exactReadback) {
+		return NativeDimensionCreateCandidateResult ("created", "native-create-and-exact-reader-row-observed", &request, &expected, &contextBefore, &contextInsideBefore, &contextAfter, &rawReadback, &inputWire, callbackError, transactionError, true, false, &knownGuid);
+	}
+	if (!dispatchAttempted) {
+		return NativeDimensionCreateCandidateResult (invalid, "candidate-refused-before-element-create", &request, &expected, &contextBefore,
+			contextInsideBefore.kind.empty () ? nullptr : &contextInsideBefore, contextAfter.kind.empty () ? nullptr : &contextAfter,
+			rawReadback.GetFieldNames ().IsEmpty () ? nullptr : &rawReadback, &inputWire, callbackError, transactionError, false, injectedFault, nullptr);
+	}
+	if (createdInCallback && callbackError != NoError && transactionError != NoError && knownGuid != APINULLGuid) {
+		NativeDimensionCreateWire::Context afterUndo;
+		GS::ObjectState afterUndoFacts;
+		const bool scopeStable = CaptureNativeDimensionCreateContext (expectedRunId, expectedProjectPath, expectedFileScopeKey, afterUndo, afterUndoFacts)
+			&& NativeDimensionCreateWire::ValidateExpectedContext (expected, afterUndo).accepted
+			&& NativeDimensionCreateWire::ValidateExpectedContext (contextInsideBefore, afterUndo).accepted;
+		API_Element exactProbe = {};
+		exactProbe.header.guid = knownGuid;
+		const GSErrCode absenceProbeError = ACAPI_Element_Get (&exactProbe);
+		if (scopeStable && absenceProbeError == APIERR_BADID) {
+			GS::ObjectState observedRollback = NativeDimensionCreateCandidateResult ("rollbackObserved", "callback-and-undo-errors-with-exact-created-guid-absence-observed",
+				&request, &expected, &contextBefore, &contextInsideBefore, &afterUndo,
+				rawReadback.GetFieldNames ().IsEmpty () ? nullptr : &rawReadback, &inputWire, callbackError, transactionError, true, injectedFault, &knownGuid);
+			observedRollback.Add ("rollbackEvidence", GS::ObjectState (
+				"status", "exact-guid-absent-after-undo", "guid", APIGuidToString (knownGuid),
+				"elementGetErrorCode", static_cast<Int32> (absenceProbeError), "absenceCode", "APIERR_BADID",
+				"contextStable", true, "coverage", "exact-created-guid-only"));
+			return observedRollback;
+		}
+		if (scopeStable) contextAfter = afterUndo;
+	}
+	return NativeDimensionCreateCandidateResult ("unresolved", injectedFault ? "compiled-post-create-fault-injected" : "create-transaction-or-postcondition-unresolved", &request, &expected, &contextBefore, &contextInsideBefore,
+		contextAfter.kind.empty () ? nullptr : &contextAfter, rawReadback.GetFieldNames ().IsEmpty () ? nullptr : &rawReadback, &inputWire,
+		callbackError, transactionError, dispatchAttempted, injectedFault, &knownGuid);
+#endif
+}
+
+GetNativeDimensionRadialDefaultsCommand::GetNativeDimensionRadialDefaultsCommand () : CommandBase (CommonSchema::NotUsed) {}
+GS::String GetNativeDimensionRadialDefaultsCommand::GetName () const { return "GetNativeDimensionRadialDefaults"; }
+GS::Optional<GS::UniString> GetNativeDimensionRadialDefaultsCommand::GetInputParametersSchema () const
+{
+    return R"({"type":"object","properties":{"schemaVersion":{"type":"string","enum":["native-dimension-radial-defaults-request/v1"]},"runId":{"type":"string","pattern":"^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$"},"expectedProjectPath":{"type":"string","minLength":1,"maxLength":1024},"fileScopeKey":{"type":"string","minLength":1,"maxLength":1100},"storyIndex":{"type":"integer"}},"required":["schemaVersion","runId","expectedProjectPath","fileScopeKey","storyIndex"],"additionalProperties":false})";
+}
+GS::Optional<GS::UniString> GetNativeDimensionRadialDefaultsCommand::GetResponseSchema () const { return {}; }
+GS::ObjectState GetNativeDimensionRadialDefaultsCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl&) const
+{
+    GS::UniString schemaVersion, runId, expectedProjectPath, requestedFileScopeKey;
+    Int32 requestedStory = 0;
+    if (!parameters.GetFieldNames ().IsEmpty () && (parameters.GetFieldNames ().GetSize () != 5
+        || !parameters.Get ("schemaVersion", schemaVersion) || schemaVersion != "native-dimension-radial-defaults-request/v1"
+        || !parameters.Get ("runId", runId) || !parameters.Get ("expectedProjectPath", expectedProjectPath)
+        || !parameters.Get ("fileScopeKey", requestedFileScopeKey) || !parameters.Get ("storyIndex", requestedStory))) {
+        return RadialDefaultsResponse (
+            "refused", runId, requestedFileScopeKey, requestedStory,
+            GS::ObjectState ("status", "not-read"), RadialDefaultsNotCheckedContext (), RadialDefaultsNotRequested (),
+            RadialDefaultsError ("INVALID_REQUEST", "Request must contain exactly the five documented radial-defaults fields."));
+    }
+    if (parameters.GetFieldNames ().IsEmpty ()) {
+        return RadialDefaultsResponse (
+            "refused", runId, requestedFileScopeKey, requestedStory,
+            GS::ObjectState ("status", "not-read"), RadialDefaultsNotCheckedContext (), RadialDefaultsNotRequested (),
+            RadialDefaultsError ("INVALID_REQUEST", "Request cannot be empty."));
+    }
+    const std::string runIdUtf8 = FixtureUtf8 (runId);
+    if (schemaVersion != "native-dimension-radial-defaults-request/v1" || runIdUtf8.empty () || runIdUtf8.size () > 48
+        || !std::all_of (runIdUtf8.begin (), runIdUtf8.end (), [] (unsigned char c) { return std::isalnum (c) || c == '_' || c == '-'; })
+        || expectedProjectPath.IsEmpty () || FixtureUtf8 (expectedProjectPath).size () > 1024
+        || requestedFileScopeKey.IsEmpty () || FixtureUtf8 (requestedFileScopeKey).size () > 1100) {
+        return RadialDefaultsResponse (
+            "refused", runId, requestedFileScopeKey, requestedStory,
+            GS::ObjectState ("status", "not-read"), RadialDefaultsNotCheckedContext (), RadialDefaultsNotRequested (),
+            RadialDefaultsError ("INVALID_REQUEST", "Request values are outside their closed fixed bounds."));
+    }
+
+    RadialDefaultsContext before;
+    ReadRadialDefaultsContext (before);
+    const GS::ObjectState beforeState = RadialDefaultsContextDetails (before);
+    if (requestedStory < std::numeric_limits<short>::min () || requestedStory > std::numeric_limits<short>::max ()
+        || !IsExactTaskOwnedRadialDefaultsCopy (runId, expectedProjectPath, requestedFileScopeKey, before)
+        || before.window.typeID != APIWind_FloorPlanID || before.database.typeID != APIWind_FloorPlanID
+        || before.activeStory != requestedStory) {
+        return RadialDefaultsResponse (
+            "refused", runId, requestedFileScopeKey, requestedStory, beforeState, RadialDefaultsNotCheckedContext (), RadialDefaultsNotRequested (),
+            RadialDefaultsError ("RADIAL_DEFAULTS_SCOPE_REFUSED", "Requires the exact saved Solo task-owned copy, matching file scope, current Floor Plan window/database and active story."));
+    }
+
+    API_Element element = {};
+    SetNativeElementTypeHeader (element, API_RadialDimensionID);
+    API_ElementMemo memo = {};
+    NativeMemoGuard memoGuard (memo);
+    const GSErrCode defaultsError = ACAPI_Element_GetDefaults (&element, &memo);
+
+    RadialDefaultsContext after;
+    ReadRadialDefaultsContext (after);
+    const GS::ObjectState afterState = RadialDefaultsContextDetails (after);
+    if (!SameRadialDefaultsContext (before, after) || !IsExactTaskOwnedRadialDefaultsCopy (runId, expectedProjectPath, requestedFileScopeKey, after)
+        || after.window.typeID != APIWind_FloorPlanID || after.database.typeID != APIWind_FloorPlanID || after.activeStory != requestedStory) {
+        return RadialDefaultsResponse (
+            "refused", runId, requestedFileScopeKey, requestedStory, beforeState, afterState, RadialDefaultsDiscardedContextChange (),
+            RadialDefaultsError ("RADIAL_DEFAULTS_CONTEXT_CHANGED", "Context or scope changed across the defaults read; SDK defaults were discarded."));
+    }
+    if (defaultsError != NoError) {
+        return RadialDefaultsResponse (
+            "unavailable", runId, requestedFileScopeKey, requestedStory, beforeState, afterState,
+            GS::ObjectState ("status", "unavailable", "nativeErrorCode", static_cast<Int32> (defaultsError)),
+            RadialDefaultsError ("GET_DEFAULTS_FAILED", "ACAPI_Element_GetDefaults failed for RadialDimension.", static_cast<Int32> (defaultsError)));
+    }
+
+    return RadialDefaultsResponse (
+        "available", runId, requestedFileScopeKey, requestedStory, beforeState, afterState,
+        RadialDefaultsFacts (element, memo), RadialDefaultsNoError ());
+}
+
+GetNativeDimensionArcHotspotsCommand::GetNativeDimensionArcHotspotsCommand () : CommandBase (CommonSchema::NotUsed) {}
+GS::String GetNativeDimensionArcHotspotsCommand::GetName () const { return "GetNativeDimensionArcHotspots"; }
+GS::Optional<GS::UniString> GetNativeDimensionArcHotspotsCommand::GetInputParametersSchema () const
+{
+    return R"({"type":"object","properties":{"schemaVersion":{"type":"string","enum":["native-dimension-arc-hotspots-request/v1"]},"runId":{"type":"string","pattern":"^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$"},"expectedProjectPath":{"type":"string","minLength":1,"maxLength":1024},"fileScopeKey":{"type":"string","minLength":1,"maxLength":1100},"storyIndex":{"type":"integer"},"hostGuid":{"type":"string","format":"uuid"}},"required":["schemaVersion","runId","expectedProjectPath","fileScopeKey","storyIndex","hostGuid"],"additionalProperties":false})";
+}
+GS::Optional<GS::UniString> GetNativeDimensionArcHotspotsCommand::GetResponseSchema () const { return {}; }
+GS::ObjectState GetNativeDimensionArcHotspotsCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const
+{
+    const auto started = std::chrono::steady_clock::now ();
+    GS::UniString schemaVersion, runId, expectedProjectPath, requestedFileScopeKey, hostGuidText;
+    Int32 requestedStory = 0;
+    const bool fieldsRead = parameters.GetFieldNames ().GetSize () == 6
+        && parameters.Get ("schemaVersion", schemaVersion) && parameters.Get ("runId", runId)
+        && parameters.Get ("expectedProjectPath", expectedProjectPath)
+        && parameters.Get ("fileScopeKey", requestedFileScopeKey)
+        && parameters.Get ("storyIndex", requestedStory) && parameters.Get ("hostGuid", hostGuidText);
+    API_Guid hostGuid = APINULLGuid;
+    if (fieldsRead)
+        hostGuid = APIGuidFromString (hostGuidText.ToCStr ());
+
+    const GS::ObjectState notRead ("status", "not-read");
+    const GS::ObjectState notChecked ("status", "not-checked-before-hotspot-call");
+    const GS::ObjectState consistencyNotRead ("status", "not-read");
+    const GS::Array<GS::ObjectState> noHotspots;
+    auto response = [&] (
+        const char* status,
+        const GS::ObjectState& contextBefore,
+        const GS::ObjectState& contextAfter,
+        const GS::ObjectState& hostBefore,
+        const GS::ObjectState& hostAfter,
+        const GS::ObjectState& consistency,
+        const Int64 count,
+        const bool complete,
+        const bool conversionComplete,
+        const char* reason,
+        const GS::Array<GS::ObjectState>& hotspots,
+        const GS::ObjectState& error) {
+        return ArcHotspotResponse (status, runId, expectedProjectPath, requestedFileScopeKey, requestedStory,
+            hostGuid, contextBefore, contextAfter, hostBefore, hostAfter, consistency, count, complete,
+            conversionComplete, reason, hotspots, error);
+    };
+
+    const GS::UniString lowerGuid = hostGuidText.ToLowerCase ();
+    const GS::UniString canonicalGuid = hostGuid == APINULLGuid ? GS::UniString () : APIGuidToString (hostGuid).ToLowerCase ();
+    const std::string runIdUtf8 = FixtureUtf8 (runId);
+    const bool requestIsValid = fieldsRead
+        && schemaVersion == "native-dimension-arc-hotspots-request/v1"
+        && !runIdUtf8.empty () && runIdUtf8.size () <= 48
+        && std::all_of (runIdUtf8.begin (), runIdUtf8.end (), [] (unsigned char c) { return std::isalnum (c) || c == '_' || c == '-'; })
+        && !expectedProjectPath.IsEmpty () && FixtureUtf8 (expectedProjectPath).size () <= 1024
+        && !requestedFileScopeKey.IsEmpty () && FixtureUtf8 (requestedFileScopeKey).size () <= 1100
+        && requestedStory >= std::numeric_limits<short>::min () && requestedStory <= std::numeric_limits<short>::max ()
+        && hostGuid != APINULLGuid && lowerGuid == canonicalGuid;
+    if (!requestIsValid) {
+        return response ("refused", notRead, notChecked, notRead, notRead, consistencyNotRead, 0, false, false,
+            "invalid-fixed-request", noHotspots,
+            ArcHotspotError ("INVALID_REQUEST", "Request must contain exactly the six fixed fields and one canonical non-null host GUID."));
+    }
+
+    RadialDefaultsContext before;
+    ReadRadialDefaultsContext (before);
+    const GS::ObjectState beforeState = RadialDefaultsContextDetails (before);
+    if (!IsExactTaskOwnedRadialDefaultsCopy (runId, expectedProjectPath, requestedFileScopeKey, before)
+        || before.window.typeID != APIWind_FloorPlanID || before.database.typeID != APIWind_FloorPlanID
+        || before.activeStory != requestedStory) {
+        return response ("refused", beforeState, notChecked, notRead, notRead, consistencyNotRead, 0, false, false,
+            "exact-saved-copy-floor-plan-database-and-story-guard-refused", noHotspots,
+            ArcHotspotError ("ARC_HOTSPOT_SCOPE_REFUSED", "Requires the exact task-owned saved Solo copy, matching file scope, Floor Plan window/database and active story."));
+    }
+
+    bool cancelled = false;
+    if (ArcHotspotStopped (processControl, started, cancelled)) {
+        return response ("partial", beforeState, notChecked, notRead, notRead, consistencyNotRead, 0, false, false,
+            cancelled ? "cancelled-before-host-read" : "deadline-before-host-read", noHotspots, ArcHotspotStoppedError (cancelled));
+    }
+
+    const ArcHotspotHostSnapshot hostBeforeSnapshot = ReadArcHotspotHost (hostGuid);
+    const GS::ObjectState hostBeforeState = ArcHotspotHostDetails (hostBeforeSnapshot);
+    if (hostBeforeSnapshot.error != NoError || hostBeforeSnapshot.returnedGuid != hostGuid || hostBeforeSnapshot.type != API_ArcID
+        || hostBeforeSnapshot.storyIndex != requestedStory || !IsFiniteArcHost (hostBeforeSnapshot)) {
+        RadialDefaultsContext after;
+        ReadRadialDefaultsContext (after);
+        const GS::ObjectState afterState = RadialDefaultsContextDetails (after);
+        const bool sameContext = SameRadialDefaultsContext (before, after)
+            && IsExactTaskOwnedRadialDefaultsCopy (runId, expectedProjectPath, requestedFileScopeKey, after)
+            && after.activeStory == requestedStory;
+        const GS::ObjectState consistency (
+            "status", sameContext ? "context-stable-host-not-eligible" : "context-changed-or-unverified",
+            "contextStable", sameContext,
+            "hostStable", false);
+        const bool isWrongType = hostBeforeSnapshot.error == NoError
+            && (hostBeforeSnapshot.type != API_ArcID || hostBeforeSnapshot.returnedGuid != hostGuid || hostBeforeSnapshot.storyIndex != requestedStory);
+        return response (isWrongType ? "refused" : "unavailable", beforeState, afterState, hostBeforeState,
+            GS::ObjectState ("status", "not-read"), consistency, 0, false, false,
+            isWrongType ? "exact-guid-is-not-an-arc-on-requested-story" : "exact-arc-header-or-geometry-unavailable",
+            noHotspots,
+            isWrongType
+                ? ArcHotspotError ("ARC_HOTSPOT_HOST_REFUSED", "The exact GUID is not an Arc on the requested active story.")
+                : ArcHotspotError ("ARC_HOTSPOT_HOST_READ_FAILED", "The exact Arc header or finite geometry could not be verified.", static_cast<Int32> (hostBeforeSnapshot.error)));
+    }
+
+    if (ArcHotspotStopped (processControl, started, cancelled)) {
+        return response ("partial", beforeState, notChecked, hostBeforeState, GS::ObjectState ("status", "not-read"),
+            GS::ObjectState ("status", "unverified-before-hotspot-call"), 0, false, false,
+            cancelled ? "cancelled-before-hotspot-call" : "deadline-before-hotspot-call", noHotspots, ArcHotspotStoppedError (cancelled));
+    }
+
+    GS::Array<API_ElementHotspot> sdkHotspots;
+    const GSErrCode hotspotsError = ACAPI_Element_GetHotspots (hostGuid, &sdkHotspots);
+    const Int64 hotspotCount = static_cast<Int64> (sdkHotspots.GetSize ());
+    if (hotspotsError != NoError) {
+        bool stoppedAfterGet = ArcHotspotStopped (processControl, started, cancelled);
+        if (stoppedAfterGet) {
+            return response ("partial", beforeState, notChecked, hostBeforeState, GS::ObjectState ("status", "not-read"),
+                GS::ObjectState ("status", "unverified-after-hotspot-api-error", "hostStable", false, "contextStable", false),
+                hotspotCount, false, false, cancelled ? "cancelled-after-hotspot-api-error" : "deadline-after-hotspot-api-error",
+                noHotspots, ArcHotspotError ("GET_HOTSPOTS_FAILED", "ACAPI_Element_GetHotspots failed before cooperative stop.", static_cast<Int32> (hotspotsError)));
+        }
+        RadialDefaultsContext after;
+        ReadRadialDefaultsContext (after);
+        const GS::ObjectState afterState = RadialDefaultsContextDetails (after);
+        const ArcHotspotHostSnapshot hostAfterSnapshot = ReadArcHotspotHost (hostGuid);
+        const GS::ObjectState hostAfterState = ArcHotspotHostDetails (hostAfterSnapshot);
+        const bool hostStable = SameArcHotspotHost (hostBeforeSnapshot, hostAfterSnapshot);
+        const bool contextStable = SameRadialDefaultsContext (before, after)
+            && IsExactTaskOwnedRadialDefaultsCopy (runId, expectedProjectPath, requestedFileScopeKey, after)
+            && after.activeStory == requestedStory;
+        return response ("unavailable", beforeState, afterState, hostBeforeState, hostAfterState,
+            ArcHotspotRecheckConsistency (hostBeforeSnapshot, hostAfterSnapshot, hostStable, contextStable, hostStable && contextStable),
+            hotspotCount, false, false, "hotspot-api-error", noHotspots,
+            ArcHotspotError ("GET_HOTSPOTS_FAILED", "ACAPI_Element_GetHotspots failed for the exact Arc GUID.", static_cast<Int32> (hotspotsError)));
+    }
+
+    if (static_cast<std::size_t> (sdkHotspots.GetSize ()) > MaxNativeArcHotspots) {
+        bool stoppedAfterGet = ArcHotspotStopped (processControl, started, cancelled);
+        if (stoppedAfterGet) {
+            return response ("partial", beforeState, notChecked, hostBeforeState, GS::ObjectState ("status", "not-read"),
+                GS::ObjectState ("status", "unverified-after-overflow"), hotspotCount, false, false,
+                cancelled ? "cancelled-after-overflow" : "deadline-after-overflow", noHotspots, ArcHotspotStoppedError (cancelled));
+        }
+        RadialDefaultsContext after;
+        ReadRadialDefaultsContext (after);
+        const GS::ObjectState afterState = RadialDefaultsContextDetails (after);
+        const ArcHotspotHostSnapshot hostAfterSnapshot = ReadArcHotspotHost (hostGuid);
+        const GS::ObjectState hostAfterState = ArcHotspotHostDetails (hostAfterSnapshot);
+        const bool hostStable = SameArcHotspotHost (hostBeforeSnapshot, hostAfterSnapshot);
+        const bool contextStable = SameRadialDefaultsContext (before, after)
+            && IsExactTaskOwnedRadialDefaultsCopy (runId, expectedProjectPath, requestedFileScopeKey, after)
+            && after.activeStory == requestedStory;
+        return response ("partial", beforeState, afterState, hostBeforeState, hostAfterState,
+            ArcHotspotRecheckConsistency (hostBeforeSnapshot, hostAfterSnapshot, hostStable, contextStable, hostStable && contextStable),
+            hotspotCount, false, false, "sdk-result-overflow-no-prefix-selected", noHotspots,
+            ArcHotspotError ("HOTSPOT_LIMIT_EXCEEDED", "The complete SDK result exceeds the fixed 32-hotspot diagnostic limit; no prefix was selected."));
+    }
+
+    GS::Array<GS::ObjectState> hotspotFacts;
+    bool allCoordinatesFinite = true;
+    bool conversionComplete = true;
+    bool cooperativelyStopped = false;
+    bool cooperativeCancelled = false;
+    for (UIndex index = 0; index < sdkHotspots.GetSize (); ++index) {
+        const API_Neig& returnedNeig = sdkHotspots[index].first;
+        const API_Coord3D& returnedCoordinate = sdkHotspots[index].second;
+        GS::ObjectState returnedCoordinateState;
+        const bool returnedCoordinateFinite = IsFiniteHotspotCoord (returnedCoordinate);
+        if (returnedCoordinateFinite) {
+            returnedCoordinateState = GS::ObjectState ("status", "available", "point", DimensionPoint3D (returnedCoordinate));
+        } else {
+            returnedCoordinateState = GS::ObjectState ("status", "unavailable-nonfinite-coordinate");
+            allCoordinatesFinite = false;
+        }
+
+        const char* skipReason = "none";
+        if (returnedNeig.neigID == APINeig_ArcOn) skipReason = "arc-on-neig-skipped-no-arc-on-synthesis";
+        else if (returnedNeig.neigID != APINeig_Arc) skipReason = "unsupported-neig-kind";
+        else if (returnedNeig.guid != hostGuid) skipReason = "returned-neig-guid-differs-from-exact-host";
+        else if (returnedNeig.flags != API_NeigFlg_Normal) skipReason = "unsupported-non-normal-floor-plan-flags";
+        else if (returnedNeig.elemPartType != APINeigElemPart_None) skipReason = "unsupported-element-part-kind";
+
+        const bool conversionEligible = std::strcmp (skipReason, "none") == 0;
+        GS::ObjectState conversionResult;
+        GS::ObjectState convertedNeigDetails ("status", "not-attempted");
+        GS::ObjectState convertedCoordinateDetails ("status", "not-attempted");
+        GS::ObjectState coordinateComparison (
+            "status", "not-attempted",
+            "tolerance", NativeArcHotspotCoordinateTolerance,
+            "toleranceUnit", "project-meter");
+
+        if (!returnedCoordinateFinite) {
+            conversionResult = GS::ObjectState ("status", "not-attempted", "reason", "returned-coordinate-nonfinite", "nativeErrorCode", static_cast<Int32> (NoError));
+            conversionComplete = false;
+        } else if (!conversionEligible) {
+            conversionResult = GS::ObjectState ("status", "skipped", "reason", skipReason);
+        } else if (cooperativelyStopped) {
+            conversionResult = GS::ObjectState (
+                "status", "not-attempted",
+                "reason", cooperativeCancelled ? "cooperative-cancelled" : "cooperative-deadline-reached",
+                "nativeErrorCode", static_cast<Int32> (NoError));
+            convertedNeigDetails = GS::ObjectState ("status", "not-returned");
+            convertedCoordinateDetails = GS::ObjectState ("status", "not-returned");
+            coordinateComparison = GS::ObjectState ("status", "not-attempted", "tolerance", NativeArcHotspotCoordinateTolerance, "toleranceUnit", "project-meter");
+            conversionComplete = false;
+        } else {
+            bool stoppedBeforeConversion = false;
+            if (ArcHotspotStopped (processControl, started, stoppedBeforeConversion)) {
+                cooperativelyStopped = true;
+                cooperativeCancelled = stoppedBeforeConversion;
+                conversionResult = GS::ObjectState (
+                    "status", "not-attempted",
+                    "reason", cooperativeCancelled ? "cooperative-cancelled" : "cooperative-deadline-reached",
+                    "nativeErrorCode", static_cast<Int32> (NoError));
+                convertedNeigDetails = GS::ObjectState ("status", "not-returned");
+                convertedCoordinateDetails = GS::ObjectState ("status", "not-returned");
+                coordinateComparison = GS::ObjectState ("status", "not-attempted", "tolerance", NativeArcHotspotCoordinateTolerance, "toleranceUnit", "project-meter");
+                conversionComplete = false;
+            } else {
+                API_Neig neigForConversion = returnedNeig;
+                API_Coord3D convertedCoordinate = {};
+#if TAPIR_AC_VERSION == 25
+                const GSErrCode conversionError = ACAPI_Goodies (APIAny_NeigToCoordID, &neigForConversion, &convertedCoordinate, nullptr);
+#else
+                const GSErrCode conversionError = ACAPI_Element_NeigToCoord (&neigForConversion, &convertedCoordinate, nullptr);
+#endif
+                convertedNeigDetails = GS::ObjectState ("status", "returned", "value", ArcHotspotNeigDetails (neigForConversion));
+                if (conversionError != NoError) {
+                    conversionResult = GS::ObjectState ("status", "error", "nativeErrorCode", static_cast<Int32> (conversionError));
+                    convertedCoordinateDetails = GS::ObjectState ("status", "unavailable-after-sdk-error");
+                    coordinateComparison = GS::ObjectState ("status", "unavailable-after-sdk-error", "tolerance", NativeArcHotspotCoordinateTolerance, "toleranceUnit", "project-meter");
+                    conversionComplete = false;
+                } else if (!IsFiniteHotspotCoord (convertedCoordinate)) {
+                    conversionResult = GS::ObjectState ("status", "error", "nativeErrorCode", static_cast<Int32> (NoError), "reason", "converted-coordinate-nonfinite");
+                    convertedCoordinateDetails = GS::ObjectState ("status", "unavailable-nonfinite-coordinate");
+                    coordinateComparison = GS::ObjectState ("status", "unavailable-nonfinite-coordinate", "tolerance", NativeArcHotspotCoordinateTolerance, "toleranceUnit", "project-meter");
+                    conversionComplete = false;
+                } else {
+                    conversionResult = GS::ObjectState ("status", "converted", "nativeErrorCode", static_cast<Int32> (NoError));
+                    convertedCoordinateDetails = GS::ObjectState ("status", "available", "point", DimensionPoint3D (convertedCoordinate));
+                    const double dx = convertedCoordinate.x - returnedCoordinate.x;
+                    const double dy = convertedCoordinate.y - returnedCoordinate.y;
+                    const double dz = convertedCoordinate.z - returnedCoordinate.z;
+                    const double distance = std::sqrt (dx * dx + dy * dy + dz * dz);
+                    const bool finiteDistance = std::isfinite (distance);
+                    coordinateComparison = finiteDistance
+                        ? GS::ObjectState (
+                            "status", distance <= NativeArcHotspotCoordinateTolerance ? "within-tolerance" : "difference-over-tolerance",
+                            "distance", distance,
+                            "distanceUnit", "project-meter",
+                            "tolerance", NativeArcHotspotCoordinateTolerance,
+                            "toleranceUnit", "project-meter")
+                        : GS::ObjectState ("status", "unavailable-nonfinite-distance", "tolerance", NativeArcHotspotCoordinateTolerance, "toleranceUnit", "project-meter");
+                    if (!finiteDistance) conversionComplete = false;
+                }
+            }
+        }
+
+        GS::ObjectState row (
+            "index", static_cast<Int32> (index),
+            "returnedNeig", ArcHotspotNeigDetails (returnedNeig),
+            "returnedCoordinate", returnedCoordinateState,
+            "eligibility", conversionEligible ? "eligible-arc-point-normal-same-host" : "skipped",
+            "skipReason", skipReason,
+            "conversion", conversionResult,
+            "convertedNeig", convertedNeigDetails,
+            "convertedCoordinate", convertedCoordinateDetails,
+            "coordinateComparison", coordinateComparison);
+        hotspotFacts.Push (row);
+    }
+
+    if (cooperativelyStopped) {
+        return response ("partial", beforeState, notChecked, hostBeforeState, GS::ObjectState ("status", "not-read"),
+            GS::ObjectState ("status", "unverified-after-cooperative-stop", "hostStable", false, "contextStable", false),
+            hotspotCount, false, false, cooperativeCancelled ? "cancelled-during-conversion" : "deadline-during-conversion",
+            hotspotFacts, ArcHotspotStoppedError (cooperativeCancelled));
+    }
+
+    bool stoppedBeforeFinalCheck = false;
+    if (ArcHotspotStopped (processControl, started, stoppedBeforeFinalCheck)) {
+        return response ("partial", beforeState, notChecked, hostBeforeState, GS::ObjectState ("status", "not-read"),
+            GS::ObjectState ("status", "unverified-before-final-recheck", "hostStable", false, "contextStable", false),
+            hotspotCount, false, conversionComplete, stoppedBeforeFinalCheck ? "cancelled-before-final-recheck" : "deadline-before-final-recheck",
+            hotspotFacts, ArcHotspotStoppedError (stoppedBeforeFinalCheck));
+    }
+
+    RadialDefaultsContext after;
+    ReadRadialDefaultsContext (after);
+    const GS::ObjectState afterState = RadialDefaultsContextDetails (after);
+    const ArcHotspotHostSnapshot hostAfterSnapshot = ReadArcHotspotHost (hostGuid);
+    const GS::ObjectState hostAfterState = ArcHotspotHostDetails (hostAfterSnapshot);
+    const bool hostStable = SameArcHotspotHost (hostBeforeSnapshot, hostAfterSnapshot);
+    const bool contextStable = SameRadialDefaultsContext (before, after)
+        && IsExactTaskOwnedRadialDefaultsCopy (runId, expectedProjectPath, requestedFileScopeKey, after)
+        && after.window.typeID == APIWind_FloorPlanID && after.database.typeID == APIWind_FloorPlanID
+        && after.activeStory == requestedStory;
+    const bool complete = hostStable && contextStable && allCoordinatesFinite;
+    const char* coverageReason = !hostStable
+        ? (hostAfterSnapshot.error != NoError ? "host-header-or-geometry-unavailable-during-recheck" : "host-guid-type-geometry-or-modification-stamp-changed")
+        : !contextStable
+            ? (!RadialDefaultsContextFactsAvailable (after) ? "saved-copy-floor-plan-database-or-story-unavailable-during-recheck" : "saved-copy-floor-plan-database-or-story-changed")
+            : !allCoordinatesFinite ? "sdk-returned-nonfinite-coordinate"
+            : "all-sdk-returned-hotspots-included";
+    const GS::ObjectState consistency = ArcHotspotRecheckConsistency (
+        hostBeforeSnapshot, hostAfterSnapshot, hostStable, contextStable, complete);
+    return response (complete ? "available" : "partial", beforeState, afterState, hostBeforeState, hostAfterState,
+        consistency, hotspotCount, complete, conversionComplete, coverageReason, hotspotFacts,
+        ArcHotspotNoError ());
+}
+
+namespace {
+
+constexpr std::size_t MaxDimensionDrawingPrimitives = 2048;
+constexpr std::size_t MaxDimensionDrawingTextRuns = 256;
+constexpr std::size_t MaxDimensionDrawingTextUnitsPerRun = 4096;
+constexpr std::size_t MaxDimensionDrawingTextUnitsPerParent = 65536;
+constexpr std::size_t MaxDimensionAutotextCandidates = 256;
+constexpr std::size_t MaxDimensionAutotextHostTypesPerCandidate = 64;
+constexpr auto NativeDimensionDrawingRunsBudget = std::chrono::milliseconds (5000);
+constexpr double NativeDimensionDrawingRunsGeometryTolerance = 1.0e-9;
+
+bool NativeDimensionDrawingRunsStopped (
+    GS::ProcessControl& processControl,
+    const std::chrono::steady_clock::time_point& started,
+    bool& cancelled);
+
+struct NativeDimensionDrawingTextRun {
+    std::size_t primitiveOrdinal = 0;
+    std::size_t textRunOrdinal = 0;
+    API_PrimText primitive = {};
+    NativeDimensionUtf16::CopyResult copiedText;
+    bool finiteGeometry = true;
+};
+
+struct NativeDimensionDrawingRunsCallbackContext {
+    std::size_t primitiveCount = 0;
+    std::size_t textRunCount = 0;
+    std::size_t textUnits = 0;
+    std::array<std::size_t, 256> primitiveTypeCounts = {};
+    std::vector<NativeDimensionDrawingTextRun> textRuns;
+    bool primitiveLimitExceeded = false;
+    bool textRunLimitExceeded = false;
+    bool textUnitLimitExceeded = false;
+    bool unsupportedPrimitiveType = false;
+    bool allocationFailed = false;
+    bool malformedUnicode = false;
+    bool missingUnicode = false;
+    bool invalidGeometry = false;
+};
+
+thread_local NativeDimensionDrawingRunsCallbackContext* tl_nativeDimensionDrawingRunsCallback = nullptr;
+std::atomic_flag tl_nativeDimensionDrawingRunsActive = ATOMIC_FLAG_INIT;
+
+GSErrCode CollectNativeDimensionDrawingRuns (
+    const API_PrimElement* primitive,
+    const void* /*par1*/,
+    const void* par2,
+    const void* /*par3*/)
+{
+    NativeDimensionDrawingRunsCallbackContext* context = tl_nativeDimensionDrawingRunsCallback;
+    if (context == nullptr || primitive == nullptr)
+        return APIERR_GENERAL;
+
+    try {
+        if (context->primitiveCount >= MaxDimensionDrawingPrimitives) {
+            context->primitiveLimitExceeded = true;
+            return APIERR_MEMFULL;
+        }
+        const std::size_t primitiveOrdinal = context->primitiveCount++;
+        const Int32 primitiveType = static_cast<Int32> (primitive->header.typeID);
+        if (primitiveType < 0 || static_cast<std::size_t> (primitiveType) >= context->primitiveTypeCounts.size ()) {
+            context->unsupportedPrimitiveType = true;
+            return APIERR_BADPARS;
+        }
+        ++context->primitiveTypeCounts[static_cast<std::size_t> (primitiveType)];
+        if (primitive->header.typeID != API_PrimTextID)
+            return NoError;
+
+        const std::size_t textRunOrdinal = context->textRunCount++;
+        if (textRunOrdinal >= MaxDimensionDrawingTextRuns) {
+            context->textRunLimitExceeded = true;
+            return APIERR_MEMFULL;
+        }
+
+        NativeDimensionDrawingTextRun run;
+        run.primitiveOrdinal = primitiveOrdinal;
+        run.textRunOrdinal = textRunOrdinal;
+        run.primitive = primitive->text;
+        run.finiteGeometry = std::isfinite (run.primitive.loc.x) && std::isfinite (run.primitive.loc.y)
+            && std::isfinite (run.primitive.heightMM) && std::isfinite (run.primitive.widthMM)
+            && std::isfinite (run.primitive.angle) && std::isfinite (run.primitive.widthFactor)
+            && std::isfinite (run.primitive.charSpaceFactor);
+        context->invalidGeometry = context->invalidGeometry || !run.finiteGeometry;
+
+        run.copiedText = NativeDimensionUtf16::CopyCallbackBuffer (
+            static_cast<const unsigned short*> (par2), MaxDimensionDrawingTextUnitsPerRun);
+        if (run.copiedText.status == NativeDimensionUtf16::CopyStatus::NullBuffer)
+            context->missingUnicode = true;
+        if (run.copiedText.status == NativeDimensionUtf16::CopyStatus::MalformedSurrogates)
+            context->malformedUnicode = true;
+        if (run.copiedText.status == NativeDimensionUtf16::CopyStatus::Available || run.copiedText.status == NativeDimensionUtf16::CopyStatus::Empty) {
+            if (run.copiedText.units.size () > MaxDimensionDrawingTextUnitsPerParent - context->textUnits) {
+                run.copiedText.units.clear ();
+                run.copiedText.status = NativeDimensionUtf16::CopyStatus::OverLimit;
+                context->textUnitLimitExceeded = true;
+            }
+        }
+        if (run.copiedText.status == NativeDimensionUtf16::CopyStatus::OverLimit)
+            context->textUnitLimitExceeded = true;
+        if (run.copiedText.status == NativeDimensionUtf16::CopyStatus::AllocationFailure) {
+            context->allocationFailed = true;
+            return APIERR_MEMFULL;
+        }
+        const std::size_t acceptedUnits = run.copiedText.status == NativeDimensionUtf16::CopyStatus::Available
+            ? run.copiedText.units.size () : 0;
+        context->textRuns.push_back (std::move (run));
+        context->textUnits += acceptedUnits;
+        return context->textUnitLimitExceeded ? APIERR_MEMFULL : NoError;
+    } catch (...) {
+        context->allocationFailed = true;
+        return APIERR_MEMFULL;
+    }
+}
+
+const char* DimensionDrawingUtf16Status (const NativeDimensionUtf16::CopyStatus status)
+{
+    switch (status) {
+        case NativeDimensionUtf16::CopyStatus::Available: return "available";
+        case NativeDimensionUtf16::CopyStatus::Empty: return "empty";
+        case NativeDimensionUtf16::CopyStatus::NullBuffer: return "unavailable-null-unicode-buffer";
+        case NativeDimensionUtf16::CopyStatus::OverLimit: return "incomplete-unit-limit-exceeded-no-prefix";
+        case NativeDimensionUtf16::CopyStatus::MalformedSurrogates: return "unavailable-malformed-utf16";
+        case NativeDimensionUtf16::CopyStatus::AllocationFailure: return "unavailable-allocation-failure";
+        case NativeDimensionUtf16::CopyStatus::InvalidLimit: return "unavailable-invalid-copy-limit";
+    }
+    return "unavailable-unknown-copy-status";
+}
+
+GS::UniString DimensionDrawingTextFromUnits (const std::vector<std::uint16_t>& units)
+{
+    static_assert (sizeof (GS::UniChar::Layout) == sizeof (std::uint16_t), "GS Unicode layout must be 16-bit.");
+    GS::UniString result;
+    if (!units.empty ())
+        result.Assign (reinterpret_cast<const GS::UniChar::Layout*> (units.data ()), static_cast<USize> (units.size ()));
+    return result;
+}
+
+GS::ObjectState NativeDimensionDrawingTextRunDetails (const NativeDimensionDrawingTextRun& run)
+{
+    GS::ObjectState result (
+        "primitiveOrdinal", static_cast<Int32> (run.primitiveOrdinal),
+        "textRunOrdinal", static_cast<Int32> (run.textRunOrdinal),
+        "textStatus", DimensionDrawingUtf16Status (run.copiedText.status),
+        "observedCodeUnits", static_cast<Int32> (run.copiedText.observedUnits),
+        "geometryStatus", run.finiteGeometry ? "available" : "unavailable-nonfinite-geometry");
+    if (run.copiedText.status == NativeDimensionUtf16::CopyStatus::Available
+        || run.copiedText.status == NativeDimensionUtf16::CopyStatus::Empty) {
+        result.Add ("content", DimensionDrawingTextFromUnits (run.copiedText.units));
+        result.Add ("contentUnit", "utf16-code-unit-sequence");
+    }
+    if (run.finiteGeometry) {
+        result.Add ("drawingFacts", GS::ObjectState (
+            "ind1", static_cast<Int32> (run.primitive.ind1),
+            "ind2", static_cast<Int32> (run.primitive.ind2),
+            "paramInd", static_cast<Int32> (run.primitive.paramInd),
+            "fontIndex", static_cast<Int32> (run.primitive.font),
+            "faceBits", static_cast<Int32> (run.primitive.faceBits),
+            "effectBits", static_cast<Int32> (run.primitive.effectBits),
+            "protectedAutotextReferenceEffect", (run.primitive.effectBits & APIEffect_Protected) != 0,
+            "anchor", static_cast<Int32> (run.primitive.anchor),
+            "justification", static_cast<Int32> (run.primitive.just),
+            "location", Create2DCoordinateObjectState (run.primitive.loc),
+            "locationUnit", "project-meter",
+            "height", run.primitive.heightMM,
+            "heightUnit", "millimeter-paper-size",
+            "width", run.primitive.widthMM,
+            "widthUnit", "millimeter-paper-size",
+            "angle", run.primitive.angle,
+            "angleUnit", "radian",
+            "widthFactor", run.primitive.widthFactor,
+            "characterSpacingFactor", run.primitive.charSpaceFactor));
+    }
+    return result;
+}
+
+GS::ObjectState NativeDimensionDrawingRunsDetails (const NativeDimensionDrawingRunsCallbackContext& context, const GSErrCode sdkError)
+{
+    const bool complete = sdkError == NoError && !context.primitiveLimitExceeded && !context.textRunLimitExceeded
+        && !context.textUnitLimitExceeded && !context.unsupportedPrimitiveType && !context.allocationFailed
+        && !context.malformedUnicode && !context.missingUnicode && !context.invalidGeometry;
+    const char* reason = complete ? "all-returned-text-primitives-copied-and-validated"
+        : context.primitiveLimitExceeded ? "primitive-count-limit-exceeded-no-prefix"
+        : context.textRunLimitExceeded ? "text-run-count-limit-exceeded-no-prefix"
+        : context.textUnitLimitExceeded ? "utf16-unit-limit-exceeded-no-prefix"
+        : context.allocationFailed ? "bounded-copy-allocation-failed"
+        : context.unsupportedPrimitiveType ? "unsupported-primitive-type-id"
+        : context.malformedUnicode ? "malformed-utf16-in-returned-text"
+        : context.missingUnicode ? "one-or-more-text-primitives-had-no-unicode-buffer"
+        : context.invalidGeometry ? "nonfinite-text-primitive-geometry"
+        : "shape-primitives-sdk-call-failed";
+    GS::ObjectState result (
+        "status", complete ? "complete" : "partial",
+        "complete", complete,
+        "coverageReason", reason,
+        "primitiveCount", static_cast<Int32> (context.primitiveCount),
+        "textRunCount", static_cast<Int32> (context.textRunCount),
+        "textRunCountIncluded", static_cast<Int32> (context.textRuns.size ()),
+        "utf16CodeUnitsCopied", static_cast<Int32> (context.textUnits),
+        "drawingCallStatus", sdkError == NoError ? "success" : "error",
+        "drawingCallErrorCode", static_cast<Int32> (sdkError),
+        "limits", GS::ObjectState (
+            "primitiveCount", static_cast<Int32> (MaxDimensionDrawingPrimitives),
+            "textRuns", static_cast<Int32> (MaxDimensionDrawingTextRuns),
+            "codeUnitsPerRun", static_cast<Int32> (MaxDimensionDrawingTextUnitsPerRun),
+            "codeUnitsPerParent", static_cast<Int32> (MaxDimensionDrawingTextUnitsPerParent)),
+        "allStories", false,
+        "dontClip", true,
+        "meaning", "parent-correlated-ShapesPrimsExt-text-runs-not-note-source-or-observed-dimension-display");
+    const auto& typeCounts = result.AddList<GS::ObjectState> ("primitiveTypeCounts");
+    for (std::size_t type = 0; type < context.primitiveTypeCounts.size (); ++type) {
+        if (context.primitiveTypeCounts[type] > 0)
+            typeCounts (GS::ObjectState ("primitiveTypeId", static_cast<Int32> (type), "count", static_cast<Int32> (context.primitiveTypeCounts[type])));
+    }
+    const auto& runs = result.AddList<GS::ObjectState> ("textRuns");
+    for (const NativeDimensionDrawingTextRun& run : context.textRuns)
+        runs (NativeDimensionDrawingTextRunDetails (run));
+    return result;
+}
+
+GS::ObjectState NativeDimensionAutotextMetadataUnavailable (const char* status, const char* reason, const Int32 errorCode = 0)
+{
+    GS::ObjectState result (
+        "status", status,
+        "meaning", "evaluable-autotext-candidate-catalog-only-not-used-token-or-note-source-proof",
+        "coverageReason", reason,
+        "candidateCount", 0,
+        "keywords", GS::Array<GS::ObjectState> ());
+    if (errorCode != 0) result.Add ("nativeErrorCode", errorCode);
+    return result;
+}
+
+GS::ObjectState ReadNativeDimensionAutotextCandidates (
+    const API_ElemTypeID ownerType,
+    const bool hasAppearance,
+    const Int32 appearanceValue,
+    GS::ProcessControl& processControl,
+    const std::chrono::steady_clock::time_point& started,
+    bool& stopped)
+{
+#if TAPIR_AC_VERSION < 26
+    (void) ownerType;
+    (void) hasAppearance;
+    (void) appearanceValue;
+    (void) processControl;
+    (void) started;
+    stopped = false;
+    return NativeDimensionAutotextMetadataUnavailable ("unavailable", "autotext-metadata-api-not-available-in-ac25");
+#else
+    stopped = false;
+    if ((ownerType == API_DimensionID) != hasAppearance || (hasAppearance && (appearanceValue < APIApp_Normal || appearanceValue > APIApp_Elev)))
+        return NativeDimensionAutotextMetadataUnavailable ("unavailable", "fresh-parent-appearance-or-family-facts-invalid", APIERR_BADPARS);
+
+    API_ElemType owner = {};
+    owner.typeID = ownerType;
+    owner.variationID = APIVarId_Generic;
+    GS::Optional<API_AppearID> appearance;
+    if (hasAppearance) appearance = static_cast<API_AppearID> (appearanceValue);
+    std::unordered_map<API_NoteAutotextID, std::unordered_set<API_ElemType>> candidates;
+    const GSErrCode catalogError = ACAPI_AutoText_GetNoteAutotexts (owner, candidates, appearance);
+    if (catalogError != NoError)
+        return NativeDimensionAutotextMetadataUnavailable ("unavailable", "autotext-candidate-catalog-api-failed", static_cast<Int32> (catalogError));
+
+    if (candidates.size () > MaxDimensionAutotextCandidates)
+        return GS::ObjectState (
+            "status", "partial",
+            "meaning", "evaluable-autotext-candidate-catalog-only-not-used-token-or-note-source-proof",
+            "coverageReason", "autotext-candidate-count-limit-exceeded-no-prefix",
+            "candidateCount", static_cast<Int32> (candidates.size ()),
+            "candidateLimit", static_cast<Int32> (MaxDimensionAutotextCandidates),
+            "keywords", GS::Array<GS::ObjectState> ());
+    for (const auto& candidate : candidates) {
+        if (candidate.second.size () > MaxDimensionAutotextHostTypesPerCandidate)
+            return GS::ObjectState (
+                "status", "partial",
+                "meaning", "evaluable-autotext-candidate-catalog-only-not-used-token-or-note-source-proof",
+                "coverageReason", "autotext-host-type-set-limit-exceeded-no-prefix",
+                "candidateCount", static_cast<Int32> (candidates.size ()),
+                "hostTypesPerCandidateLimit", static_cast<Int32> (MaxDimensionAutotextHostTypesPerCandidate),
+                "keywords", GS::Array<GS::ObjectState> ());
+    }
+
+    struct KeywordEntry {
+        Int32 id = 0;
+        GS::UniString keyword;
+        GS::Array<GS::ObjectState> hostTypes;
+        bool general = false;
+        bool notRead = false;
+        GSErrCode error = NoError;
+    };
+    std::vector<KeywordEntry> ordered;
+    try {
+        ordered.reserve (candidates.size ());
+        for (const auto& candidate : candidates) {
+            KeywordEntry entry;
+            entry.id = static_cast<Int32> (candidate.first);
+            entry.general = candidate.second.empty ();
+            std::vector<API_ElemType> hostTypes (candidate.second.begin (), candidate.second.end ());
+            std::sort (hostTypes.begin (), hostTypes.end (), [] (const API_ElemType& left, const API_ElemType& right) {
+                if (left.typeID != right.typeID) return left.typeID < right.typeID;
+                if (left.variationID != right.variationID) return left.variationID < right.variationID;
+                return FixtureUtf8 (APIGuidToString (left.classID)) < FixtureUtf8 (APIGuidToString (right.classID));
+            });
+            for (const API_ElemType& hostType : hostTypes) {
+                entry.hostTypes.Push (GS::ObjectState (
+                    "typeId", static_cast<Int32> (hostType.typeID),
+                    "variationId", static_cast<Int32> (hostType.variationID),
+                    "classId", CreateGuidObjectState (hostType.classID)));
+            }
+            bool cancelled = false;
+            if (NativeDimensionDrawingRunsStopped (processControl, started, cancelled)) {
+                stopped = true;
+                entry.notRead = true;
+            } else {
+                entry.error = ACAPI_AutoText_GetNoteKeywordForAutotextID (candidate.first, entry.keyword);
+            }
+            ordered.push_back (std::move (entry));
+        }
+    } catch (...) {
+        return GS::ObjectState (
+            "status", "partial",
+            "meaning", "evaluable-autotext-candidate-catalog-only-not-used-token-or-note-source-proof",
+            "coverageReason", "bounded-autotext-catalog-allocation-failed-no-prefix",
+            "candidateCount", static_cast<Int32> (candidates.size ()),
+            "keywords", GS::Array<GS::ObjectState> ());
+    }
+    std::sort (ordered.begin (), ordered.end (), [] (const KeywordEntry& left, const KeywordEntry& right) { return left.id < right.id; });
+
+    std::size_t totalKeywordUnits = 0;
+    bool anyKeywordError = false;
+    bool anyKeywordNotRead = false;
+    std::map<std::string, std::size_t> keywordCounts;
+    for (const KeywordEntry& entry : ordered) {
+        if (entry.notRead) { anyKeywordNotRead = true; continue; }
+        if (entry.error != NoError) { anyKeywordError = true; continue; }
+        const std::size_t unitCount = static_cast<std::size_t> (entry.keyword.GetLength ());
+        if (unitCount > MaxDimensionDrawingTextUnitsPerRun || unitCount > MaxDimensionDrawingTextUnitsPerParent - totalKeywordUnits)
+            return GS::ObjectState (
+                "status", "partial",
+                "meaning", "evaluable-autotext-candidate-catalog-only-not-used-token-or-note-source-proof",
+                "coverageReason", "autotext-keyword-unicode-unit-limit-exceeded-no-prefix",
+                "candidateCount", static_cast<Int32> (ordered.size ()),
+                "keywordUnitsPerCandidateLimit", static_cast<Int32> (MaxDimensionDrawingTextUnitsPerRun),
+                "keywordUnitsTotalLimit", static_cast<Int32> (MaxDimensionDrawingTextUnitsPerParent),
+                "keywords", GS::Array<GS::ObjectState> ());
+        totalKeywordUnits += unitCount;
+        ++keywordCounts[FixtureUtf8 (entry.keyword)];
+    }
+    GS::ObjectState result (
+        "status", anyKeywordError || anyKeywordNotRead ? "partial" : "available",
+        "meaning", "evaluable-autotext-candidate-catalog-only-not-used-token-or-note-source-proof",
+        "coverageReason", stopped ? "cooperative-cancelled-or-deadline-between-keyword-lookups" : anyKeywordError ? "one-or-more-keyword-lookups-failed" : "complete-candidate-catalog-returned",
+        "ownerNativeTypeId", static_cast<Int32> (ownerType),
+        "appearanceStatus", hasAppearance ? "available" : "not-applicable-to-this-dimension-family",
+        "candidateCount", static_cast<Int32> (ordered.size ()),
+        "keywordUnitsTotal", static_cast<Int32> (totalKeywordUnits),
+        "hostTypesPerCandidateLimit", static_cast<Int32> (MaxDimensionAutotextHostTypesPerCandidate));
+    if (hasAppearance) result.Add ("appearance", appearanceValue);
+    const auto& keywords = result.AddList<GS::ObjectState> ("keywords");
+    for (const KeywordEntry& entry : ordered) {
+        const bool lookupSucceeded = entry.error == NoError;
+        GS::ObjectState item (
+            "autotextId", entry.id,
+            "keywordStatus", entry.notRead ? "not-read" : lookupSucceeded ? "available" : "unavailable",
+            "generallyEvaluable", entry.general,
+            "evaluableForElementTypes", entry.hostTypes,
+            "keywordCollision", lookupSucceeded && keywordCounts[FixtureUtf8 (entry.keyword)] > 1);
+        if (!entry.notRead && lookupSucceeded) item.Add ("keyword", entry.keyword);
+        else if (!entry.notRead) item.Add ("nativeErrorCode", static_cast<Int32> (entry.error));
+        keywords (item);
+    }
+    return result;
+#endif
+}
+
+struct NativeDimensionDrawingParentFacts {
+    bool valid = false;
+    bool supported = false;
+    bool hasGuid = false;
+    bool hasNativeType = false;
+    bool hasVariation = false;
+    bool hasStory = false;
+    bool hasDatabase = false;
+    bool hasStamp = false;
+    bool hasGeometry = false;
+    bool hasFingerprint = false;
+    GS::UniString elementType;
+    GS::UniString guid;
+    GS::UniString databaseGuid;
+    GS::UniString fingerprint;
+    Int32 nativeTypeId = 0;
+    Int32 variationId = 0;
+    Int32 nativeErrorCode = 0;
+    Int32 storyIndex = -1;
+    Int64 modificationStamp = 0;
+    Int32 appearance = -1;
+    bool hasAppearance = false;
+    GS::ObjectState facts;
+    const char* errorReason = "exact-parent-read-unavailable";
+};
+
+GS::ObjectState NativeDimensionDrawingParentFactsDetails (const NativeDimensionDrawingParentFacts& facts)
+{
+    return facts.facts.GetFieldNames ().GetSize () > 0
+        ? facts.facts
+        : GS::ObjectState ("status", "unavailable", "reason", facts.errorReason);
+}
+
+NativeDimensionDrawingParentFacts ReadNativeDimensionDrawingParentFacts (const API_Guid& requestedGuid, GS::ProcessControl& processControl)
+{
+    GS::Array<GS::UniString> guids;
+    guids.Push (APIGuidToString (requestedGuid));
+    const GS::ObjectState response = GetNativeDimensionDetailsCommand ().Execute (
+        GS::ObjectState ("guids", guids), processControl);
+    GS::Array<GS::ObjectState> rows;
+    if (!response.Get ("elements", rows) || rows.GetSize () != 1) {
+        NativeDimensionDrawingParentFacts facts;
+        facts.errorReason = "exact-parent-reader-returned-no-single-row";
+        return facts;
+    }
+
+    const GS::ObjectState& row = rows[0];
+    NativeDimensionDrawingParentFacts facts;
+    GS::UniString status;
+    const bool rowReadSucceeded = row.Get ("status", status) && status == "success";
+    if (!row.Get ("elementType", facts.elementType) || !row.Get ("nativeElementTypeId", facts.nativeTypeId)) {
+        facts.errorReason = "exact-element-type-read-unavailable";
+        return facts;
+    }
+    facts.hasNativeType = true;
+    const GS::ObjectState* elementId = row.Get ("elementId");
+    GS::UniString parentGuid;
+    if (elementId == nullptr || !elementId->Get ("guid", parentGuid)) {
+        facts.errorReason = "exact-parent-reader-element-guid-unavailable";
+        return facts;
+    }
+    const API_Guid parsedParentGuid = APIGuidFromString (parentGuid.ToCStr ());
+    if (parsedParentGuid != requestedGuid) {
+        facts.errorReason = "exact-parent-reader-returned-a-different-guid";
+        return facts;
+    }
+    facts.guid = parentGuid;
+    facts.hasGuid = true;
+    const API_ElemTypeID nativeType = static_cast<API_ElemTypeID> (facts.nativeTypeId);
+    facts.supported = nativeType == API_DimensionID || nativeType == API_RadialDimensionID
+        || nativeType == API_AngleDimensionID || nativeType == API_LevelDimensionID;
+    GS::ObjectState observedFacts (
+        "elementType", facts.elementType,
+        "nativeElementTypeId", facts.nativeTypeId,
+        "elementId", CreateGuidObjectState (requestedGuid));
+    Int32 variationId = 0;
+    if (row.Get ("elementVariationId", variationId)) {
+        facts.variationId = variationId;
+        facts.hasVariation = true;
+        observedFacts.Add ("elementVariationId", variationId);
+    }
+    if (!facts.supported) {
+        facts.errorReason = "exact-guid-is-not-a-supported-dimension-family";
+        facts.facts = observedFacts;
+        return facts;
+    }
+
+    facts.hasStory = row.Get ("storyIndex", facts.storyIndex);
+    facts.hasStamp = row.Get ("modificationStamp", facts.modificationStamp);
+    const GS::ObjectState* database = row.Get ("database");
+    GS::UniString databaseStatus;
+    const GS::ObjectState* databaseId = database == nullptr ? nullptr : database->Get ("databaseId");
+    facts.hasDatabase = database != nullptr && database->Get ("status", databaseStatus)
+        && databaseStatus == "available" && databaseId != nullptr
+        && databaseId->Get ("guid", facts.databaseGuid) && !facts.databaseGuid.IsEmpty ();
+    if (facts.hasStory) observedFacts.Add ("storyIndex", facts.storyIndex);
+    if (facts.hasDatabase) observedFacts.Add ("databaseId", CreateGuidObjectState (APIGuidFromString (facts.databaseGuid.ToCStr ())));
+    if (facts.hasStamp) observedFacts.Add ("modificationStamp", facts.modificationStamp);
+    bool hasNativeErrorCode = row.Get ("errorCode", facts.nativeErrorCode);
+    if (!hasNativeErrorCode) {
+        const GS::ObjectState* memo = row.Get ("memo");
+        hasNativeErrorCode = memo != nullptr && memo->Get ("errorCode", facts.nativeErrorCode);
+    }
+    if (hasNativeErrorCode) observedFacts.Add ("nativeErrorCode", facts.nativeErrorCode);
+
+    if (nativeType == API_DimensionID) {
+        const GS::ObjectState* geometry = row.Get ("geometryAndSettings");
+        if (geometry == nullptr || !geometry->Get ("appearance", facts.appearance)) {
+            facts.errorReason = "linear-parent-appearance-unavailable-for-candidate-metadata";
+            facts.facts = observedFacts;
+            return facts;
+        }
+        facts.hasAppearance = true;
+    }
+    const GS::ObjectState* geometry = row.Get ("geometryAndSettings");
+    facts.hasGeometry = geometry != nullptr;
+    if (facts.hasGeometry) observedFacts.Add ("geometryAndSettings", *geometry);
+    facts.hasFingerprint = row.Get ("fingerprint", facts.fingerprint) && !facts.fingerprint.IsEmpty ();
+    if (facts.hasFingerprint) observedFacts.Add ("factualFingerprint", facts.fingerprint);
+    facts.facts = observedFacts;
+    if (!rowReadSucceeded) {
+        facts.errorReason = facts.hasDatabase && facts.hasStory && facts.hasStamp
+            ? "exact-parent-reader-returned-a-partial-or-error-row"
+            : "exact-parent-reader-returned-an-error-row-with-incomplete-identity";
+        return facts;
+    }
+    if (!facts.hasStory || !facts.hasStamp || !facts.hasDatabase || geometry == nullptr || !facts.hasFingerprint || !facts.hasVariation) {
+        facts.errorReason = "exact-parent-reader-omitted-required-identity-or-fingerprint";
+        return facts;
+    }
+    const GS::ObjectState* consistency = row.Get ("readConsistency");
+    GS::UniString consistencyStatus;
+    if (consistency == nullptr || !consistency->Get ("status", consistencyStatus)
+        || consistencyStatus != "same-guid-type-and-modification-stamp-through-memo-read") {
+        facts.errorReason = "exact-parent-facts-were-not-a-coherent-native-read";
+        return facts;
+    }
+
+    facts.valid = true;
+    return facts;
+}
+
+bool SameNativeDimensionDrawingParentFacts (const NativeDimensionDrawingParentFacts& before, const NativeDimensionDrawingParentFacts& after)
+{
+    return before.valid && after.valid && before.supported && after.supported
+        && before.guid == after.guid && before.elementType == after.elementType
+        && before.nativeTypeId == after.nativeTypeId && before.variationId == after.variationId && before.storyIndex == after.storyIndex
+        && before.databaseGuid == after.databaseGuid && before.modificationStamp == after.modificationStamp
+        && before.fingerprint == after.fingerprint;
+}
+
+GS::ObjectState NativeDimensionDrawingParentNotRead (const char* reason)
+{
+    return GS::ObjectState (
+        "status", "not-read",
+        "coverageReason", reason,
+        "meaning", "no-parent-drawing-or-autotext-facts-were-read");
+}
+
+GS::ObjectState NativeDimensionDrawingRunsResponse (
+    const char* status,
+    const GS::UniString& runId,
+    const GS::UniString& requestedProjectPath,
+    const GS::UniString& fileScopeKey,
+    const Int32 requestedStory,
+    const GS::ObjectState& contextBefore,
+    const GS::ObjectState& contextAfter,
+    const GS::ObjectState& consistency,
+    const GS::Array<GS::ObjectState>& rows,
+    const GS::ObjectState& error,
+    const GS::Array<GS::UniString>& parentGuids = GS::Array<GS::UniString> ())
+{
+    GS::Array<GS::ObjectState> requestParents;
+    for (const GS::UniString& guid : parentGuids)
+        requestParents.Push (GS::ObjectState ("elementId", GS::ObjectState ("guid", guid)));
+    return GS::ObjectState (
+        "schemaVersion", "native-dimension-parent-drawing-runs/v1",
+        "archicadMajor", TAPIR_AC_VERSION,
+        "status", status,
+        "meaning", "read-only-parent-correlated-drawing-text-and-candidate-autotext-metadata-not-note-source-or-display-proof",
+        "request", GS::ObjectState (
+            "schemaVersion", "native-dimension-parent-drawing-runs-request/v1",
+            "runId", runId,
+            "expectedProjectPath", requestedProjectPath,
+            "fileScopeKey", fileScopeKey,
+            "storyIndex", requestedStory,
+            "elements", requestParents),
+        "contextBefore", contextBefore,
+        "contextAfter", contextAfter,
+        "readConsistency", consistency,
+        "elements", rows,
+        "error", error);
+}
+
+bool NativeDimensionDrawingRunsStopped (GS::ProcessControl& processControl, const std::chrono::steady_clock::time_point& started, bool& cancelled)
+{
+    cancelled = processControl.TestBreak ();
+    return cancelled || std::chrono::steady_clock::now () - started >= NativeDimensionDrawingRunsBudget;
+}
+
+} // namespace
+
+GetNativeDimensionParentDrawingRunsCommand::GetNativeDimensionParentDrawingRunsCommand () : CommandBase (CommonSchema::NotUsed) {}
+GS::String GetNativeDimensionParentDrawingRunsCommand::GetName () const { return "GetNativeDimensionParentDrawingRuns"; }
+GS::Optional<GS::UniString> GetNativeDimensionParentDrawingRunsCommand::GetInputParametersSchema () const
+{
+    return R"({"type":"object","properties":{"schemaVersion":{"type":"string","enum":["native-dimension-parent-drawing-runs-request/v1"]},"runId":{"type":"string","pattern":"^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$"},"expectedProjectPath":{"type":"string","minLength":1,"maxLength":1024},"fileScopeKey":{"type":"string","minLength":1,"maxLength":1100},"storyIndex":{"type":"integer","minimum":-32768,"maximum":32767},"elements":{"type":"array","minItems":1,"maxItems":10,"items":{"type":"object","properties":{"elementId":{"type":"object","properties":{"guid":{"type":"string","format":"uuid"}},"required":["guid"],"additionalProperties":false}},"required":["elementId"],"additionalProperties":false}}},"required":["schemaVersion","runId","expectedProjectPath","fileScopeKey","storyIndex","elements"],"additionalProperties":false})";
+}
+GS::Optional<GS::UniString> GetNativeDimensionParentDrawingRunsCommand::GetResponseSchema () const { return {}; }
+GS::ObjectState GetNativeDimensionParentDrawingRunsCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const
+{
+    GS::UniString schemaVersion, runId, expectedProjectPath, fileScopeKey;
+    Int32 requestedStory = -1;
+    GS::Array<GS::ObjectState> requested;
+    const GS::HashSet<GS::String> names = parameters.GetFieldNames ();
+    const bool exactFields = names.GetSize () == 6
+        && parameters.Get ("schemaVersion", schemaVersion) && parameters.Get ("runId", runId)
+        && parameters.Get ("expectedProjectPath", expectedProjectPath) && parameters.Get ("fileScopeKey", fileScopeKey)
+        && parameters.Get ("storyIndex", requestedStory) && parameters.Get ("elements", requested);
+
+    GS::Array<GS::ObjectState> rows;
+    GS::ObjectState contextNotRead ("status", "not-read");
+    const GS::ObjectState errorNotChecked ("status", "none");
+    if (!exactFields || schemaVersion != "native-dimension-parent-drawing-runs-request/v1"
+        || runId.IsEmpty () || FixtureUtf8 (runId).size () > 48
+        || expectedProjectPath.IsEmpty () || FixtureUtf8 (expectedProjectPath).size () > 1024
+        || fileScopeKey.IsEmpty () || FixtureUtf8 (fileScopeKey).size () > 1100
+        || requestedStory < std::numeric_limits<short>::min () || requestedStory > std::numeric_limits<short>::max ()
+        || requested.GetSize () < 1 || requested.GetSize () > 10) {
+        return NativeDimensionDrawingRunsResponse (
+            "refused", runId, expectedProjectPath, fileScopeKey, requestedStory,
+            contextNotRead, contextNotRead,
+            GS::ObjectState ("status", "not-checked", "contextStable", false, "reason", "invalid-closed-request"), rows,
+            GS::ObjectState ("status", "present", "code", "INVALID_REQUEST", "message", "Requires the closed request schema and one to ten exact dimension GUIDs."));
+    }
+    const std::string runIdUtf8 = FixtureUtf8 (runId);
+    if (!std::all_of (runIdUtf8.begin (), runIdUtf8.end (), [] (unsigned char value) { return std::isalnum (value) || value == '_' || value == '-'; })) {
+        return NativeDimensionDrawingRunsResponse (
+            "refused", runId, expectedProjectPath, fileScopeKey, requestedStory,
+            contextNotRead, contextNotRead,
+            GS::ObjectState ("status", "not-checked", "contextStable", false, "reason", "invalid-run-id"), rows, errorNotChecked);
+    }
+
+    GS::Array<API_Guid> guids;
+    GS::Array<GS::UniString> normalizedGuids;
+    GS::HashSet<API_Guid> seen;
+    for (const GS::ObjectState& item : requested) {
+        const GS::HashSet<GS::String> itemFields = item.GetFieldNames ();
+        const GS::ObjectState* elementId = item.Get ("elementId");
+        GS::UniString guidText;
+        if (itemFields.GetSize () != 1 || elementId == nullptr || item.GetFieldNames ().Contains ("guid")
+            || elementId->GetFieldNames ().GetSize () != 1 || !elementId->Get ("guid", guidText)) {
+            return NativeDimensionDrawingRunsResponse (
+                "refused", runId, expectedProjectPath, fileScopeKey, requestedStory,
+                contextNotRead, contextNotRead,
+                GS::ObjectState ("status", "not-checked", "contextStable", false, "reason", "invalid-exact-parent-selector"), rows,
+                GS::ObjectState ("status", "present", "code", "INVALID_PARENT_SELECTOR", "message", "Each parent selector must contain only elementId.guid."));
+        }
+        const API_Guid guid = APIGuidFromString (guidText.ToCStr ());
+        if (guid == APINULLGuid || seen.Contains (guid)) {
+            return NativeDimensionDrawingRunsResponse (
+                "refused", runId, expectedProjectPath, fileScopeKey, requestedStory,
+                contextNotRead, contextNotRead,
+                GS::ObjectState ("status", "not-checked", "contextStable", false, "reason", "invalid-or-repeated-parent-guid"), rows,
+                GS::ObjectState ("status", "present", "code", "INVALID_PARENT_GUID", "message", "Parent GUIDs must be valid, non-null and unique."));
+        }
+        const GS::UniString normalized = APIGuidToString (guid);
+        if (FixtureUtf8 (normalized).size () != 36) {
+            return NativeDimensionDrawingRunsResponse (
+                "refused", runId, expectedProjectPath, fileScopeKey, requestedStory,
+                contextNotRead, contextNotRead,
+                GS::ObjectState ("status", "not-checked", "contextStable", false, "reason", "invalid-parent-guid-serialization"), rows,
+                GS::ObjectState ("status", "present", "code", "INVALID_PARENT_GUID", "message", "A parent GUID did not normalize to canonical text."));
+        }
+        seen.Add (guid);
+        guids.Push (guid);
+        normalizedGuids.Push (normalized);
+    }
+
+    if (tl_nativeDimensionDrawingRunsActive.test_and_set (std::memory_order_acquire)) {
+        for (const GS::UniString& guid : normalizedGuids)
+            rows.Push (GS::ObjectState ("requestedGuid", guid, "status", "refused", "coverageReason", "nonreentrant-diagnostic-already-active"));
+        return NativeDimensionDrawingRunsResponse (
+            "refused", runId, expectedProjectPath, fileScopeKey, requestedStory,
+            contextNotRead, contextNotRead,
+            GS::ObjectState ("status", "not-checked", "contextStable", false, "reason", "diagnostic-reentrancy-guard"), rows,
+            GS::ObjectState ("status", "present", "code", "NONREENTRANT_DIAGNOSTIC", "message", "This diagnostic is non-reentrant."), normalizedGuids);
+    }
+    const GS::OnExit activeGuard ([] () {
+        tl_nativeDimensionDrawingRunsCallback = nullptr;
+        tl_nativeDimensionDrawingRunsActive.clear (std::memory_order_release);
+    });
+    const auto started = std::chrono::steady_clock::now ();
+
+    RadialDefaultsContext requestBefore;
+    ReadRadialDefaultsContext (requestBefore);
+    const GS::ObjectState requestBeforeState = RadialDefaultsContextDetails (requestBefore);
+    const bool requestScopeValid = IsExactTaskOwnedRadialDefaultsCopy (runId, expectedProjectPath, fileScopeKey, requestBefore)
+        && requestBefore.window.typeID == APIWind_FloorPlanID && requestBefore.database.typeID == APIWind_FloorPlanID
+        && requestBefore.activeStory == requestedStory;
+    if (!requestScopeValid) {
+        for (const GS::UniString& guid : normalizedGuids)
+            rows.Push (GS::ObjectState ("requestedGuid", guid, "status", "not-read", "coverageReason", "exact-task-owned-floor-plan-story-scope-refused"));
+        return NativeDimensionDrawingRunsResponse (
+            "refused", runId, expectedProjectPath, fileScopeKey, requestedStory,
+            requestBeforeState, GS::ObjectState ("status", "not-checked-before-parent-drawing-call"),
+            GS::ObjectState ("status", "not-read", "contextStable", false), rows,
+            GS::ObjectState ("status", "present", "code", "PARENT_DRAWING_SCOPE_REFUSED", "message", "Requires the exact saved Solo task-owned copy, current Floor Plan database/window and requested story."), normalizedGuids);
+    }
+
+    bool requestCancelled = false;
+    if (NativeDimensionDrawingRunsStopped (processControl, started, requestCancelled)) {
+        for (const GS::UniString& guid : normalizedGuids)
+            rows.Push (GS::ObjectState ("requestedGuid", guid, "status", "not-read", "coverageReason", requestCancelled ? "cooperative-cancelled-before-parent-read" : "cooperative-deadline-before-parent-read"));
+        return NativeDimensionDrawingRunsResponse (
+            "partial", runId, expectedProjectPath, fileScopeKey, requestedStory,
+            requestBeforeState, requestBeforeState,
+            GS::ObjectState ("status", "stable-before-read", "contextStable", true), rows,
+            GS::ObjectState ("status", "present", "code", requestCancelled ? "COOPERATIVE_CANCELLED" : "COOPERATIVE_DEADLINE_REACHED", "message", "Stopped before parent extraction at a cooperative boundary."), normalizedGuids);
+    }
+
+    bool allRowsComplete = true;
+    for (UInt32 index = 0; index < guids.GetSize (); ++index) {
+        const API_Guid guid = guids[index];
+        const GS::UniString guidText = normalizedGuids[index];
+        bool stopped = false;
+        if (NativeDimensionDrawingRunsStopped (processControl, started, stopped)) {
+            allRowsComplete = false;
+            for (UInt32 remaining = index; remaining < guids.GetSize (); ++remaining)
+                rows.Push (GS::ObjectState ("requestedGuid", normalizedGuids[remaining], "status", "not-read", "coverageReason", stopped ? "cooperative-cancelled-before-parent-read" : "cooperative-deadline-before-parent-read"));
+            break;
+        }
+
+        RadialDefaultsContext parentContextBefore;
+        ReadRadialDefaultsContext (parentContextBefore);
+        const GS::ObjectState parentContextBeforeState = RadialDefaultsContextDetails (parentContextBefore);
+        if (!SameRadialDefaultsContext (requestBefore, parentContextBefore)
+            || !IsExactTaskOwnedRadialDefaultsCopy (runId, expectedProjectPath, fileScopeKey, parentContextBefore)
+            || parentContextBefore.activeStory != requestedStory) {
+            allRowsComplete = false;
+            rows.Push (GS::ObjectState (
+                "requestedGuid", guidText,
+                "status", "refused",
+                "contextBefore", parentContextBeforeState,
+                "contextAfter", GS::ObjectState ("status", "not-read"),
+                "coverageReason", "scope-or-current-context-changed-before-parent-read",
+                "drawingRuns", NativeDimensionDrawingRunsDetails (NativeDimensionDrawingRunsCallbackContext (), APIERR_BADID),
+                "autotextMetadata", NativeDimensionAutotextMetadataUnavailable ("not-read", "parent-scope-guard-refused"),
+                "sourceExpression", GS::ObjectState ("status", "unproven", "reason", "no-note-source-mapping"),
+                "observedDisplay", GS::ObjectState ("status", "unavailable", "reason", "no-independent-display-channel"),
+                "noteCorrespondence", GS::ObjectState ("status", "unproven", "reason", "drawing-runs-have-no-note-identifiers")));
+            continue;
+        }
+
+        const NativeDimensionDrawingParentFacts before = ReadNativeDimensionDrawingParentFacts (guid, processControl);
+        const bool beforeMatchesCurrentDatabase = before.valid
+            && before.databaseGuid == APIGuidToString (requestBefore.database.databaseUnId.elemSetId);
+        if (!before.valid || !beforeMatchesCurrentDatabase) {
+            allRowsComplete = false;
+            rows.Push (GS::ObjectState (
+                "requestedGuid", guidText,
+                "status", before.supported ? "partial" : "refused",
+                "parentBefore", NativeDimensionDrawingParentFactsDetails (before),
+                "contextBefore", parentContextBeforeState,
+                "contextAfter", GS::ObjectState ("status", "not-read"),
+                "coverageReason", before.valid ? "exact-parent-database-does-not-match-current-floor-plan-database" : before.errorReason,
+                "drawingRuns", GS::ObjectState ("status", "not-read", "coverageReason", "coherent-dimension-parent-facts-unavailable"),
+                "autotextMetadata", NativeDimensionAutotextMetadataUnavailable ("not-read", "coherent-dimension-parent-facts-unavailable"),
+                "sourceExpression", GS::ObjectState ("status", "unproven", "reason", "no-note-source-mapping"),
+                "observedDisplay", GS::ObjectState ("status", "unavailable", "reason", "no-independent-display-channel"),
+                "noteCorrespondence", GS::ObjectState ("status", "unproven", "reason", "drawing-runs-have-no-note-identifiers")));
+            continue;
+        }
+        if (before.storyIndex != requestedStory) {
+            allRowsComplete = false;
+            rows.Push (GS::ObjectState (
+                "requestedGuid", guidText, "status", "refused", "parentBefore", before.facts,
+                "contextBefore", parentContextBeforeState, "contextAfter", GS::ObjectState ("status", "not-read"),
+                "coverageReason", "exact-guid-is-not-on-requested-story",
+                "drawingRuns", GS::ObjectState ("status", "not-read", "coverageReason", "story-scope-refused"),
+                "autotextMetadata", NativeDimensionAutotextMetadataUnavailable ("not-read", "story-scope-refused"),
+                "sourceExpression", GS::ObjectState ("status", "unproven", "reason", "no-note-source-mapping"),
+                "observedDisplay", GS::ObjectState ("status", "unavailable", "reason", "no-independent-display-channel"),
+                "noteCorrespondence", GS::ObjectState ("status", "unproven", "reason", "drawing-runs-have-no-note-identifiers")));
+            continue;
+        }
+
+        NativeDimensionDrawingRunsCallbackContext callbackContext;
+        tl_nativeDimensionDrawingRunsCallback = &callbackContext;
+        API_Elem_Head parentHead = {};
+        parentHead.guid = guid;
+        API_ShapePrimsParams shapeParams = {};
+        shapeParams.dontClip = true;
+        shapeParams.allStories = false;
+#if defined(ServerMainVers_2700)
+        const GSErrCode shapeError = ACAPI_DrawingPrimitive_ShapePrimsExt (
+            parentHead, CollectNativeDimensionDrawingRuns, &shapeParams);
+#else
+        const GSErrCode shapeError = ACAPI_Element_ShapePrimsExt (parentHead, CollectNativeDimensionDrawingRuns, &shapeParams);
+#endif
+        tl_nativeDimensionDrawingRunsCallback = nullptr;
+
+        const bool shapeCoverageComplete = shapeError == NoError && !callbackContext.primitiveLimitExceeded
+            && !callbackContext.textRunLimitExceeded && !callbackContext.textUnitLimitExceeded
+            && !callbackContext.unsupportedPrimitiveType && !callbackContext.allocationFailed
+            && !callbackContext.malformedUnicode && !callbackContext.missingUnicode && !callbackContext.invalidGeometry;
+        bool stoppedAfterShape = false;
+        const bool budgetAfterShape = NativeDimensionDrawingRunsStopped (processControl, started, stoppedAfterShape);
+        bool metadataStopped = false;
+        GS::ObjectState metadata;
+        if (shapeCoverageComplete && !budgetAfterShape)
+            metadata = ReadNativeDimensionAutotextCandidates (
+                static_cast<API_ElemTypeID> (before.nativeTypeId), before.hasAppearance, before.appearance,
+                processControl, started, metadataStopped);
+        else {
+#if TAPIR_AC_VERSION < 26
+            metadata = NativeDimensionAutotextMetadataUnavailable ("unavailable", "autotext-metadata-api-not-available-in-ac25");
+#else
+            metadata = NativeDimensionAutotextMetadataUnavailable ("not-read", budgetAfterShape ? "cooperative-stop-before-metadata-call" : "drawing-run-coverage-incomplete");
+#endif
+        }
+
+        NativeDimensionDrawingParentFacts after;
+        RadialDefaultsContext parentContextAfter;
+        bool afterReadDone = false;
+        bool stopBeforeRecheck = false;
+        if (!NativeDimensionDrawingRunsStopped (processControl, started, stopBeforeRecheck)) {
+            after = ReadNativeDimensionDrawingParentFacts (guid, processControl);
+            ReadRadialDefaultsContext (parentContextAfter);
+            afterReadDone = true;
+        }
+        const GS::ObjectState parentAfterState = afterReadDone
+            ? NativeDimensionDrawingParentFactsDetails (after)
+            : GS::ObjectState ("status", "not-read", "reason", stopBeforeRecheck ? "cooperative-cancelled-before-final-parent-recheck" : "cooperative-deadline-before-final-parent-recheck");
+        const GS::ObjectState contextAfterState = afterReadDone ? RadialDefaultsContextDetails (parentContextAfter) : GS::ObjectState ("status", "not-read");
+        const bool parentStable = afterReadDone && SameNativeDimensionDrawingParentFacts (before, after)
+            && after.storyIndex == requestedStory
+            && SameRadialDefaultsContext (parentContextBefore, parentContextAfter)
+            && IsExactTaskOwnedRadialDefaultsCopy (runId, expectedProjectPath, fileScopeKey, parentContextAfter)
+            && parentContextAfter.activeStory == requestedStory;
+        GS::UniString metadataStatus;
+        GS::UniString metadataReason;
+        const bool metadataFieldsAvailable = metadata.Get ("status", metadataStatus) && metadata.Get ("coverageReason", metadataReason);
+        const bool metadataCoverageComplete = metadataFieldsAvailable && (metadataStatus == "available"
+#if TAPIR_AC_VERSION == 25
+            || (metadataStatus == "unavailable" && metadataReason == "autotext-metadata-api-not-available-in-ac25")
+#endif
+            );
+        bool afterShapeBudgetPermitsCompletion = true;
+#if TAPIR_AC_VERSION >= 26
+        afterShapeBudgetPermitsCompletion = !stoppedAfterShape;
+#endif
+        const bool rowComplete = shapeCoverageComplete && parentStable && metadataCoverageComplete
+            && afterShapeBudgetPermitsCompletion && !metadataStopped;
+        if (!rowComplete) allRowsComplete = false;
+
+        GS::ObjectState consistency (
+            "status", parentStable ? "same-guid-type-story-database-stamp-and-dimension-fingerprint" : "parent-or-context-changed-or-final-recheck-unavailable",
+            "stable", parentStable,
+            "sameGuid", before.hasGuid && after.hasGuid && before.guid == after.guid,
+            "sameFamily", before.hasNativeType && after.hasNativeType && before.hasVariation && after.hasVariation
+                && before.nativeTypeId == after.nativeTypeId && before.variationId == after.variationId,
+            "sameStory", before.hasStory && after.hasStory && before.storyIndex == after.storyIndex,
+            "sameDatabase", before.hasDatabase && after.hasDatabase && before.databaseGuid == after.databaseGuid,
+            "sameModificationStamp", before.hasStamp && after.hasStamp && before.modificationStamp == after.modificationStamp,
+            "sameFactualGeometry", before.hasGeometry && after.hasGeometry && before.hasFingerprint && after.hasFingerprint
+                && before.fingerprint == after.fingerprint);
+        GS::ObjectState row (
+            "requestedGuid", guidText,
+            "status", rowComplete ? "available" : "partial",
+            "parentBefore", before.facts,
+            "parentAfter", parentAfterState,
+            "contextBefore", parentContextBeforeState,
+            "contextAfter", contextAfterState,
+            "readConsistency", consistency,
+            "drawingRuns", NativeDimensionDrawingRunsDetails (callbackContext, shapeError),
+            "autotextMetadata", metadata,
+            "sourceExpression", GS::ObjectState ("status", "unproven", "reason", "drawing-run-output-and-keyword-catalog-do-not-identify-original-note-expression"),
+            "observedDisplay", GS::ObjectState ("status", "unavailable", "reason", "ShapePrimsExt-output-is-not-independent-dimension-display-evidence"),
+            "noteCorrespondence", GS::ObjectState ("status", "unproven", "reason", "ShapePrimsExt-provides-no-note-or-point-identity"));
+        rows.Push (row);
+    }
+
+    bool stoppedBeforeRequestAfter = false;
+    RadialDefaultsContext requestAfter;
+    GS::ObjectState requestAfterState;
+    bool requestAfterRead = false;
+    if (!NativeDimensionDrawingRunsStopped (processControl, started, stoppedBeforeRequestAfter)) {
+        ReadRadialDefaultsContext (requestAfter);
+        requestAfterState = RadialDefaultsContextDetails (requestAfter);
+        requestAfterRead = true;
+    } else {
+        requestAfterState = GS::ObjectState ("status", "not-read", "reason", stoppedBeforeRequestAfter ? "cooperative-cancelled-before-request-final-context" : "cooperative-deadline-before-request-final-context");
+        allRowsComplete = false;
+    }
+    const bool requestContextStable = requestAfterRead
+        && SameRadialDefaultsContext (requestBefore, requestAfter)
+        && IsExactTaskOwnedRadialDefaultsCopy (runId, expectedProjectPath, fileScopeKey, requestAfter)
+        && requestAfter.activeStory == requestedStory;
+    if (!requestContextStable) allRowsComplete = false;
+    const GS::ObjectState requestConsistency (
+        "status", requestContextStable ? "stable-exact-saved-copy-floor-plan-database-and-story" : "context-changed-or-final-context-unavailable",
+        "contextStable", requestContextStable);
+    return NativeDimensionDrawingRunsResponse (
+        allRowsComplete ? "available" : "partial", runId, expectedProjectPath, fileScopeKey, requestedStory,
+        requestBeforeState, requestAfterState, requestConsistency, rows,
+        allRowsComplete ? errorNotChecked : GS::ObjectState (
+            "status", "present",
+            "code", "PARENT_DRAWING_COVERAGE_PARTIAL",
+            "message", "One or more parent drawing-run, metadata, revision, context or cooperative-coverage checks are incomplete."), normalizedGuids);
 }
 
 ModifyColumnsCommand::ModifyColumnsCommand (const bool atomicIn) :

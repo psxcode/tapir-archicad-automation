@@ -8,6 +8,8 @@
 #include "NativeOwnership.hpp"
 #include "NativeRichTextMemo.hpp"
 #include "ObjectStateJSONConversion.hpp"
+#include "NativeDimensionCreateWire.hpp"
+#include "NativeDimensionCreateWireObjectState.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -20,6 +22,7 @@
 #include <initializer_list>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -30,6 +33,9 @@
 #ifndef TAPIR_AC_VERSION
 #define TAPIR_AC_VERSION 0
 #endif
+#ifndef TAPIR_ENABLE_NATIVE_DIMENSION_CREATE_CANDIDATE
+#define TAPIR_ENABLE_NATIVE_DIMENSION_CREATE_CANDIDATE 0
+#endif
 
 namespace {
 
@@ -39,6 +45,8 @@ constexpr const char* ReceiptVersion = "native-mutation-receipt-v1";
 constexpr const char* HistoryVersion = "native-mutation-history-v1";
 constexpr const char* CapabilitySchemaVersion = "native-crud-capabilities-v2";
 constexpr const char* CapabilitySchemaHash = "3eee0c6ffe9f006ec6ddfa65faefd45d80cfc246e5b7a4da2aa0fdd3125b7f7b";
+constexpr const char* CapabilitySchemaV3Version = "native-crud-capabilities-v3";
+constexpr const char* CapabilitySchemaV3Hash = "14b8ca2431813e2c66f518ed074ba1801d313fb5615b2ca17fb02e604a2eba33";
 constexpr const char* ImpactEnvelopeVersion = "native-impact-envelope-v1";
 constexpr const char* ImpactEvidenceVersion = "native-impact-evidence-v1";
 constexpr const char* ImpactMetadataKey = "nativeImpact";
@@ -3487,8 +3495,8 @@ GS::ObjectState GetNativeCrudCapabilitiesCommand::Execute (const GS::ObjectState
     response.Add ("receiptVersion", ReceiptVersion);
     response.Add ("historyVersion", HistoryVersion);
     response.Add ("capabilityIdentity", GS::ObjectState (
-        "schemaVersion", CapabilitySchemaVersion,
-        "schemaHash", CapabilitySchemaHash,
+        "schemaVersion", CapabilitySchemaV3Version,
+        "schemaHash", CapabilitySchemaV3Hash,
         "source", "apx"));
     response.Add ("fileScope", "saved Solo PLN canonical path");
     response.Add ("limits", GS::ObjectState (
@@ -3531,6 +3539,23 @@ GS::ObjectState GetNativeCrudCapabilitiesCommand::Execute (const GS::ObjectState
         AddCanonicalWritableFields (type, GS::UniString (typeName));
         elementTypes (type);
     }
+    for (const char* typeName : { "Dimension", "RadialDimension", "AngleDimension", "LevelDimension" }) {
+        GS::ObjectState type;
+        type.Add ("elementType", typeName);
+        type.Add ("contracted", GS::ObjectState ("create", false, "read", true, "update", false, "delete", false));
+        type.Add ("create", false);
+        type.Add ("read", true);
+        type.Add ("update", false);
+        type.Add ("delete", false);
+        type.Add ("writerStatus", "read_only_dimension");
+        type.Add ("capabilityState", GS::ObjectState (
+            "create", "unavailable", "read", "verified", "update", "unavailable", "delete", "unavailable"));
+        type.Add ("writableFields", GS::Array<GS::UniString> {});
+        type.Add ("createFields", GS::Array<GS::UniString> {});
+        type.Add ("createPlacementFields", GS::Array<GS::UniString> {});
+        type.Add ("updateFields", GS::Array<GS::UniString> {});
+        elementTypes (type);
+    }
     response.Add ("safety", GS::ObjectState (
         "previewRequired", false,
         "singleStepAtomicPatch", true,
@@ -3558,13 +3583,96 @@ GS::ObjectState GetNativeElementSnapshotsCommand::Execute (const GS::ObjectState
     const GS::Optional<GS::UniString> contractError = ValidateContractVersion (parameters);
     if (contractError.HasValue ()) return ScopeError (contractError);
     GS::UniString requestedType;
-    if (parameters.Get ("elementType", requestedType) && !requestedType.IsEmpty () && !IsSupportedNativeTypeName (requestedType))
+    if (parameters.Get ("elementType", requestedType) && !requestedType.IsEmpty () && !IsSupportedNativeTypeName (requestedType)
+        && requestedType != "Dimension" && requestedType != "RadialDimension"
+        && requestedType != "AngleDimension" && requestedType != "LevelDimension")
         return CreateErrorResponse (APIERR_BADPARS, "Unsupported native elementType.");
     GS::Array<GS::UniString> guids;
     const GS::Optional<GS::UniString> guidError = ReadRequestedGuids (parameters, guids);
     if (guidError.HasValue ()) return ScopeError (guidError);
+    // The dimension detail reader is internal to this already scope-validated
+    // exact snapshot route.  Classify mixed requests from native headers,
+    // capture each subfamily through its owning reader, then reassemble by
+    // exact GUID in caller order.  This keeps the canonical response envelope
+    // and prevents the unscoped detail command from becoming a public route.
+    GS::Array<GS::UniString> dimensionGuids;
+    GS::Array<GS::UniString> ordinaryGuids;
+    for (const GS::UniString& guidText : guids) {
+        const API_Guid guid = APIGuidFromString (guidText.ToCStr ());
+        API_Elem_Head header = {};
+        header.guid = guid;
+        const GSErrCode headerError = ACAPI_Element_GetHeader (&header);
+        const bool requestedDimensionType = requestedType == "Dimension" || requestedType == "RadialDimension"
+            || requestedType == "AngleDimension" || requestedType == "LevelDimension";
+        if (requestedDimensionType || (headerError == NoError && (GetElemTypeId (header) == API_DimensionID
+            || GetElemTypeId (header) == API_RadialDimensionID || GetElemTypeId (header) == API_AngleDimensionID
+            || GetElemTypeId (header) == API_LevelDimensionID)))
+            dimensionGuids.Push (guidText);
+        else
+            ordinaryGuids.Push (guidText);
+    }
     bool complete = false;
-    GS::ObjectState response = ExactSnapshots (RequestedIdsFromGuids (guids), CurrentSoloFileScope ().Get (), processControl, complete);
+    GS::ObjectState response;
+    if (dimensionGuids.IsEmpty ()) {
+        response = ExactSnapshots (RequestedIdsFromGuids (guids), CurrentSoloFileScope ().Get (), processControl, complete);
+    } else {
+        GS::Array<GS::ObjectState> dimensionRows;
+        bool dimensionsComplete = true;
+        if (!dimensionGuids.IsEmpty ()) {
+            GS::ObjectState exactParameters;
+            exactParameters.Add ("guids", dimensionGuids);
+            const GS::ObjectState dimensionResponse = GetNativeDimensionDetailsCommand ().Execute (exactParameters, processControl);
+            if (dimensionResponse.Get ("error") != nullptr) return dimensionResponse;
+            if (!dimensionResponse.Get ("elements", dimensionRows) || dimensionRows.GetSize () != dimensionGuids.GetSize ())
+                return CreateErrorResponse (APIERR_BADID, "Canonical dimension exact read did not preserve every requested GUID.");
+            for (const GS::ObjectState& row : dimensionRows) {
+                GS::UniString rowStatus;
+                row.Get ("status", rowStatus);
+                if (rowStatus != "success") dimensionsComplete = false;
+            }
+        }
+        GS::Array<GS::ObjectState> ordinaryRows;
+        bool ordinaryComplete = true;
+        GS::Array<GS::UniString> missingGuids;
+        if (!ordinaryGuids.IsEmpty ()) {
+            GS::ObjectState ordinaryResponse = ExactSnapshots (RequestedIdsFromGuids (ordinaryGuids), CurrentSoloFileScope ().Get (), processControl, ordinaryComplete);
+            ordinaryResponse.Get ("elements", ordinaryRows);
+            ordinaryResponse.Get ("missingGuids", missingGuids);
+        }
+        std::map<std::string, GS::ObjectState> rowsByGuid;
+        for (const GS::ObjectState& row : dimensionRows) {
+            const GS::ObjectState* id = row.Get ("elementId");
+            if (id != nullptr) {
+                GS::ObjectState tagged = row;
+                tagged.Add ("canonicalSnapshotKind", "dimension");
+                rowsByGuid[std::string (APIGuidToString (GetGuidFromObjectState (*id)).ToCStr (CC_UTF8).Get ())] = tagged;
+            }
+        }
+        for (const GS::ObjectState& row : ordinaryRows) {
+            const GS::ObjectState* id = row.Get ("elementId");
+            if (id != nullptr) rowsByGuid[std::string (APIGuidToString (GetGuidFromObjectState (*id)).ToCStr (CC_UTF8).Get ())] = row;
+        }
+        response.Add ("status", "success");
+        response.Add ("contractVersion", ContractVersion);
+        response.Add ("fileScopeKey", CurrentSoloFileScope ().Get ());
+        const auto& outputRows = response.AddList<GS::ObjectState> ("elements");
+        for (const GS::UniString& guidText : guids) {
+            const API_Guid guid = APIGuidFromString (guidText.ToCStr ());
+            const std::string key (APIGuidToString (guid).ToCStr (CC_UTF8).Get ());
+            const auto found = rowsByGuid.find (key);
+            if (found != rowsByGuid.end ()) {
+                GS::UniString actualType;
+                found->second.Get ("elementType", actualType);
+                if (!requestedType.IsEmpty () && actualType != requestedType)
+                    return CreateErrorResponse (APIERR_BADID, "An exact snapshot GUID does not match elementType.");
+                outputRows (found->second);
+            }
+        }
+        complete = dimensionsComplete && ordinaryComplete && rowsByGuid.size () == guids.GetSize ();
+        response.Add ("complete", complete);
+        const auto& missing = response.AddList<GS::UniString> ("missingGuids");
+        for (const GS::UniString& guid : missingGuids) missing (guid);
+    }
     if (!complete) response.Add ("code", "SNAPSHOT_COVERAGE_INCOMPLETE");
     if (!requestedType.IsEmpty ()) {
         GS::Array<GS::ObjectState> snapshots;
@@ -3718,9 +3826,12 @@ GS::ObjectState DiscoverNativeElementsCommand::Execute (const GS::ObjectState& p
 
     GS::UniString typeName;
     API_ElemTypeID typeID = API_ZombieElemID;
+    bool requestedDimensionFamily = false;
     if (parameters.Get ("elementType", typeName)) {
         typeID = GetElementTypeFromNonLocalizedName (typeName);
-        if (!IsSupportedNativeType (typeID)) return CreateErrorResponse (APIERR_BADPARS, "Unsupported native elementType.");
+        requestedDimensionFamily = typeID == API_DimensionID || typeID == API_RadialDimensionID
+            || typeID == API_AngleDimensionID || typeID == API_LevelDimensionID;
+        if (!IsSupportedNativeType (typeID) && !requestedDimensionFamily) return CreateErrorResponse (APIERR_BADPARS, "Unsupported native elementType.");
     }
 
     double minX = 0.0;
@@ -3803,6 +3914,59 @@ GS::ObjectState DiscoverNativeElementsCommand::Execute (const GS::ObjectState& p
     }
     if (ids.GetSize () > MaxDiscoveryReferences)
         return CreateErrorResponse (APIERR_BADPARS, "NARROW_SCOPE_REQUIRED: discovery exceeded the 100-reference cap.");
+    if (requestedDimensionFamily) {
+        GS::Array<GS::ObjectState> detailRows;
+        bool dimensionCoverageComplete = true;
+        for (GSSize offset = 0; offset < static_cast<GSSize> (ids.GetSize ()); offset += MaxMutationItems) {
+            GS::Array<GS::UniString> exactGuids;
+            const GSSize end = std::min (static_cast<GSSize> (ids.GetSize ()), offset + MaxMutationItems);
+            for (GSSize index = offset; index < end; ++index) {
+                const API_Guid guid = GetRequestedElementGuid (ids[index]);
+                if (guid == APINULLGuid) return CreateErrorResponse (APIERR_BADPARS, "Dimension discovery returned an invalid exact GUID.");
+                exactGuids.Push (APIGuidToString (guid));
+            }
+            GS::ObjectState exactParameters;
+            exactParameters.Add ("guids", exactGuids);
+            const GS::ObjectState detailResponse = GetNativeDimensionDetailsCommand ().Execute (exactParameters, processControl);
+            if (detailResponse.Get ("error") != nullptr) return detailResponse;
+            GS::Array<GS::ObjectState> chunkRows;
+            if (!detailResponse.Get ("elements", chunkRows) || chunkRows.GetSize () != exactGuids.GetSize ())
+                return CreateErrorResponse (APIERR_BADID, "Dimension discovery did not preserve its bounded exact candidate set.");
+            for (GSSize local = 0; local < static_cast<GSSize> (chunkRows.GetSize ()); ++local) {
+                const GS::ObjectState& row = chunkRows[local];
+                const API_Guid expectedGuid = GetRequestedElementGuid (ids[offset + local]);
+                const GS::ObjectState* rowElementId = row.Get ("elementId");
+                if (rowElementId == nullptr || GetGuidFromObjectState (*rowElementId) != expectedGuid)
+                    return CreateErrorResponse (APIERR_BADID, "Dimension discovery exact read changed candidate identity or order.");
+                GS::UniString rowStatus;
+                row.Get ("status", rowStatus);
+                if (rowStatus != "success") dimensionCoverageComplete = false;
+                Int32 rowStory = 0;
+                if (hasStory && rowStatus == "success" && (!row.Get ("storyIndex", rowStory) || rowStory != storyIndex))
+                    return CreateErrorResponse (APIERR_BADID, "Dimension discovery exact read changed the requested story scope.");
+                if (hasBounds && rowStatus == "success") {
+                    const GS::ObjectState* rowBounds = row.Get ("bounds");
+                    double xMin = 0.0, yMin = 0.0, xMax = 0.0, yMax = 0.0;
+                    if (rowBounds == nullptr || !rowBounds->Get ("xMin", xMin) || !rowBounds->Get ("yMin", yMin)
+                        || !rowBounds->Get ("xMax", xMax) || !rowBounds->Get ("yMax", yMax)
+                        || !DiscoveryBoundsIntersect (xMin, yMin, xMax, yMax, minX, minY, maxX, maxY))
+                        return CreateErrorResponse (APIERR_BADID, "Dimension discovery exact read changed the requested bounds scope.");
+                }
+                GS::ObjectState tagged = row;
+                tagged.Add ("canonicalSnapshotKind", "dimension");
+                detailRows.Push (tagged);
+            }
+        }
+        GS::ObjectState result;
+        result.Add ("status", "success");
+        result.Add ("contractVersion", ContractVersion);
+        result.Add ("fileScopeKey", CurrentSoloFileScope ().Get ());
+        result.Add ("scope", hasDocument ? "documentTargetKey" : hasStory ? "story" : "bounds");
+        const auto& elements = result.AddList<GS::ObjectState> ("elements");
+        for (const GS::ObjectState& row : detailRows) elements (row);
+        result.Add ("complete", dimensionCoverageComplete);
+        return result;
+    }
     bool complete = false;
     const GS::UniString scope = CurrentSoloFileScope ().Get ();
     GS::ObjectState snapshots = ExactSnapshots (ids, scope, processControl, complete);
@@ -3927,6 +4091,23 @@ GS::ObjectState MutateNativeElementsCommand::Execute (const GS::ObjectState& par
     scopeParameters.Add ("fileScopeKey", expectedScope);
     const GS::Optional<GS::UniString> scopeError = ValidateScope (scopeParameters);
     if (scopeError.HasValue ()) return ScopeError (scopeError);
+    GS::UniString requestedType;
+    if (parameters.Get ("elementType", requestedType) && requestedType == "Dimension") {
+#if TAPIR_ENABLE_NATIVE_DIMENSION_CREATE_CANDIDATE
+        return ExecuteNativeDimensionCreateCandidate (parameters, processControl);
+#else
+        // An explicitly versioned private candidate envelope is refused by an
+        // ordinary profile without entering the ordinary CRUD parser. Keep
+        // historical ordinary Dimension denial unchanged for every other
+        // payload shape.
+        GS::Array<GS::ObjectState> dimensionItems;
+        GS::UniString wireSchema;
+        if (parameters.Get ("items", dimensionItems) && dimensionItems.GetSize () == 1
+            && dimensionItems[0].Get ("schemaVersion", wireSchema)
+            && wireSchema == NativeDimensionCreateWire::SchemaVersion)
+            return ExecuteNativeDimensionCreateCandidate (parameters, processControl);
+#endif
+    }
     GS::UniString contract;
     if (!parameters.Get ("contractVersion", contract) || contract != ContractVersion)
         return CreateErrorResponse (APIERR_BADPARS, "contractVersion must be native-crud-v2.");
@@ -3952,6 +4133,9 @@ GS::ObjectState MutateNativeElementsCommand::Execute (const GS::ObjectState& par
     if (operation != "create" && operation != "update" && operation != "delete")
         return CreateErrorResponse (APIERR_BADPARS, "operation must be create, update or delete.");
     const API_ElemTypeID typeID = GetElementTypeFromNonLocalizedName (typeName);
+    if (typeID == API_DimensionID || typeID == API_RadialDimensionID
+        || typeID == API_AngleDimensionID || typeID == API_LevelDimensionID)
+        return CreateErrorResponse (APIERR_BADPARS, "Dimension elements are read-only; no native mutation was dispatched.");
     if (!IsSupportedNativeType (typeID)) return CreateErrorResponse (APIERR_BADPARS, "Unsupported native elementType.");
     // Keep the wire vocabulary canonical at the native boundary as well.  A
     // full Circle is exposed as Arc in native-crud-v2; accepting the alias

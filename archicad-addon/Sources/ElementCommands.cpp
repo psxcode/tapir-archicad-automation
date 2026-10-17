@@ -1,4 +1,5 @@
 #include "ElementCommands.hpp"
+#include "BoundedRectangleReadDecision.hpp"
 #include "ElementGDLParameterCommands.hpp"
 #include "MigrationHelper.hpp"
 #include "PerfTrace.hpp"
@@ -3375,7 +3376,11 @@ GS::ObjectState GetElementsInRectCommand::Execute (const GS::ObjectState& parame
     Int32 elementCount = 0;
     const GSSize selectedCount = selectedNeigs.GetSize ();
     const bool pageRequired = boundedErr == NoError && selectedCount > static_cast<GSSize> (pageSize);
-    if (boundedErr == NoError && !pageRequired) {
+    const auto selectionReadAction = BoundedRectangleReadDecision::ClassifySelectionRead (
+        boundedErr == NoError,
+        boundedErr == APIERR_NOSEL,
+        pageRequired);
+    if (selectionReadAction == BoundedRectangleReadDecision::SelectionReadAction::CollectRows) {
         for (const API_Neig& selectedNeig : selectedNeigs) {
             const API_Guid guid = GetParentElemOfSectElem (selectedNeig.guid);
             elements (CreateElementIdObjectState (guid));
@@ -3395,7 +3400,7 @@ GS::ObjectState GetElementsInRectCommand::Execute (const GS::ObjectState& parame
             }
             focusElements (focusElement);
         }
-    } else if (boundedErr != APIERR_NOSEL) {
+    } else if (selectionReadAction == BoundedRectangleReadDecision::SelectionReadAction::VerifyFocusAfterSdkError) {
         // Do not overwrite an unknown/current operator focus after a failed
         // selection read.  A second read is required before it is safe to
         // restore the temporary marquee.
@@ -3423,26 +3428,35 @@ GS::ObjectState GetElementsInRectCommand::Execute (const GS::ObjectState& parame
     const bool focusChangedDuringRead = selectionAfterErr == NoError &&
         !IsSameHorizontalMarquee (selectionAfter, xMin, yMin, xMax, yMax, multiStory);
 
-    if (focusReadUnavailable || focusChangedDuringRead) {
+    const bool focusVerifiedUnchanged = !focusReadUnavailable && !focusChangedDuringRead;
+    if (!focusVerifiedUnchanged) {
         const GSErrCode restoreMarqueeErr = restoreOperatorFocus ();
+        const auto finalAction = BoundedRectangleReadDecision::ClassifyFinalRead (
+            focusVerifiedUnchanged,
+            restoreMarqueeErr == NoError,
+            pageRequired);
         return CreateErrorResponse (
             restoreMarqueeErr != NoError
                 ? restoreMarqueeErr
                 : focusReadUnavailable ? selectionAfterErr : APIERR_REFUSEDCMD,
-            restoreMarqueeErr != NoError
+            finalAction == BoundedRectangleReadDecision::FinalAction::RestoreError
                 ? "Operator focus could not be verified after the bounded read and could not be restored."
                 : "Operator focus could not be verified after the bounded read; refusing to overwrite the current focus.");
     }
 
     const GSErrCode restoreErr = restoreOperatorFocus ();
+    const auto finalAction = BoundedRectangleReadDecision::ClassifyFinalRead (
+        focusVerifiedUnchanged,
+        restoreErr == NoError,
+        pageRequired);
 
-    if (restoreErr != NoError) {
+    if (finalAction == BoundedRectangleReadDecision::FinalAction::RestoreError) {
         return CreateErrorResponse (
             restoreErr,
             "Bounded read succeeded but the operator focus could not be restored.");
     }
 
-    if (pageRequired) {
+    if (finalAction == BoundedRectangleReadDecision::FinalAction::PageRequired) {
         const Int32 enumerated = selectedCount > static_cast<GSSize> (std::numeric_limits<Int32>::max ())
             ? std::numeric_limits<Int32>::max ()
             : static_cast<Int32> (selectedCount);

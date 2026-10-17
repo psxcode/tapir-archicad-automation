@@ -17,6 +17,29 @@ option (TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS
     OFF
 )
 
+option (TAPIR_ENABLE_NATIVE_DIMENSION_CREATE_CANDIDATE
+    "Compile the closed, private Dimension CREATE candidate producer into its isolated test APX."
+    OFF
+)
+
+option (TAPIR_ENABLE_NATIVE_DIMENSION_CREATE_POST_CREATE_FAULT
+    "Compile the isolated Dimension producer post-CREATE fault seam; requires its candidate profile."
+    OFF
+)
+
+if (TAPIR_ENABLE_NATIVE_DIMENSION_CREATE_POST_CREATE_FAULT AND NOT TAPIR_ENABLE_NATIVE_DIMENSION_CREATE_CANDIDATE)
+    message (FATAL_ERROR "The native Dimension post-CREATE fault profile requires TAPIR_ENABLE_NATIVE_DIMENSION_CREATE_CANDIDATE.")
+endif ()
+
+if (TAPIR_ENABLE_NATIVE_DIMENSION_CREATE_CANDIDATE AND (TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS
+    OR TAPIR_ENABLE_NATIVE_CRUD_TEST_FAULT OR TAPIR_ENABLE_NATIVE_DISPOSABLE_CHANNEL_PROBE
+    OR TAPIR_ENABLE_NATIVE_DISPOSABLE_PERMIT OR TAPIR_ENABLE_NATIVE_DISPOSABLE_COLUMN
+    OR TAPIR_ENABLE_NATIVE_DISPOSABLE_LINE OR TAPIR_ENABLE_NATIVE_DISPOSABLE_ARC
+    OR TAPIR_ENABLE_NATIVE_DISPOSABLE_HATCH OR TAPIR_ENABLE_NATIVE_DISPOSABLE_ZONE
+    OR TAPIR_ENABLE_NATIVE_DISPOSABLE_DOOR OR TAPIR_ENABLE_NATIVE_DISPOSABLE_WINDOW))
+    message (FATAL_ERROR "The native Dimension producer must use a separate isolated APX profile from every other candidate, fault, and disposable profile.")
+endif ()
+
 option (TAPIR_ENABLE_NATIVE_DISPOSABLE_CHANNEL_PROBE
     "Compile the default-off disposable channel read-only probe into a test-only APX."
     OFF
@@ -137,7 +160,11 @@ else ()
 	set (NamePostFix Mac)
 endif ()
 set (AddOnName "TapirAddOn_AC${AC_VERSION}_${NamePostFix}")
-if (TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS)
+if (TAPIR_ENABLE_NATIVE_DIMENSION_CREATE_CANDIDATE AND TAPIR_ENABLE_NATIVE_DIMENSION_CREATE_POST_CREATE_FAULT)
+    set (AddOnName "${AddOnName}_NativeDimensionCreatePostCreateFault")
+elseif (TAPIR_ENABLE_NATIVE_DIMENSION_CREATE_CANDIDATE)
+    set (AddOnName "${AddOnName}_NativeDimensionCreateCandidate")
+elseif (TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS)
     # Candidate writers retain one shared developer-only identity, including
     # when combined with the first-applied rollback fault seam.
     set (AddOnName "${AddOnName}_NativeCandidateWriters")
@@ -272,6 +299,16 @@ else ()
 endif ()
 target_compile_definitions (AddOn PRIVATE TAPIR_BUILD_ID="${TAPIR_BUILD_ID_SAFE}")
 target_compile_definitions (AddOn PRIVATE TAPIR_AC_VERSION=${AC_VERSION})
+if (TAPIR_ENABLE_NATIVE_DIMENSION_CREATE_CANDIDATE)
+    target_compile_definitions (AddOn PRIVATE TAPIR_ENABLE_NATIVE_DIMENSION_CREATE_CANDIDATE=1)
+else ()
+    target_compile_definitions (AddOn PRIVATE TAPIR_ENABLE_NATIVE_DIMENSION_CREATE_CANDIDATE=0)
+endif ()
+if (TAPIR_ENABLE_NATIVE_DIMENSION_CREATE_POST_CREATE_FAULT)
+    target_compile_definitions (AddOn PRIVATE TAPIR_ENABLE_NATIVE_DIMENSION_CREATE_POST_CREATE_FAULT=1)
+else ()
+    target_compile_definitions (AddOn PRIVATE TAPIR_ENABLE_NATIVE_DIMENSION_CREATE_POST_CREATE_FAULT=0)
+endif ()
 if (TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS)
     target_compile_definitions (AddOn PRIVATE TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS=1)
 else ()
