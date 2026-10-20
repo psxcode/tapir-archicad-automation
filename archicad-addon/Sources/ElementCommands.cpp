@@ -229,6 +229,37 @@ static bool AddBoundedTextContent (GS::ObjectState& target, const API_ElementMem
     return true;
 }
 
+// Frame ("contour") decoration of a Text element or of a textual Label's
+// embedded API_TextType.  AC28 exposes API_TextFrameType (shape + fixed size);
+// AC25 has only the boolean contour, so its frame is always a rectangle.
+static GS::ObjectState CreateTextFrameObjectState (const API_TextType& text)
+{
+    GS::ObjectState frame;
+    frame.Add ("enabled", text.usedContour);
+    frame.Add ("contourPen", static_cast<Int32> (text.contourPen));
+    frame.Add ("contourOffset", text.contourOffset);
+    frame.Add ("usedFill", text.usedFill);
+#ifdef ServerMainVers_2800
+    const char* shape = "Unknown";
+    switch (text.textFrame.shapeType) {
+        case API_TextFrameShapeType_Rectangle:        shape = "Rectangle"; break;
+        case API_TextFrameShapeType_Circle:           shape = "Circle"; break;
+        case API_TextFrameShapeType_RoundedRectangle: shape = "RoundedRectangle"; break;
+        case API_TextFrameShapeType_Pill:             shape = "Pill"; break;
+        default: break;
+    }
+    frame.Add ("shape", shape);
+    frame.Add ("shapeSource", "API_TextFrameType");
+    frame.Add ("isSizeFixed", text.textFrame.isSizeFixed);
+    frame.Add ("fixedWidth", text.textFrame.fixedWidth);
+    frame.Add ("fixedHeight", text.textFrame.fixedHeight);
+#else
+    frame.Add ("shape", "Rectangle");
+    frame.Add ("shapeSource", "ac25_rectangle_only");
+#endif
+    return frame;
+}
+
 static void ApplyLineFamilyDetails (const GS::ObjectState& details,
                                     API_ExtendedPenType& pen,
                                     API_AttributeIndex& lineType,
@@ -1734,6 +1765,33 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                 typeSpecificDetails.Add ("midCoordinate", Create2DCoordinateObjectState (elem.label.midC));
                 typeSpecificDetails.Add ("endCoordinate", Create2DCoordinateObjectState (elem.label.endC));
                 typeSpecificDetails.Add ("hasLeaderLine", elem.label.hasLeaderLine);
+                typeSpecificDetails.Add ("labelClass", elem.label.labelClass == APILblClass_Text ? "Text" :
+                                                       elem.label.labelClass == APILblClass_Symbol ? "Symbol" : "Unknown");
+                // Label-level frame switch and text/frame offset (the embedded
+                // API_TextType.usedContour below is reported verbatim as well).
+                typeSpecificDetails.Add ("framed", elem.label.framed);
+                typeSpecificDetails.Add ("contourOffset", elem.label.contourOffset);
+                if (elem.label.labelClass == APILblClass_Text) {
+                    const API_TextType& labelText = elem.label.u.text;
+                    GS::ObjectState textDetails;
+                    textDetails.Add ("size", labelText.size);
+                    textDetails.Add ("angle", labelText.angle);
+                    textDetails.Add ("pen", static_cast<Int32> (labelText.pen));
+                    textDetails.Add ("fontIndex", static_cast<Int32> (labelText.font));
+                    textDetails.Add ("anchorCoordinate", Create2DCoordinateObjectState (labelText.loc));
+                    textDetails.Add ("frame", CreateTextFrameObjectState (labelText));
+                    typeSpecificDetails.Add ("text", textDetails);
+
+                    API_ElementMemo labelMemo = {};
+                    const GS::OnExit labelMemoGuard ([&labelMemo] () { ACAPI_DisposeElemMemoHdls (&labelMemo); });
+                    GSErrCode labelMemoErr;
+                    {
+                        PerfTrace::ScopeTimer timer (PerfTrace::Phase::TypeMemo);
+                        labelMemoErr = ACAPI_Element_GetMemo (elem.header.guid, &labelMemo, APIMemoMask_TextContentUni);
+                    }
+                    if (!AddBoundedTextContent (typeSpecificDetails, labelMemo, labelMemoErr))
+                        typeSpecificDetails.Add ("contentStatus", "unavailable");
+                }
                 break;
 
             case API_ObjectID:
@@ -2161,6 +2219,7 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                 typeSpecificDetails.Add ("justification", static_cast<Int32> (elem.text.just));
                 typeSpecificDetails.Add ("fixedAngle", elem.text.fixedAngle);
                 typeSpecificDetails.Add ("lineCount", elem.text.nLine);
+                typeSpecificDetails.Add ("frame", CreateTextFrameObjectState (elem.text));
 
                 API_ElementMemo memo = {};
                 const GS::OnExit guard ([&memo] () { ACAPI_DisposeElemMemoHdls (&memo); });
