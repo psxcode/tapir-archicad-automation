@@ -2461,6 +2461,30 @@ GS::ObjectState ExecuteDelete (
 
 constexpr UInt64 TextRichMemoMask = APIMemoMask_TextContentUni | APIMemoMask_ParagraphUni;
 
+// A Rich Text element draws with its run pens: API_TextType::pen alone is
+// overridden by the paragraph memo, so a pen-only UPDATE used to report
+// success while the visible pen stayed unchanged (V1-021).  Retarget every
+// run of the exact current memo; content, fonts and sizes stay as they are
+// (D-283 style-only rule).  Returns false when the memo has no paragraph
+// handle, in which case the element pen is the only pen to change.
+static bool SetAllRunPens (API_ElementMemo& memo, const short pen)
+{
+    if (memo.paragraphs == nullptr || *memo.paragraphs == nullptr)
+        return false;
+    const GSSize paragraphCount = BMhGetSize (reinterpret_cast<GSHandle> (memo.paragraphs)) / sizeof (API_ParagraphType);
+    bool changed = false;
+    for (GSSize paragraphIndex = 0; paragraphIndex < paragraphCount; ++paragraphIndex) {
+        API_ParagraphType& paragraph = (*memo.paragraphs)[paragraphIndex];
+        if (paragraph.run == nullptr) continue;
+        const GSSize runCount = BMGetPtrSize (reinterpret_cast<GSPtr> (paragraph.run)) / sizeof (API_RunType);
+        for (GSSize runIndex = 0; runIndex < runCount; ++runIndex) {
+            paragraph.run[runIndex].pen = pen;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
 void ApplyTextPlacement (
     API_Element& element,
     API_Element& mask,
@@ -2802,9 +2826,18 @@ GS::ObjectState ExecuteTextUpdate (
                             : richTextError));
                     }
                 }
+                Int32 requestedPen = 0;
+                bool penThroughMemo = false;
+                if (error == NoError && richText == nullptr && item.Get ("pen", requestedPen)) {
+                    error = ACAPI_Element_GetMemo (guid, &memo, TextRichMemoMask);
+                    if (error == NoError)
+                        penThroughMemo = SetAllRunPens (memo, static_cast<short> (requestedPen));
+                    else
+                        results (CreateFailedExecutionResult (error, "Failed to read the Rich Text memo for a pen UPDATE."));
+                }
                 if (error == NoError) {
                     ApplyTextPlacement (element, mask, item, false, stories);
-                    if (richText != nullptr) {
+                    if (richText != nullptr || penThroughMemo) {
                         error = ACAPI_Element_Change (&element, &mask, &memo, TextRichMemoMask, true);
                     } else {
                         error = ACAPI_Element_Change (&element, &mask, nullptr, 0, true);
