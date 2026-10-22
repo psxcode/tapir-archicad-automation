@@ -182,6 +182,16 @@ constexpr double CompensatedDoorCenterOffsetForWidthChange (const double centerO
 }
 
 constexpr double DoorCenterCompensationTestTolerance = 1.0e-12;
+
+// A created opening's lengths are recomputed by the host (live AC28: a
+// requested 0.2 m sill read back as 0.20000000000000018).  CREATE postconditions
+// compare them within the 1e-9 m Tapir readback resolution, far below the 1 mm
+// drafting defect (D-293), instead of bit-exact (V1-022).
+constexpr double OpeningCreateLengthTolerance = 1.0e-9;
+bool SameOpeningCreateLength (const double actual, const double requested)
+{
+    return std::fabs (actual - requested) <= OpeningCreateLengthTolerance;
+}
 constexpr double DoorCenterCompensationAbsolute (const double value) { return value < 0.0 ? -value : value; }
 static_assert (DoorCenterCompensationAbsolute (
     CompensatedDoorCenterOffsetForWidthChange (1.0, 0.9, 0.95) - 1.025) < DoorCenterCompensationTestTolerance,
@@ -263,14 +273,28 @@ GS::ObjectState ExecuteDoorCreate (const GS::Array<GS::ObjectState>& items, GS::
             created.header.guid = element.header.guid;
             failureStage = "read-created-door";
             error = ACAPI_Element_Get (&created);
-            if (error == NoError && (created.header.guid == APINULLGuid || created.header.guid == sourceGuid
-                || created.header.floorInd != static_cast<short> (storyIndex) || created.door.owner != hostGuid
-                || created.door.openingBase.width != element.door.openingBase.width || created.door.openingBase.height != element.door.openingBase.height
-                || created.door.objLoc != element.door.objLoc || created.door.lower != element.door.lower
-                || created.door.openingBase.reflected != element.door.openingBase.reflected
-                || created.door.openingBase.refSide != element.door.openingBase.refSide || created.door.openingBase.oSide != element.door.openingBase.oSide
-                || created.door.openingBase.libInd != source.door.openingBase.libInd
-                || created.door.openingBase.markGuid != APINULLGuid)) error = APIERR_COMMANDFAILED;
+            if (error == NoError) {
+                // Name the first field that did not hold, with the created
+                // value, so the factual history row says why (V1-022).
+                GS::UniString mismatch;
+                const auto differs = [&] (const char* field, double actual, double requested = 0.0) { if (mismatch.IsEmpty ()) mismatch = GS::UniString::Printf (":%s=%.17g/requested=%.17g", field, actual, requested); };
+                if (created.header.guid == APINULLGuid || created.header.guid == sourceGuid) differs ("guid", 0.0);
+                if (created.header.floorInd != static_cast<short> (storyIndex)) differs ("floorIndex", created.header.floorInd);
+                if (created.door.owner != hostGuid) differs ("owner", 0.0);
+                if (!SameOpeningCreateLength (created.door.openingBase.width, element.door.openingBase.width)) differs ("width", created.door.openingBase.width, element.door.openingBase.width);
+                if (!SameOpeningCreateLength (created.door.openingBase.height, element.door.openingBase.height)) differs ("height", created.door.openingBase.height, element.door.openingBase.height);
+                if (!SameOpeningCreateLength (created.door.objLoc, element.door.objLoc)) differs ("centerOffset", created.door.objLoc, element.door.objLoc);
+                if (!SameOpeningCreateLength (created.door.lower, element.door.lower)) differs ("sillHeight", created.door.lower, element.door.lower);
+                if (created.door.openingBase.reflected != element.door.openingBase.reflected) differs ("reflected", created.door.openingBase.reflected);
+                if (created.door.openingBase.refSide != element.door.openingBase.refSide) differs ("refSide", created.door.openingBase.refSide);
+                if (created.door.openingBase.oSide != element.door.openingBase.oSide) differs ("oSide", created.door.openingBase.oSide);
+                if (created.door.openingBase.libInd != source.door.openingBase.libInd) differs ("libInd", created.door.openingBase.libInd);
+                if (created.door.openingBase.markGuid != APINULLGuid) differs ("markGuid", 0.0);
+                if (!mismatch.IsEmpty ()) {
+                    failureStage += mismatch;
+                    error = APIERR_COMMANDFAILED;
+                }
+            }
             API_Element sourceAfter = {};
             if (error == NoError) {
                 sourceAfter.header.guid = sourceGuid;
@@ -893,7 +917,7 @@ GS::Optional<GS::UniString> ValidateAllowedPayloadFields (
     static const char* knownFields[] = {
         "begCoordinate", "endCoordinate", "coordinates", "origin", "floorIndex", "storyIndex", "zCoordinate", "elevation", "level",
         "height", "width", "depth", "thickness", "bottomOffset", "offset", "slantAngle", "arcAngle",
-        "verticalCurveHeight", "axisRotationAngle", "profileAngle", "referenceLineLocation", "referencePlaneLocation",
+        "verticalCurveHeight", "axisRotationAngle", "profileAngle", "referenceLineLocation", "flipped", "referencePlaneLocation",
         "structureType", "buildingMaterialId", "compositeId", "profileId", "anchorPoint", "coreAnchor",
         "circleBased", "isWidthAndHeightLinked", "isSlanted", "polygonCoordinates", "polygonOutline", "polygonArcs", "holes",
         "richText", "coordinate", "angle", "anchor", "pen", "nonBreaking", "linePen", "linePenIndex", "lineTypeIndex",
@@ -923,12 +947,12 @@ GS::Optional<GS::UniString> ValidateAllowedPayloadFields (
         if (isCreate) {
             return rejectUnsupportedFields ({
                 "begCoordinate", "endCoordinate", "floorIndex", "zCoordinate", "height", "thickness", "offset", "arcAngle",
-                "referenceLineLocation", "structureType", "buildingMaterialId", "compositeId", "profileId"
+                "referenceLineLocation", "flipped", "structureType", "buildingMaterialId", "compositeId", "profileId"
             });
         }
         return rejectUnsupportedFields ({
                 "begCoordinate", "endCoordinate", "storyIndex", "elevation", "arcAngle", "height", "thickness", "bottomOffset", "offset",
-                "referenceLineLocation", "structureType", "buildingMaterialId", "compositeId", "profileId"
+                "referenceLineLocation", "flipped", "structureType", "buildingMaterialId", "compositeId", "profileId"
         });
     } else if (typeID == API_SlabID) {
         if (isCreate) {
@@ -1123,6 +1147,8 @@ GS::Optional<GS::UniString> ValidatePayload (
         error = ValidateFloorIndexField (payload, "storyIndex");
         if (error.HasValue ()) return error;
         error = ValidateFiniteNumberField (payload, "elevation");
+        if (error.HasValue ()) return error;
+        error = ValidateBooleanField (payload, "flipped");
         if (error.HasValue ()) return error;
         error = ValidateEnumField (payload, "referenceLineLocation", {
             "Outside", "Center", "Inside", "CoreOutside", "CoreCenter", "CoreInside"
@@ -1431,13 +1457,28 @@ GS::ObjectState ExecuteWindowCreate (const GS::Array<GS::ObjectState>& items, GS
             after.header.guid = element.header.guid;
             failureStage = "verify-created-window";
             error = ACAPI_Element_Get (&after);
-            if (error == NoError && (after.header.guid == APINULLGuid || after.header.guid == sourceGuid || after.header.floorInd != static_cast<short> (storyIndex)
-                || after.window.owner != hostGuid || after.window.openingBase.markGuid != APINULLGuid
-                || after.window.openingBase.libInd != source.window.openingBase.libInd || !WindowNativeTopologySupported (after)
-                || after.window.objLoc != element.window.objLoc || after.window.lower != element.window.lower
-                || after.window.openingBase.width != element.window.openingBase.width || after.window.openingBase.height != element.window.openingBase.height
-                || after.window.openingBase.reflected != element.window.openingBase.reflected || after.window.openingBase.refSide != element.window.openingBase.refSide
-                || after.window.openingBase.oSide != element.window.openingBase.oSide)) error = APIERR_COMMANDFAILED;
+            if (error == NoError) {
+                // Name the first field that did not hold, as for Door (V1-022).
+                GS::UniString mismatch;
+                const auto differs = [&] (const char* field, double actual, double requested = 0.0) { if (mismatch.IsEmpty ()) mismatch = GS::UniString::Printf (":%s=%.17g/requested=%.17g", field, actual, requested); };
+                if (after.header.guid == APINULLGuid || after.header.guid == sourceGuid) differs ("guid", 0.0);
+                if (after.header.floorInd != static_cast<short> (storyIndex)) differs ("floorIndex", after.header.floorInd);
+                if (after.window.owner != hostGuid) differs ("owner", 0.0);
+                if (after.window.openingBase.markGuid != APINULLGuid) differs ("markGuid", 0.0);
+                if (after.window.openingBase.libInd != source.window.openingBase.libInd) differs ("libInd", after.window.openingBase.libInd);
+                if (!WindowNativeTopologySupported (after)) differs ("topology", 0.0);
+                if (!SameOpeningCreateLength (after.window.objLoc, element.window.objLoc)) differs ("centerOffset", after.window.objLoc, element.window.objLoc);
+                if (!SameOpeningCreateLength (after.window.lower, element.window.lower)) differs ("sillHeight", after.window.lower, element.window.lower);
+                if (!SameOpeningCreateLength (after.window.openingBase.width, element.window.openingBase.width)) differs ("width", after.window.openingBase.width, element.window.openingBase.width);
+                if (!SameOpeningCreateLength (after.window.openingBase.height, element.window.openingBase.height)) differs ("height", after.window.openingBase.height, element.window.openingBase.height);
+                if (after.window.openingBase.reflected != element.window.openingBase.reflected) differs ("reflected", after.window.openingBase.reflected);
+                if (after.window.openingBase.refSide != element.window.openingBase.refSide) differs ("refSide", after.window.openingBase.refSide);
+                if (after.window.openingBase.oSide != element.window.openingBase.oSide) differs ("oSide", after.window.openingBase.oSide);
+                if (!mismatch.IsEmpty ()) {
+                    failureStage += mismatch;
+                    error = APIERR_COMMANDFAILED;
+                }
+            }
             API_LibPart createdPart = {};
             LibraryPartLocationGuard createdPartGuard (createdPart);
             if (error == NoError) {
@@ -2297,6 +2338,12 @@ bool ApplyNativeCrudWallDetails (
             return false;
         }
         ACAPI_ELEMENT_MASK_SET (mask, API_WallType, referenceLineLocation);
+        changed = true;
+    }
+    bool flipped = false;
+    if (details.Get ("flipped", flipped)) {
+        element.wall.flipped = flipped;
+        ACAPI_ELEMENT_MASK_SET (mask, API_WallType, flipped);
         changed = true;
     }
     return true;

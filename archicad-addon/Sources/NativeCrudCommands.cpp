@@ -44,9 +44,9 @@ constexpr const char* SnapshotVersion = "native-element-snapshot-v1";
 constexpr const char* ReceiptVersion = "native-mutation-receipt-v1";
 constexpr const char* HistoryVersion = "native-mutation-history-v1";
 constexpr const char* CapabilitySchemaVersion = "native-crud-capabilities-v2";
-constexpr const char* CapabilitySchemaHash = "3eee0c6ffe9f006ec6ddfa65faefd45d80cfc246e5b7a4da2aa0fdd3125b7f7b";
+constexpr const char* CapabilitySchemaHash = "62e57e16dad3389a7852d70552af41eaf9ef7c08eb71687d0016329002db228b";
 constexpr const char* CapabilitySchemaV3Version = "native-crud-capabilities-v3";
-constexpr const char* CapabilitySchemaV3Hash = "14b8ca2431813e2c66f518ed074ba1801d313fb5615b2ca17fb02e604a2eba33";
+constexpr const char* CapabilitySchemaV3Hash = "0b02675a0d1fb224469ee82d55c9eb0f6a7f030c2f3211d3203e717d0b7627b4";
 constexpr const char* ImpactEnvelopeVersion = "native-impact-envelope-v1";
 constexpr const char* ImpactEvidenceVersion = "native-impact-evidence-v1";
 constexpr const char* ImpactMetadataKey = "nativeImpact";
@@ -372,6 +372,8 @@ GS::ObjectState CanonicalWritableState (
         CopyStringField (details, "structureType", state, "structure");
         CopyObjectField (details, "compositeId", state, "composite");
         CopyStringField (details, "referenceLineLocation", state, "referenceLine");
+        // Which side of the reference line the Wall body lies on (V1-022).
+        CopyBoolField (details, "flipped", state, "flipped");
     } else if (typeName == "Column") {
         CopyObjectField (details, "origin", state, "origin");
         CopyDoubleField (details, "zCoordinate", state, "elevation");
@@ -783,7 +785,7 @@ void AddCanonicalWritableFields (GS::ObjectState& target, const GS::UniString& t
         count = sizeof (values) / sizeof (values[0]);
         for (GSSize i = 0; i < count; ++i) fields[i] = values[i];
     } else if (typeName == "Wall") {
-        const char* values[] = { "begCoordinate", "endCoordinate", "elevation", "height", "thickness", "offset", "structure", "composite", "referenceLine" };
+        const char* values[] = { "begCoordinate", "endCoordinate", "elevation", "height", "thickness", "offset", "structure", "composite", "referenceLine", "flipped" };
         count = sizeof (values) / sizeof (values[0]);
         for (GSSize i = 0; i < count; ++i) fields[i] = values[i];
     } else if (typeName == "Column") {
@@ -1649,7 +1651,18 @@ GS::ObjectState BuildNativeMutationParameters (
                 CopyObjectField (*payload, "begCoordinate", mapped, "begCoordinate");
                 CopyObjectField (*payload, "endCoordinate", mapped, "endCoordinate");
                 if (operation == "create") {
-                    CopyDoubleField (*payload, "elevation", mapped, "zCoordinate");
+                    // `elevation` is the absolute bottom level in READ and
+                    // UPDATE.  CreateWalls reads zCoordinate as a bottom
+                    // offset once floorIndex pins the story, so convert it
+                    // against the placement story (V1-022).
+                    double elevation = 0.0;
+                    if (payload->Get ("elevation", elevation)) {
+                        const GS::ObjectState* placement = item.Get ("placement");
+                        Int32 storyIndex = 0;
+                        if (placement != nullptr && placement->Get ("storyIndex", storyIndex))
+                            elevation -= GetZPos (static_cast<short> (storyIndex), 0.0, GetStories ());
+                        mapped.Add ("zCoordinate", elevation);
+                    }
                 } else {
                     // Wall UPDATE has a different native mask contract from
                     // CREATE.  Keep the canonical placement names internal
@@ -1666,6 +1679,7 @@ GS::ObjectState BuildNativeMutationParameters (
                 CopyObjectField (*payload, "profile", mapped, "profileId");
                 CopyObjectField (*payload, "composite", mapped, "compositeId");
                 CopyStringField (*payload, "referenceLine", mapped, "referenceLineLocation");
+                CopyBoolField (*payload, "flipped", mapped, "flipped");
             } else if (typeName == "Column") {
                 if (operation == "create") {
                     CopyColumnCreateCoordinates (*payload, mapped);

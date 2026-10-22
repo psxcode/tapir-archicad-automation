@@ -3984,6 +3984,7 @@ GS::Optional<GS::UniString> CreateWallsCommand::GetInputParametersSchema () cons
                             "type": "string",
                             "enum": ["Outside", "Center", "Inside", "CoreOutside", "CoreCenter", "CoreInside"]
                         },
+                        "flipped": { "type": "boolean", "description": "The Wall body lies on the mirrored side of its reference line." },
                         "structureType": {
                             "type": "string",
                             "enum": ["Basic", "Composite", "Profile"]
@@ -4053,6 +4054,11 @@ GS::Optional<GS::ObjectState> CreateWallsCommand::SetTypeSpecificParameters (API
     }
     element.wall.modelElemStructureType = API_BasicStructure;
     element.wall.offset = 0.0;
+    // Without an explicit value the Wall tool default decides the side.
+    bool flipped = false;
+    if (parameters.Get ("flipped", flipped)) {
+        element.wall.flipped = flipped;
+    }
 
     auto offset = GetOptionalDouble (parameters, "offset");
 
