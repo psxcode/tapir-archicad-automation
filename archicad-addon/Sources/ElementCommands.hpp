@@ -59,17 +59,6 @@ public:
     virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
 };
 
-/** Developer-only exact Arc drawing primitives for candidate diagnostics. */
-class GetNativeArcDrawingPrimitivesCommand : public CommandBase
-{
-public:
-    GetNativeArcDrawingPrimitivesCommand ();
-    virtual GS::String GetName () const override;
-    virtual GS::Optional<GS::UniString> GetInputParametersSchema () const override;
-    virtual GS::Optional<GS::UniString> GetResponseSchema () const override;
-    virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
-};
-
 /**
  * Read-only drafting projection used by the disposable sheet-index capture.
  * This command deliberately returns geometry only; sheet/stamp semantics stay

@@ -3354,17 +3354,6 @@ GS::Optional<GS::UniString> MutateElementsCommand::GetInputParametersSchema () c
                 "type": "string",
                 "enum": ["Wall", "Slab", "Column", "Beam", "Text", "Line", "Arc", "Hatch", "Door"]
             },
-            "nativeCandidateColumnTemplateSection": {
-                "type": "object",
-                "description": "Internal candidate-only factual section readback for the exact same-file Column template."
-            },
-            "nativeCandidateDoorFields": {
-                "type": "array",
-                "description": "Internal candidate authorization derived by NativeCrudCommands' exact public-to-native Door field mapping.",
-                "items": { "type": "string", "enum": ["ownerWallId", "centerOffset", "sillHeight", "width", "height", "reflected", "refSide", "oSide"] },
-                "minItems": 1,
-                "uniqueItems": true
-            },
             "items": {
                 "type": "array",
                 "minItems": 1,
@@ -3587,6 +3576,11 @@ GS::ObjectState MutateElementsCommand::Execute (
     const GS::ObjectState& parameters,
     GS::ProcessControl& processControl) const
 {
+    for (const GS::String& fieldName : parameters.GetFieldNames ()) {
+        if (GS::UniString (fieldName).BeginsWith ("nativeCandidate"))
+            return CreateErrorResponse (APIERR_BADPARS, "Native candidate writer metadata is retired (D-307).");
+    }
+
     GS::UniString operation;
     if (!parameters.Get ("operation", operation) || !IsOneOf (operation, { "create", "update", "delete" })) {
         return CreateErrorResponse (APIERR_BADPARS, "'operation' must be one of 'create', 'update' or 'delete'.");
@@ -3602,80 +3596,25 @@ GS::ObjectState MutateElementsCommand::Execute (
     parameters.Get ("nativeCrudAtomic", nativeCrudAtomic);
     bool nativeCrudHatchWriter = false;
     parameters.Get ("nativeCrudHatchWriter", nativeCrudHatchWriter);
-    bool nativeCandidateHatchWriter = false;
-    const bool hasNativeCandidateHatchWriter = parameters.Get ("nativeCandidateHatchWriter", nativeCandidateHatchWriter);
-    if (parameters.Contains ("nativeCandidateHatchWriter") && !hasNativeCandidateHatchWriter)
-        return CreateErrorResponse (APIERR_BADPARS, "Candidate Hatch diagnostics marker must be a boolean.");
     if (nativeCrudHatchWriter && (typeID != API_HatchID || (operation != "create" && operation != "update")))
         return CreateErrorResponse (APIERR_BADPARS, "Hatch typed writer marker is valid only for Hatch CREATE or UPDATE.");
     bool nativeCrudDoorWriter = false;
     const bool hasNativeCrudDoorWriter = parameters.Get ("nativeCrudDoorWriter", nativeCrudDoorWriter);
     if (parameters.Contains ("nativeCrudDoorWriter") && !hasNativeCrudDoorWriter)
         return CreateErrorResponse (APIERR_BADPARS, "Door typed writer marker must be a boolean.");
-    bool nativeCandidateDoorWriter = false;
-    const bool hasNativeCandidateDoorWriter = parameters.Get ("nativeCandidateDoorWriter", nativeCandidateDoorWriter);
-    if (parameters.Contains ("nativeCandidateDoorWriter") && !hasNativeCandidateDoorWriter)
-        return CreateErrorResponse (APIERR_BADPARS, "Door candidate writer marker must be a boolean.");
-    GS::Array<GS::UniString> nativeCandidateDoorFields;
-    const bool hasNativeCandidateDoorFields = parameters.Get ("nativeCandidateDoorFields", nativeCandidateDoorFields);
-    if (parameters.Contains ("nativeCandidateDoorFields") && !hasNativeCandidateDoorFields)
-        return CreateErrorResponse (APIERR_BADPARS, "Door candidate native field authorization must be a string array.");
     if (nativeCrudDoorWriter && (typeID != API_DoorID || (operation != "create" && operation != "update")))
         return CreateErrorResponse (APIERR_BADPARS, "Door typed writer marker is valid only for Door CREATE or UPDATE.");
     if (typeID == API_DoorID && (operation == "create" || operation == "update")
         && !nativeCrudDoorWriter)
         return CreateErrorResponse (APIERR_BADPARS, "Door CREATE/UPDATE requires the typed Native CRUD writer route.");
-    if (nativeCandidateDoorWriter && (!nativeCrudDoorWriter || typeID != API_DoorID || operation != "create" && operation != "update"))
-        return CreateErrorResponse (APIERR_BADPARS, "Candidate Door marker is valid only for Door CREATE or UPDATE through its typed writer.");
-    if (nativeCandidateDoorWriter != hasNativeCandidateDoorFields || (nativeCandidateDoorWriter && nativeCandidateDoorFields.IsEmpty ()))
-        return CreateErrorResponse (APIERR_BADPARS, "Candidate Door writes require the exact flattened native field authorization derived at the Native CRUD boundary.");
-    if (!nativeCandidateDoorWriter && hasNativeCandidateDoorFields)
-        return CreateErrorResponse (APIERR_BADPARS, "Door candidate field authorization is invalid without the guarded candidate writer.");
     bool nativeCrudWindowWriter = false;
     const bool hasNativeCrudWindowWriter = parameters.Get ("nativeCrudWindowWriter", nativeCrudWindowWriter);
     if (parameters.Contains ("nativeCrudWindowWriter") && !hasNativeCrudWindowWriter)
         return CreateErrorResponse (APIERR_BADPARS, "Window typed writer marker must be a boolean.");
-    bool nativeCandidateWindowWriter = false;
-    const bool hasNativeCandidateWindowWriter = parameters.Get ("nativeCandidateWindowWriter", nativeCandidateWindowWriter);
-    if (parameters.Contains ("nativeCandidateWindowWriter") && !hasNativeCandidateWindowWriter)
-        return CreateErrorResponse (APIERR_BADPARS, "Window candidate writer marker must be a boolean.");
-    GS::Array<GS::UniString> nativeCandidateWindowFields;
-    const bool hasNativeCandidateWindowFields = parameters.Get ("nativeCandidateWindowFields", nativeCandidateWindowFields);
-    if (parameters.Contains ("nativeCandidateWindowFields") && !hasNativeCandidateWindowFields)
-        return CreateErrorResponse (APIERR_BADPARS, "Window candidate native field authorization must be a string array.");
     if (nativeCrudWindowWriter && (typeID != API_WindowID || (operation != "create" && operation != "update")))
         return CreateErrorResponse (APIERR_BADPARS, "Window typed writer marker is valid only for Window CREATE or UPDATE.");
     if (typeID == API_WindowID && (operation == "create" || operation == "update") && !nativeCrudWindowWriter)
         return CreateErrorResponse (APIERR_BADPARS, "Window CREATE/UPDATE requires its typed Native CRUD writer route.");
-    if (nativeCandidateWindowWriter && (!nativeCrudWindowWriter || typeID != API_WindowID || (operation != "create" && operation != "update")))
-        return CreateErrorResponse (APIERR_BADPARS, "Candidate Window marker is valid only for Window CREATE/UPDATE through its typed writer.");
-    if (nativeCandidateWindowWriter != hasNativeCandidateWindowFields || (nativeCandidateWindowWriter && nativeCandidateWindowFields.IsEmpty ()))
-        return CreateErrorResponse (APIERR_BADPARS, "Candidate Window writes require exact flattened native field authorization.");
-    if (!nativeCandidateWindowWriter && hasNativeCandidateWindowFields)
-        return CreateErrorResponse (APIERR_BADPARS, "Window candidate field authorization is invalid without its guarded writer.");
-#if !TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS
-    if (hasNativeCandidateWindowWriter || hasNativeCandidateWindowFields)
-        return CreateErrorResponse (APIERR_BADPARS, "Window candidate writer is unavailable in this ordinary APX build.");
-#endif
-    if (typeID == API_WindowID && (operation == "create" || operation == "update")) {
-#if TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS
-        if (!nativeCandidateWindowWriter)
-            return CreateErrorResponse (APIERR_BADPARS, "Window candidate build requires its exact guarded candidate writer marker.");
-#else
-        // Ordinary requests have already rejected candidate-only metadata;
-        // they use the same typed writer and factual host/story postconditions.
-#endif
-    }
-#if !TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS
-    if (hasNativeCandidateDoorWriter || hasNativeCandidateDoorFields)
-        return CreateErrorResponse (APIERR_BADPARS, "Door candidate writer is unavailable in this ordinary APX build.");
-#endif
-    if (nativeCandidateHatchWriter && (!nativeCrudHatchWriter || typeID != API_HatchID || operation != "create"))
-        return CreateErrorResponse (APIERR_BADPARS, "Candidate Hatch diagnostics are valid only for Hatch CREATE through its typed writer.");
-#if !TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS
-    if (nativeCandidateHatchWriter)
-        return CreateErrorResponse (APIERR_BADPARS, "Candidate Hatch diagnostics are unavailable in this ordinary APX build.");
-#endif
     if (typeID == API_HatchID && (operation == "create" || operation == "update") && !nativeCrudHatchWriter)
         return CreateErrorResponse (APIERR_BADPARS, "Hatch CREATE/UPDATE requires the validated typed Native CRUD writer route.");
     bool nativeCrudTestFaultAfterFirstApplied = false;
@@ -3688,16 +3627,6 @@ GS::ObjectState MutateElementsCommand::Execute (
 #else
     if (nativeCrudTestFaultAfterFirstApplied && ((typeID != API_ColumnID && typeID != API_LineID && typeID != API_ArcID && typeID != API_HatchID && typeID != API_DoorID && typeID != API_WindowID) || operation != "update"))
         return CreateErrorResponse (APIERR_BADPARS, "First-applied fault seam is valid only for Column, Line, Arc, Hatch, Door or Window UPDATE.");
-#endif
-    GS::ObjectState candidateColumnTemplateSection;
-    const bool hasCandidateColumnTemplateSection = parameters.Get ("nativeCandidateColumnTemplateSection", candidateColumnTemplateSection);
-    if (parameters.Contains ("nativeCandidateColumnTemplateSection") && !hasCandidateColumnTemplateSection)
-        return CreateErrorResponse (APIERR_BADPARS, "Column candidate template section is malformed.");
-    if (hasCandidateColumnTemplateSection && (operation != "create" || typeID != API_ColumnID))
-        return CreateErrorResponse (APIERR_BADPARS, "Column candidate template section is valid only for Column CREATE.");
-#if !TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS
-    if (hasCandidateColumnTemplateSection)
-        return CreateErrorResponse (APIERR_BADPARS, "Column candidate template section is unavailable in this APX build.");
 #endif
     const bool isDoor = typeID == API_DoorID;
     const bool isWindow = typeID == API_WindowID;
@@ -3727,55 +3656,6 @@ GS::ObjectState MutateElementsCommand::Execute (
             // called.  Invalid enum/range/reference/conflict input therefore
             // cannot result in a native mutation.
             return CreateErrorResponse (APIERR_BADPARS, error.Get ());
-        }
-    }
-    if (nativeCandidateDoorWriter) {
-        GS::HashSet<GS::UniString> authorized;
-        for (const GS::UniString& field : nativeCandidateDoorFields) {
-            if (authorized.Contains (field)) return CreateErrorResponse (APIERR_BADPARS, "Door candidate native field authorization contains duplicates.");
-            authorized.Add (field);
-        }
-        for (const GS::ObjectState& item : normalizedItems) {
-            // CREATE keeps its nested payload; UPDATE is flattened by
-            // ValidateEnvelopeItem and carries the target GUID at top level.
-            // Validate exactly the corresponding normalized writable fields.
-            const GS::ObjectState* shape = operation == "create" ? item.Get ("payload") : &item;
-            if (shape == nullptr) return CreateErrorResponse (APIERR_BADPARS, "Door candidate normalized item is missing its payload/patch.");
-            GS::HashSet<GS::UniString> actual;
-            for (const GS::String& name : shape->GetFieldNames ()) {
-                const GS::UniString field (name);
-                if (operation == "create" && field == "floorIndex") continue;
-                if (operation == "update" && field == "elementId") continue;
-                actual.Add (field);
-            }
-            if (actual.GetSize () != authorized.GetSize ())
-                return CreateErrorResponse (APIERR_BADPARS, "Door candidate flattened field authorization does not match the normalized native item.");
-            for (const GS::UniString& field : actual)
-                if (!authorized.Contains (field)) return CreateErrorResponse (APIERR_BADPARS, "Door candidate flattened field authorization does not match the normalized native item.");
-        }
-    }
-    if (nativeCandidateWindowWriter) {
-        GS::HashSet<GS::UniString> authorized;
-        const std::initializer_list<const char*> allowedFields = { "ownerWallId", "centerOffset", "sillHeight", "width", "height", "reflected", "refSide", "oSide" };
-        for (const GS::UniString& field : nativeCandidateWindowFields) {
-            if (authorized.Contains (field)) return CreateErrorResponse (APIERR_BADPARS, "Window candidate native field authorization contains duplicates.");
-            bool allowed = false;
-            for (const char* allowedField : allowedFields) allowed = allowed || field == allowedField;
-            if (!allowed) return CreateErrorResponse (APIERR_BADPARS, "Window candidate native field authorization contains an unsupported field.");
-            authorized.Add (field);
-        }
-        for (const GS::ObjectState& item : normalizedItems) {
-            const GS::ObjectState* shape = operation == "create" ? item.Get ("payload") : &item;
-            if (shape == nullptr) return CreateErrorResponse (APIERR_BADPARS, "Window candidate normalized item is missing its payload/patch.");
-            GS::HashSet<GS::UniString> actual;
-            for (const GS::String& name : shape->GetFieldNames ()) {
-                const GS::UniString field (name);
-                if (operation == "create" && field == "floorIndex") continue;
-                if (operation == "update" && field == "elementId") continue;
-                actual.Add (field);
-            }
-            if (actual.GetSize () != authorized.GetSize ()) return CreateErrorResponse (APIERR_BADPARS, "Window candidate flattened field authorization differs from its normalized native item.");
-            for (const GS::UniString& field : actual) if (!authorized.Contains (field)) return CreateErrorResponse (APIERR_BADPARS, "Window candidate flattened field authorization differs from its normalized native item.");
         }
     }
 
@@ -3816,33 +3696,13 @@ GS::ObjectState MutateElementsCommand::Execute (
     GS::ObjectState mutationParameters;
     if ((isDoor || isWindow) && operation == "create") {
         mutationParameters = BuildArrayParameters ("items", normalizedItems);
-        if (nativeCandidateDoorWriter) {
-            mutationParameters.Add ("nativeCandidateDoorWriter", true);
-            mutationParameters.Add ("nativeCandidateDoorFields", nativeCandidateDoorFields);
-        }
-        if (nativeCandidateWindowWriter) {
-            mutationParameters.Add ("nativeCandidateWindowWriter", true);
-            mutationParameters.Add ("nativeCandidateWindowFields", nativeCandidateWindowFields);
-        }
     } else if (!isText && !isDoor && !isWindow && operation == "create") {
         mutationParameters = BuildArrayParameters (typeSpec->createArrayName, normalizedItems);
-        if (hasCandidateColumnTemplateSection)
-            mutationParameters.Add ("nativeCandidateColumnTemplateSection", candidateColumnTemplateSection);
         if (nativeCrudHatchWriter)
             mutationParameters.Add ("nativeCrudHatchWriter", true);
-        if (nativeCandidateHatchWriter)
-            mutationParameters.Add ("nativeCandidateHatchWriter", true);
     } else if ((isDoor || isWindow) && operation == "update") {
         mutationParameters = BuildArrayParameters ("items", normalizedItems);
         mutationParameters.Add ("nativeCrudAtomic", true);
-        if (nativeCandidateDoorWriter) {
-            mutationParameters.Add ("nativeCandidateDoorWriter", true);
-            mutationParameters.Add ("nativeCandidateDoorFields", nativeCandidateDoorFields);
-        }
-        if (nativeCandidateWindowWriter) {
-            mutationParameters.Add ("nativeCandidateWindowWriter", true);
-            mutationParameters.Add ("nativeCandidateWindowFields", nativeCandidateWindowFields);
-        }
 #if defined(TAPIR_NATIVE_CRUD_TEST_FAULT_AFTER_FIRST_APPLIED)
         if (nativeCrudTestFaultAfterFirstApplied) mutationParameters.Add ("nativeCrudTestFaultAfterFirstApplied", true);
 #endif

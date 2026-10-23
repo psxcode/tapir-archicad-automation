@@ -14,193 +14,6 @@
 
 namespace {
 
-GS::Optional<GS::UniString> ValidateColumnCandidateDefaultSection (
-    const API_Element& element,
-    const API_ElementMemo& memo,
-    const GS::ObjectState& qualifiedTemplateSection,
-    GS::ObjectState& diagnosticDetails)
-{
-    GS::UniString status;
-    Int32 segmentCount = 0;
-    bool simpleVertical = false;
-    GS::Array<GS::ObjectState> templateSegments;
-    GS::Array<GS::UniString> mismatchingFields;
-    diagnosticDetails.Add ("expectedTemplateSection", qualifiedTemplateSection);
-
-    GS::ObjectState observedDefaults;
-    observedDefaults.Add ("isSlanted", element.column.isSlanted);
-    if (std::isfinite (element.column.slantAngle))
-        observedDefaults.Add ("slantAngle", element.column.slantAngle);
-    else
-        observedDefaults.Add ("slantAngle", "unavailable");
-    const char* observedSectionStatus = "unavailable";
-    GS::ObjectState unavailableSegment;
-    unavailableSegment.Add ("status", "unavailable");
-    unavailableSegment.Add ("shape", "unavailable");
-    unavailableSegment.Add ("structure", "unavailable");
-    unavailableSegment.Add ("profileType", "unavailable");
-    unavailableSegment.Add ("nominalWidth", "unavailable");
-    unavailableSegment.Add ("nominalDepth", "unavailable");
-    unavailableSegment.Add ("dimensionsLinked", "unavailable");
-    unavailableSegment.Add ("materialGuid", "unavailable");
-    unavailableSegment.Add ("homogeneous", "unavailable");
-    unavailableSegment.Add ("endWidth", "unavailable");
-    unavailableSegment.Add ("endDepth", "unavailable");
-    unavailableSegment.Add ("endDimensionsLinked", "unavailable");
-    unavailableSegment.Add ("endDimensionsStatus", "unavailable");
-    GSSize observedSegmentCount = 0;
-    if (memo.columnSegments != nullptr) {
-        const GSSize bytes = BMGetPtrSize (reinterpret_cast<GSPtr> (memo.columnSegments));
-        if (bytes > 0 && bytes % sizeof (API_ColumnSegmentType) == 0) {
-            observedSegmentCount = bytes / sizeof (API_ColumnSegmentType);
-            observedSectionStatus = "available";
-            observedDefaults.Add ("segmentCount", static_cast<Int32> (observedSegmentCount));
-            if (observedSegmentCount == 0) observedDefaults.Add ("segment", unavailableSegment);
-            if (observedSegmentCount > 0) {
-                const API_AssemblySegmentData& actual = memo.columnSegments[0].assemblySegmentData;
-                const char* shape = actual.circleBased ? "circular" : "rectangular";
-                const char* structure = actual.modelElemStructureType == API_BasicStructure ? "Basic"
-                    : actual.modelElemStructureType == API_ProfileStructure ? "Profile" : "unsupported";
-                const API_Guid actualMaterial = actual.modelElemStructureType == API_BasicStructure
-                    && actual.buildingMaterial != APIInvalidAttributeIndex
-                    ? GetAttributeGuidFromIndex (API_BuildingMaterialID, actual.buildingMaterial) : APINULLGuid;
-                const GS::UniString actualMaterialText = actualMaterial == APINULLGuid
-                    ? GS::UniString ("unavailable") : APIGuidToString (actualMaterial);
-                GS::ObjectState observedSegment;
-                observedSegment.Add ("status", "available");
-                observedSegment.Add ("shape", shape);
-                observedSegment.Add ("circleBased", actual.circleBased);
-                observedSegment.Add ("structure", structure);
-                observedSegment.Add ("profileType", static_cast<Int32> (actual.profileType));
-                if (std::isfinite (actual.nominalWidth) && actual.nominalWidth > 0.0)
-                    observedSegment.Add ("nominalWidth", actual.nominalWidth);
-                else
-                    observedSegment.Add ("nominalWidth", "unavailable");
-                if (std::isfinite (actual.nominalHeight) && actual.nominalHeight > 0.0)
-                    observedSegment.Add ("nominalDepth", actual.nominalHeight);
-                else
-                    observedSegment.Add ("nominalDepth", "unavailable");
-                observedSegment.Add ("dimensionsLinked", actual.isWidthAndHeightLinked);
-                observedSegment.Add ("materialGuid", actualMaterialText);
-                observedSegment.Add ("homogeneous", actual.isHomogeneous);
-                if (!actual.isHomogeneous)
-                    observedSegment.Add ("endDimensionsLinked", actual.isEndWidthAndHeightLinked);
-                GS::ObjectState observedEndDimensions;
-                if (actual.isHomogeneous && std::isfinite (actual.nominalWidth) && actual.nominalWidth > 0.0
-                    && std::isfinite (actual.nominalHeight) && actual.nominalHeight > 0.0) {
-                    observedEndDimensions.Add ("status", "same-as-nominal");
-                    observedEndDimensions.Add ("width", actual.nominalWidth);
-                    observedEndDimensions.Add ("depth", actual.nominalHeight);
-                } else if (actual.isHomogeneous) {
-                    observedEndDimensions.Add ("status", "unavailable");
-                } else if (std::isfinite (actual.endWidth) && std::isfinite (actual.endHeight)
-                    && actual.endWidth > 0.0 && actual.endHeight > 0.0) {
-                    observedEndDimensions.Add ("status", "available-nonhomogeneous");
-                    observedEndDimensions.Add ("width", actual.endWidth);
-                    observedEndDimensions.Add ("depth", actual.endHeight);
-                } else {
-                    observedEndDimensions.Add ("status", "unavailable");
-                }
-                observedSegment.Add ("endDimensions", observedEndDimensions);
-                observedDefaults.Add ("segment", observedSegment);
-            }
-        } else {
-            observedSectionStatus = "malformed";
-            observedDefaults.Add ("memoBytes", static_cast<Int32> (bytes));
-            observedDefaults.Add ("segment", unavailableSegment);
-        }
-    } else {
-        observedDefaults.Add ("segment", unavailableSegment);
-    }
-    observedDefaults.Add ("sectionStatus", observedSectionStatus);
-    diagnosticDetails.Add ("observedDefaults", observedDefaults);
-
-    bool templateAvailable = qualifiedTemplateSection.Get ("status", status) && status == "available"
-        && qualifiedTemplateSection.Get ("segmentCount", segmentCount) && segmentCount == 1
-        && qualifiedTemplateSection.Get ("simpleVerticalSingleSegment", simpleVertical) && simpleVertical
-        && qualifiedTemplateSection.Get ("segments", templateSegments) && templateSegments.GetSize () == 1;
-    if (!templateAvailable) {
-        mismatchingFields.Push ("qualifiedTemplate.sectionTopology");
-    }
-    const GS::ObjectState* templateSegmentPtr = templateAvailable ? &templateSegments[0] : nullptr;
-    const GS::ObjectState& templateSegment = templateSegmentPtr == nullptr ? qualifiedTemplateSection : *templateSegmentPtr;
-    GS::UniString templateShape;
-    GS::UniString templateStructure;
-    GS::ObjectState templateDimensions;
-    GS::ObjectState templateEndDimensions;
-    GS::ObjectState templateLinkage;
-    bool templateCircleBased = true;
-    bool templateLinked = true;
-    Int32 templateProfileType = -1;
-    bool templateHomogeneous = false;
-    double templateWidth = 0.0;
-    double templateDepth = 0.0;
-    if (!templateSegment.Get ("shape", templateShape) || templateShape != "rectangular"
-        || !templateSegment.Get ("structure", templateStructure) || templateStructure != "Basic"
-        || !templateSegment.Get ("circleBased", templateCircleBased) || templateCircleBased
-        || !templateSegment.Get ("dimensions", templateDimensions)
-        || !templateDimensions.Get ("width", templateWidth) || !std::isfinite (templateWidth) || templateWidth <= 0.0
-        || !templateDimensions.Get ("depth", templateDepth) || !std::isfinite (templateDepth) || templateDepth <= 0.0
-        || !templateSegment.Get ("linkage", templateLinkage)
-        || !templateLinkage.Get ("dimensionsLinked", templateLinked)
-        || !templateSegment.Get ("homogeneous", templateHomogeneous)
-        || !templateSegment.Get ("endDimensions", templateEndDimensions)) {
-        mismatchingFields.Push ("qualifiedTemplate.segment.supportedRectangularBasicSection");
-    }
-    if (!templateSegment.Get ("profileType", templateProfileType) || templateProfileType != APISect_Normal)
-        mismatchingFields.Push ("qualifiedTemplate.segment.profileType");
-    GS::UniString endStatus;
-    double endWidth = 0.0;
-    double endDepth = 0.0;
-    if (!templateEndDimensions.Get ("status", endStatus) || endStatus != "same-as-nominal"
-        || !templateEndDimensions.Get ("width", endWidth) || !templateEndDimensions.Get ("depth", endDepth)
-        || std::abs (endWidth - templateWidth) > 1.0e-9 || std::abs (endDepth - templateDepth) > 1.0e-9
-        || !templateHomogeneous)
-        mismatchingFields.Push ("qualifiedTemplate.segment.homogeneousEndDimensions");
-
-    if (element.column.isSlanted) mismatchingFields.Push ("slant.isSlanted");
-    if (!std::isfinite (element.column.slantAngle)) mismatchingFields.Push ("slant.angle");
-    if (observedSegmentCount != 1) mismatchingFields.Push ("section.segmentCount");
-    if (memo.columnSegments == nullptr || observedSegmentCount != 1) {
-        const auto& mismatchList = diagnosticDetails.AddList<GS::UniString> ("mismatchingFields");
-        for (const GS::UniString& field : mismatchingFields) mismatchList (field);
-        return "Column candidate CREATE active defaults do not provide a supported template section topology or valid positive dimensions.";
-    }
-    const API_AssemblySegmentData& defaults = memo.columnSegments[0].assemblySegmentData;
-    if (defaults.circleBased) mismatchingFields.Push ("section.circleBased");
-    if (defaults.modelElemStructureType != API_BasicStructure) mismatchingFields.Push ("section.structure");
-    if (defaults.profileType != APISect_Normal) mismatchingFields.Push ("section.profileType");
-    // Tool defaults need not have the template's requested dimensions: the
-    // typed CREATE setter overwrites nominalWidth/nominalHeight below. They
-    // must still be valid native values before that setter is allowed to run.
-    if (!std::isfinite (defaults.nominalWidth) || defaults.nominalWidth <= 0.0) mismatchingFields.Push ("section.nominalWidth");
-    if (!std::isfinite (defaults.nominalHeight) || defaults.nominalHeight <= 0.0) mismatchingFields.Push ("section.nominalDepth");
-    if (defaults.isWidthAndHeightLinked != templateLinked) mismatchingFields.Push ("section.dimensionsLinked");
-    if (!defaults.isHomogeneous) mismatchingFields.Push ("section.homogeneous");
-    if (!defaults.isHomogeneous && (!std::isfinite (defaults.endWidth) || !std::isfinite (defaults.endHeight)
-        || std::abs (defaults.endWidth - defaults.nominalWidth) > 1.0e-9
-        || std::abs (defaults.endHeight - defaults.nominalHeight) > 1.0e-9))
-        mismatchingFields.Push ("section.endDimensions");
-    if (!templateHomogeneous) {
-        bool templateEndLinked = false;
-        if (!templateLinkage.Get ("endDimensionsLinked", templateEndLinked)
-            || defaults.isEndWidthAndHeightLinked != templateEndLinked)
-            mismatchingFields.Push ("section.endDimensionsLinked");
-    }
-    const GS::ObjectState* materialId = templateSegment.Get ("material");
-    const API_Guid templateMaterialGuid = materialId == nullptr ? APINULLGuid : GetGuidFromObjectState (*materialId);
-    const API_Guid defaultsMaterialGuid = defaults.buildingMaterial == APIInvalidAttributeIndex ? APINULLGuid
-        : GetAttributeGuidFromIndex (API_BuildingMaterialID, defaults.buildingMaterial);
-    if (templateMaterialGuid == APINULLGuid || defaultsMaterialGuid == APINULLGuid || templateMaterialGuid != defaultsMaterialGuid)
-        mismatchingFields.Push ("section.materialGuid");
-
-    const auto& mismatchList = diagnosticDetails.AddList<GS::UniString> ("mismatchingFields");
-    for (const GS::UniString& field : mismatchingFields) mismatchList (field);
-    if (mismatchingFields.GetSize () != 0)
-        return "Column candidate CREATE active defaults do not provide a supported template section topology or valid positive dimensions.";
-    return {};
-}
-
 GS::Optional<GS::UniString> ValidateColumnRequestedState (
     const API_Element& element,
     const API_ElementMemo& memo,
@@ -307,27 +120,6 @@ GS::Optional<GS::UniString> CreateElementsCommandBase::GetResponseSchema () cons
             "elements": {
                 "$ref": "#/Elements"
             },
-            "nativeCandidateFailure": {
-                "type": "object",
-                "properties": {
-                    "itemIndex": { "type": "integer", "minimum": 0 },
-                    "stage": {
-                        "type": "string",
-                        "enum": [
-                            "defaults",
-                            "qualified-template/default validation",
-                            "typed parameter application",
-                            "requested-section validation",
-                            "ACAPI_Element_Create"
-                        ]
-                    },
-                    "errorCode": { "type": "integer" },
-                    "errorMessage": { "type": "string" },
-                    "details": { "type": "object" }
-                },
-                "additionalProperties": false,
-                "required": ["itemIndex", "stage", "errorCode", "errorMessage"]
-            },
             "transactionRolledBack": {
                 "type": "boolean"
             },
@@ -350,73 +142,24 @@ GS::ObjectState	CreateElementsCommandBase::Execute (const GS::ObjectState& param
     GS::ObjectState response;
     const auto& elements = response.AddList<GS::ObjectState> ("elements");
 
+    for (const GS::String& fieldName : parameters.GetFieldNames ()) {
+        if (GS::UniString (fieldName).BeginsWith ("nativeCandidate")) {
+            elements (CreateErrorResponse (APIERR_BADPARS, "Native candidate writer metadata is retired (D-307)."));
+            return response;
+        }
+    }
     const GS::UniString elemTypeName = GetElementTypeNonLocalizedName (elemTypeID);
     const Stories stories = GetStories ();
     std::vector<API_Elem_Head> createdHeads;
     createdHeads.reserve (dataArray.GetSize ());
     // Native CRUD relies on a single undoable command for Zone batches. Keep
     // raw CreateZones callers on their historical per-item behavior; only the
-    // candidate-gated typed dispatcher may set the schema-hidden marker.
+    // typed dispatcher may set the schema-hidden marker.
     bool nativeCrudAtomic = false;
     parameters.Get ("nativeCrudAtomic", nativeCrudAtomic);
-    GS::ObjectState candidateColumnTemplateSection;
-    const bool candidateColumnCreate = elemTypeID == API_ColumnID
-        && parameters.Get ("nativeCandidateColumnTemplateSection", candidateColumnTemplateSection);
-    bool candidateHatchCreate = false;
-    parameters.Get ("nativeCandidateHatchWriter", candidateHatchCreate);
-    if (parameters.Contains ("nativeCandidateHatchWriter") && (elemTypeID != API_HatchID || !candidateHatchCreate)) {
-        elements (CreateErrorResponse (APIERR_BADPARS, "Candidate Hatch diagnostics marker is malformed."));
-        return response;
-    }
-    if (parameters.Contains ("nativeCandidateColumnTemplateSection") && !candidateColumnCreate) {
-        elements (CreateErrorResponse (APIERR_BADPARS, "Column candidate template section is malformed."));
-        return response;
-    }
     const bool atomicBatch = (elemTypeID == API_ZoneID && nativeCrudAtomic) || elemTypeID == API_WallID || elemTypeID == API_ColumnID ||
         elemTypeID == API_LineID || elemTypeID == API_ArcID || elemTypeID == API_HatchID;
     GSErrCode callbackError = NoError;
-    bool hasCandidateColumnFailure = false;
-    const auto recordCandidateColumnFailure = [&] (Int32 itemIndex, const char* stage, GSErrCode errorCode, const GS::UniString& errorMessage, const GS::ObjectState* details) {
-        if (!candidateColumnCreate || hasCandidateColumnFailure)
-            return;
-        GS::ObjectState failure;
-        failure.Add ("itemIndex", itemIndex);
-        failure.Add ("stage", stage);
-        failure.Add ("errorCode", errorCode);
-        failure.Add ("errorMessage", errorMessage.ToCStr ().Get ());
-        if (details != nullptr) failure.Add ("details", *details);
-        response.Add ("nativeCandidateFailure", failure);
-        hasCandidateColumnFailure = true;
-    };
-    bool hasCandidateHatchFailure = false;
-    const auto candidateHatchElementDetails = [] (const API_Element& element) {
-        GS::ObjectState details;
-        details.Add ("hatchType", static_cast<Int32> (element.hatch.hatchType));
-        details.Add ("determination", static_cast<Int32> (element.hatch.determination));
-        details.Add ("storyIndex", static_cast<Int32> (element.header.floorInd));
-        details.Add ("contourPenIndex", static_cast<Int32> (element.hatch.contPen.penIndex));
-        details.Add ("contourPenOverride", static_cast<Int32> (element.hatch.contPen.colorOverridePenIndex));
-        details.Add ("foregroundPenIndex", static_cast<Int32> (element.hatch.fillPen.penIndex));
-        details.Add ("foregroundPenOverride", static_cast<Int32> (element.hatch.fillPen.colorOverridePenIndex));
-        details.Add ("backgroundPenIndex", static_cast<Int32> (element.hatch.fillBGPen));
-        details.Add ("hatchFlags", static_cast<Int32> (element.hatch.hatchFlags));
-        details.Add ("polygonCoordinateCount", element.hatch.poly.nCoords);
-        details.Add ("polygonSubPolygonCount", element.hatch.poly.nSubPolys);
-        details.Add ("polygonArcCount", element.hatch.poly.nArcs);
-        return details;
-    };
-    const auto recordCandidateHatchFailure = [&] (Int32 itemIndex, const char* stage, GSErrCode errorCode, const GS::UniString& errorMessage, const GS::ObjectState* details) {
-        if (!candidateHatchCreate || hasCandidateHatchFailure)
-            return;
-        GS::ObjectState failure;
-        failure.Add ("itemIndex", itemIndex);
-        failure.Add ("stage", stage);
-        failure.Add ("errorCode", errorCode);
-        failure.Add ("errorMessage", errorMessage.ToCStr ().Get ());
-        if (details != nullptr) failure.Add ("details", *details);
-        response.Add ("nativeCandidateFailure", failure);
-        hasCandidateHatchFailure = true;
-    };
 
     API_NotifyElementType notification = {};
     notification.notifID = APINotifyElement_BeginEvents;
@@ -463,24 +206,11 @@ GS::ObjectState	CreateElementsCommandBase::Execute (const GS::ObjectState& param
             GSErrCode err = ACAPI_Element_GetDefaults (&element, &memo);
             if (err != NoError) {
                 elements (CreateErrorResponse (err, "Failed to get defaults for new " + elemTypeName));
-                recordCandidateColumnFailure (static_cast<Int32> (itemIndex), "defaults", err,
-                    "ACAPI_Element_GetDefaults failed for candidate Column.", nullptr);
-                recordCandidateHatchFailure (static_cast<Int32> (itemIndex), "defaults", err,
-                    "ACAPI_Element_GetDefaults failed for candidate Hatch.", nullptr);
                 if (atomicBatch) callbackError = err;
                 continue;
             }
 
-            if (candidateColumnCreate) {
-                GS::ObjectState candidateDefaultDetails;
-                const auto candidateDefaultsError = ValidateColumnCandidateDefaultSection (element, memo, candidateColumnTemplateSection, candidateDefaultDetails);
-                if (candidateDefaultsError.HasValue ()) {
-                    elements (CreateErrorResponse (APIERR_BADPARS, candidateDefaultsError.Get ()));
-                    recordCandidateColumnFailure (static_cast<Int32> (itemIndex), "qualified-template/default validation", APIERR_BADPARS, candidateDefaultsError.Get (), &candidateDefaultDetails);
-                    if (atomicBatch) callbackError = APIERR_BADPARS;
-                    continue;
-                }
-            } else if (elemTypeID == API_ColumnID) {
+            if (elemTypeID == API_ColumnID) {
                 const auto supportedDefaultsError = ValidateColumnSupportedDefaultSection (element, memo);
                 if (supportedDefaultsError.HasValue ()) {
                     elements (CreateErrorResponse (APIERR_BADPARS, supportedDefaultsError.Get ()));
@@ -492,36 +222,14 @@ GS::ObjectState	CreateElementsCommandBase::Execute (const GS::ObjectState& param
             auto os = SetTypeSpecificParameters (element, memo, stories, data);
             if (os.HasValue ()) {
                 elements (*os);
-                if (candidateColumnCreate) {
-                    Int32 candidateErrorCode = APIERR_BADPARS;
-                    GS::UniString candidateErrorMessage = "Candidate Column typed parameter application failed.";
-                    const GS::ObjectState* error = os->Get ("error");
-                    if (error != nullptr) {
-                        error->Get ("code", candidateErrorCode);
-                        error->Get ("message", candidateErrorMessage);
-                    }
-                    recordCandidateColumnFailure (static_cast<Int32> (itemIndex), "typed parameter application", candidateErrorCode, candidateErrorMessage, nullptr);
-                }
-                if (candidateHatchCreate) {
-                    Int32 candidateErrorCode = APIERR_BADPARS;
-                    GS::UniString candidateErrorMessage = "Candidate Hatch typed parameter application failed.";
-                    const GS::ObjectState* error = os->Get ("error");
-                    if (error != nullptr) {
-                        error->Get ("code", candidateErrorCode);
-                        error->Get ("message", candidateErrorMessage);
-                    }
-                    const GS::ObjectState details = candidateHatchElementDetails (element);
-                    recordCandidateHatchFailure (static_cast<Int32> (itemIndex), "typed parameter application", candidateErrorCode, candidateErrorMessage, &details);
-                }
                 if (atomicBatch) callbackError = APIERR_BADPARS;
                 continue;
             }
 
             if (elemTypeID == API_ColumnID) {
-                const auto candidateSectionError = ValidateColumnRequestedState (element, memo, data, stories);
-                if (candidateSectionError.HasValue ()) {
-                    elements (CreateErrorResponse (APIERR_BADPARS, candidateSectionError.Get ()));
-                    recordCandidateColumnFailure (static_cast<Int32> (itemIndex), "requested-section validation", APIERR_BADPARS, candidateSectionError.Get (), nullptr);
+                const auto requestedStateError = ValidateColumnRequestedState (element, memo, data, stories);
+                if (requestedStateError.HasValue ()) {
+                    elements (CreateErrorResponse (APIERR_BADPARS, requestedStateError.Get ()));
                     if (atomicBatch) callbackError = APIERR_BADPARS;
                     continue;
                 }
@@ -530,11 +238,6 @@ GS::ObjectState	CreateElementsCommandBase::Execute (const GS::ObjectState& param
             err = ACAPI_Element_Create (&element, &memo);
             if (err != NoError) {
                 elements (CreateErrorResponse (err, "Failed to create new " + elemTypeName));
-                recordCandidateColumnFailure (static_cast<Int32> (itemIndex), "ACAPI_Element_Create", err,
-                    "ACAPI_Element_Create failed for candidate Column.", nullptr);
-                const GS::ObjectState details = candidateHatchElementDetails (element);
-                recordCandidateHatchFailure (static_cast<Int32> (itemIndex), "ACAPI_Element_Create", err,
-                    "ACAPI_Element_Create failed for candidate Hatch.", &details);
                 if (atomicBatch) callbackError = err;
                 continue;
             }
@@ -584,7 +287,6 @@ GS::Optional<GS::UniString> CreateColumnsCommand::GetInputParametersSchema () co
     return R"({
         "type": "object",
         "properties": {
-            "nativeCandidateColumnTemplateSection": { "type": "object" },
             "columnsData": {
                 "type": "array",
                 "description": "Array of data to create Columns.",
@@ -1481,7 +1183,7 @@ static GSErrCode BuildHatchMemo (const GS::Array<GS::ObjectState>& outline,
                                  const GS::Array<GS::ObjectState>& holes,
                                  API_Element& element,
                                  API_ElementMemo& memo,
-                                 const bool nativeCrudCandidate = false)
+                                 const bool nativeCrudTypedHatch = false)
 {
     if (outline.GetSize () < 3 || static_cast<GSSize> (outline.GetSize ()) > static_cast<GSSize> (std::numeric_limits<Int32>::max () - 1))
         return APIERR_BADPARS;
@@ -1548,11 +1250,11 @@ static GSErrCode BuildHatchMemo (const GS::Array<GS::ObjectState>& outline,
             // Graphisoft's memo contract requires zero IDs for newly created
             // vertices. The legacy command retains its historical local IDs;
             // the typed Native CRUD writer follows the documented API shape.
-            (*memo.vertexIDs)[coordinateIndex] = nativeCrudCandidate ? 0 : static_cast<UInt32> (coordinateIndex - firstIndex + 1);
+            (*memo.vertexIDs)[coordinateIndex] = nativeCrudTypedHatch ? 0 : static_cast<UInt32> (coordinateIndex - firstIndex + 1);
         }
         ++coordinateIndex;
         (*memo.coords)[coordinateIndex] = (*memo.coords)[firstIndex];
-        (*memo.vertexIDs)[coordinateIndex] = nativeCrudCandidate ? 0 : (*memo.vertexIDs)[firstIndex];
+        (*memo.vertexIDs)[coordinateIndex] = nativeCrudTypedHatch ? 0 : (*memo.vertexIDs)[firstIndex];
         (*memo.pends)[subPolyIndex++] = coordinateIndex;
         const GS::Array<API_PolyArc> polyArcs = GetPolyArcs (arcs, firstIndex);
         if (arcIndex + static_cast<Int32> (polyArcs.GetSize ()) > static_cast<Int32> (totalArcs))
@@ -1581,22 +1283,22 @@ GS::Optional<GS::ObjectState> CreateHatchesCommand::SetTypeSpecificParameters (A
     parameters.Get ("floorInd", element.header.floorInd);
     // The internal typed adapter uses a distinct, schema-hidden geometry
     // field. Legacy CreateHatches callers continue to use `coordinates`.
-    const bool nativeCrudCandidate = parameters.Contains ("hatchCoordinates");
-    if (nativeCrudCandidate) {
+    const bool nativeCrudTypedHatch = parameters.Contains ("hatchCoordinates");
+    if (nativeCrudTypedHatch) {
         // Native CRUD exposes one fixed CREATE profile: a drafting Fill Hatch.
         // Do not inherit the active Hatch tool's category, which may be Cut or
         // Cover Fills even though the typed request is explicitly a drafting fill.
         element.hatch.hatchType = API_FillHatch;
         element.hatch.determination = APIHatch_DraftingFills;
     }
-    if (nativeCrudCandidate
+    if (nativeCrudTypedHatch
         && (element.hatch.hatchType != API_FillHatch || element.hatch.determination != APIHatch_DraftingFills))
         return CreateErrorResponse (APIERR_BADPARS, "Hatch candidate CREATE could not establish the supported drafting Fill Hatch profile.");
-    if (nativeCrudCandidate
+    if (nativeCrudTypedHatch
         && (element.hatch.contPen.IsOverriden () || element.hatch.fillPen.IsOverriden ()
             || element.hatch.hatchFlags != 0))
         return CreateErrorResponse (APIERR_BADPARS, "Hatch candidate CREATE requires defaults without active pen, fill, or RGB overrides.");
-    if (nativeCrudCandidate) {
+    if (nativeCrudTypedHatch) {
         // The guard above establishes that the defaults have no active
         // overrides. Preserve their raw SDK sentinel values; the snapshot
         // separately reports the factual active/inactive override state.
@@ -1612,13 +1314,13 @@ GS::Optional<GS::ObjectState> CreateHatchesCommand::SetTypeSpecificParameters (A
     GS::Array<GS::ObjectState> coordinates;
     GS::Array<GS::ObjectState> arcs;
     GS::Array<GS::ObjectState> holes;
-    parameters.Get (nativeCrudCandidate ? "hatchCoordinates" : "coordinates", coordinates);
+    parameters.Get (nativeCrudTypedHatch ? "hatchCoordinates" : "coordinates", coordinates);
     parameters.Get ("arcs", arcs);
     parameters.Get ("holes", holes);
-    if (nativeCrudCandidate && (coordinates.GetSize () > 64 || !arcs.IsEmpty () || !holes.IsEmpty ()))
+    if (nativeCrudTypedHatch && (coordinates.GetSize () > 64 || !arcs.IsEmpty () || !holes.IsEmpty ()))
         return CreateErrorResponse (APIERR_BADPARS, "Hatch candidate CREATE supports only one unclosed external ring with 3 to 64 vertices.");
 
-    if (nativeCrudCandidate) {
+    if (nativeCrudTypedHatch) {
         // GetDefaults owns fresh polygon handles. BuildHatchMemo replaces
         // coords/pends/parcs/vertexIDs, so dispose exactly those defaults
         // before assigning the candidate ring. Keep unrelated memo handles
@@ -1634,19 +1336,19 @@ GS::Optional<GS::ObjectState> CreateHatchesCommand::SetTypeSpecificParameters (A
         memo.vertexIDs = nullptr;
         ACAPI_DisposeElemMemoHdls (&defaultPolygonMemo);
     }
-    const GSErrCode geometryError = BuildHatchMemo (coordinates, arcs, holes, element, memo, nativeCrudCandidate);
+    const GSErrCode geometryError = BuildHatchMemo (coordinates, arcs, holes, element, memo, nativeCrudTypedHatch);
     if (geometryError != NoError)
         return CreateErrorResponse (geometryError, "Invalid hatch polygon geometry.");
 
     short pen = 0;
     if (parameters.Get ("contourPenIndex", pen) && pen > 0) {
         element.hatch.contPen.penIndex = pen;
-        if (!nativeCrudCandidate)
+        if (!nativeCrudTypedHatch)
             element.hatch.contPen.colorOverridePenIndex = 0;
     }
     if (parameters.Get ("fillPenIndex", pen) && pen > 0) {
         element.hatch.fillPen.penIndex = pen;
-        if (!nativeCrudCandidate)
+        if (!nativeCrudTypedHatch)
             element.hatch.fillPen.colorOverridePenIndex = 0;
     }
     parameters.Get ("fillBackgroundPenIndex", element.hatch.fillBGPen);

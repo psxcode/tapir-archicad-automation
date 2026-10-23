@@ -12,11 +12,6 @@ option (TAPIR_ENABLE_NATIVE_CRUD_TEST_FAULT
     OFF
 )
 
-option (TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS
-    "Enable explicitly guarded developer-only candidate Native CRUD writers for disposable qualification."
-    OFF
-)
-
 option (TAPIR_ENABLE_NATIVE_DIMENSION_CREATE_CANDIDATE
     "Compile the closed, private Dimension CREATE candidate producer into its isolated test APX."
     OFF
@@ -31,9 +26,8 @@ if (TAPIR_ENABLE_NATIVE_DIMENSION_CREATE_POST_CREATE_FAULT AND NOT TAPIR_ENABLE_
     message (FATAL_ERROR "The native Dimension post-CREATE fault profile requires TAPIR_ENABLE_NATIVE_DIMENSION_CREATE_CANDIDATE.")
 endif ()
 
-if (TAPIR_ENABLE_NATIVE_DIMENSION_CREATE_CANDIDATE AND (TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS
-    OR TAPIR_ENABLE_NATIVE_CRUD_TEST_FAULT))
-    message (FATAL_ERROR "The native Dimension producer must use a separate isolated APX profile from every other candidate and fault profile.")
+if (TAPIR_ENABLE_NATIVE_DIMENSION_CREATE_CANDIDATE AND TAPIR_ENABLE_NATIVE_CRUD_TEST_FAULT)
+    message (FATAL_ERROR "The native Dimension producer must use a separate isolated APX profile from the CRUD test-fault profile.")
 endif ()
 
 set_property (GLOBAL PROPERTY USE_FOLDERS ON)
@@ -59,10 +53,6 @@ if (TAPIR_ENABLE_NATIVE_DIMENSION_CREATE_CANDIDATE AND TAPIR_ENABLE_NATIVE_DIMEN
     set (AddOnName "${AddOnName}_NativeDimensionCreatePostCreateFault")
 elseif (TAPIR_ENABLE_NATIVE_DIMENSION_CREATE_CANDIDATE)
     set (AddOnName "${AddOnName}_NativeDimensionCreateCandidate")
-elseif (TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS)
-    # Candidate writers retain one shared developer-only identity, including
-    # when combined with the first-applied rollback fault seam.
-    set (AddOnName "${AddOnName}_NativeCandidateWriters")
 elseif (TAPIR_ENABLE_NATIVE_CRUD_TEST_FAULT)
     # This target name is intentionally distinct from the runtime APX.  The
     # disposable fault profile must never look deployable by filename alone.
@@ -95,11 +85,6 @@ if (TAPIR_ENABLE_NATIVE_DIMENSION_CREATE_POST_CREATE_FAULT)
     target_compile_definitions (AddOn PRIVATE TAPIR_ENABLE_NATIVE_DIMENSION_CREATE_POST_CREATE_FAULT=1)
 else ()
     target_compile_definitions (AddOn PRIVATE TAPIR_ENABLE_NATIVE_DIMENSION_CREATE_POST_CREATE_FAULT=0)
-endif ()
-if (TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS)
-    target_compile_definitions (AddOn PRIVATE TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS=1)
-else ()
-    target_compile_definitions (AddOn PRIVATE TAPIR_ENABLE_NATIVE_CANDIDATE_WRITERS=0)
 endif ()
 if (TAPIR_ENABLE_NATIVE_CRUD_TEST_FAULT)
     # The ordinary profile deliberately does not define this macro.  The
