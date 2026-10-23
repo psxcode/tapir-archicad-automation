@@ -2253,22 +2253,13 @@ GS::Optional<GS::UniString> ApplyNativeCrudWallPlacement (
     const Stories& stories,
     bool& changed)
 {
+    // `elevation` is the bottom offset above the Wall's own story (D-306).
+    (void) stories;
     const bool hasElevation = details.Contains ("elevation");
     if (!hasElevation) return {};
-    if (stories.empty ())
-        return "Story settings are unavailable; Wall placement cannot be updated.";
-
-    const short currentStoryIndex = element.header.floorInd;
-    if (stories.find (currentStoryIndex) == stories.end())
-        return "The Wall current story is unavailable; absolute elevation cannot be resolved.";
-
-    const double currentElevation = GetZPos (currentStoryIndex, element.wall.bottomOffset, stories);
-    double targetElevation = 0.0;
-    if (!details.Get ("elevation", targetElevation) || !std::isfinite (targetElevation))
+    double targetBottomOffset = 0.0;
+    if (!details.Get ("elevation", targetBottomOffset) || !std::isfinite (targetBottomOffset))
         return "'elevation' must be a finite real number.";
-    const double targetBottomOffset = targetElevation - GetZPos (currentStoryIndex, 0.0, stories);
-    if (!std::isfinite (targetBottomOffset))
-        return "Wall placement resolved to a non-finite bottom offset.";
 
     element.wall.bottomOffset = targetBottomOffset;
     ACAPI_ELEMENT_MASK_SET (mask, API_WallType, bottomOffset);

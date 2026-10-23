@@ -44,9 +44,9 @@ constexpr const char* SnapshotVersion = "native-element-snapshot-v1";
 constexpr const char* ReceiptVersion = "native-mutation-receipt-v1";
 constexpr const char* HistoryVersion = "native-mutation-history-v1";
 constexpr const char* CapabilitySchemaVersion = "native-crud-capabilities-v2";
-constexpr const char* CapabilitySchemaHash = "62e57e16dad3389a7852d70552af41eaf9ef7c08eb71687d0016329002db228b";
+constexpr const char* CapabilitySchemaHash = "2d0676a3fb6c40100f07a7492d9a9e8eec1e29dc6646c31ba8d594dfe25a9d8e";
 constexpr const char* CapabilitySchemaV3Version = "native-crud-capabilities-v3";
-constexpr const char* CapabilitySchemaV3Hash = "0b02675a0d1fb224469ee82d55c9eb0f6a7f030c2f3211d3203e717d0b7627b4";
+constexpr const char* CapabilitySchemaV3Hash = "602487f50c363bc7c99cf96bb96a9f5d4a9331473dde8be8bcd2f884230b80b5";
 constexpr const char* ImpactEnvelopeVersion = "native-impact-envelope-v1";
 constexpr const char* ImpactEvidenceVersion = "native-impact-evidence-v1";
 constexpr const char* ImpactMetadataKey = "nativeImpact";
@@ -365,7 +365,8 @@ GS::ObjectState CanonicalWritableState (
     } else if (typeName == "Wall") {
         CopyObjectField (details, "begCoordinate", state, "begCoordinate");
         CopyObjectField (details, "endCoordinate", state, "endCoordinate");
-        CopyDoubleField (details, "zCoordinate", state, "elevation");
+        // `elevation` is the bottom level above the Wall's own story (D-306).
+        CopyDoubleField (details, "bottomOffset", state, "elevation");
         CopyDoubleField (details, "height", state, "height");
         CopyDoubleField (details, "begThickness", state, "thickness");
         CopyDoubleField (details, "offset", state, "offset");
@@ -376,9 +377,10 @@ GS::ObjectState CanonicalWritableState (
         CopyBoolField (details, "flipped", state, "flipped");
     } else if (typeName == "Column") {
         CopyObjectField (details, "origin", state, "origin");
-        CopyDoubleField (details, "zCoordinate", state, "elevation");
+        // Story-relative like the Wall's (D-306); factualState keeps the
+        // absolute level.
+        CopyDoubleField (details, "bottomOffset", state, "elevation");
         CopyDoubleField (details, "height", state, "height");
-        CopyDoubleField (details, "bottomOffset", state, "offset");
         CopyDoubleField (details, "axisRotationAngle", state, "rotation");
         CopyDoubleField (details, "slantAngle", state, "slant");
         // Column fingerprints always include factual memo topology and
@@ -789,11 +791,11 @@ void AddCanonicalWritableFields (GS::ObjectState& target, const GS::UniString& t
         count = sizeof (values) / sizeof (values[0]);
         for (GSSize i = 0; i < count; ++i) fields[i] = values[i];
     } else if (typeName == "Column") {
-        // The typed Column commands use operation-specific vocabularies.
-        const char* values[] = { "origin", "offset", "height", "rotation", "dimensions" };
+        // READ, CREATE and UPDATE share one story-relative vocabulary (D-306).
+        const char* values[] = { "origin", "elevation", "height", "rotation", "dimensions" };
         count = sizeof (values) / sizeof (values[0]);
         for (GSSize i = 0; i < count; ++i) fields[i] = values[i];
-        const char* createValues[] = { "coordinates", "height", "rotation", "dimensions" };
+        const char* createValues[] = { "origin", "elevation", "height", "rotation", "dimensions" };
         createCount = sizeof (createValues) / sizeof (createValues[0]);
         for (GSSize i = 0; i < createCount; ++i) createFields[i] = createValues[i];
     } else if (typeName == "Text") {
@@ -1651,18 +1653,10 @@ GS::ObjectState BuildNativeMutationParameters (
                 CopyObjectField (*payload, "begCoordinate", mapped, "begCoordinate");
                 CopyObjectField (*payload, "endCoordinate", mapped, "endCoordinate");
                 if (operation == "create") {
-                    // `elevation` is the absolute bottom level in READ and
-                    // UPDATE.  CreateWalls reads zCoordinate as a bottom
-                    // offset once floorIndex pins the story, so convert it
-                    // against the placement story (V1-022).
-                    double elevation = 0.0;
-                    if (payload->Get ("elevation", elevation)) {
-                        const GS::ObjectState* placement = item.Get ("placement");
-                        Int32 storyIndex = 0;
-                        if (placement != nullptr && placement->Get ("storyIndex", storyIndex))
-                            elevation -= GetZPos (static_cast<short> (storyIndex), 0.0, GetStories ());
-                        mapped.Add ("zCoordinate", elevation);
-                    }
+                    // `elevation` is story-relative (D-306), and CreateWalls
+                    // reads zCoordinate as the bottom offset once floorIndex
+                    // pins the story.
+                    CopyDoubleField (*payload, "elevation", mapped, "zCoordinate");
                 } else {
                     // Wall UPDATE has a different native mask contract from
                     // CREATE.  Keep the canonical placement names internal
@@ -1681,8 +1675,25 @@ GS::ObjectState BuildNativeMutationParameters (
                 CopyStringField (*payload, "referenceLine", mapped, "referenceLineLocation");
                 CopyBoolField (*payload, "flipped", mapped, "flipped");
             } else if (typeName == "Column") {
-                if (operation == "create") {
+                if (operation == "create" && payload->Contains ("coordinates")) {
+                    // Developer candidate writer (column-native-v1): absolute z.
                     CopyColumnCreateCoordinates (*payload, mapped);
+                } else if (operation == "create") {
+                    // Ordinary CREATE: origin x/y plus the story-relative
+                    // elevation (D-306).  CreateColumns takes one absolute
+                    // point, so add the placement story level here.
+                    const GS::ObjectState* origin = payload->Get ("origin");
+                    const GS::ObjectState* placement = item.Get ("placement");
+                    double x = 0.0;
+                    double y = 0.0;
+                    double elevation = 0.0;
+                    Int32 storyIndex = 0;
+                    if (origin != nullptr && origin->Get ("x", x) && origin->Get ("y", y)
+                        && payload->Get ("elevation", elevation)
+                        && placement != nullptr && placement->Get ("storyIndex", storyIndex)) {
+                        const double z = GetZPos (static_cast<short> (storyIndex), elevation, GetStories ());
+                        mapped.Add ("coordinates", GS::ObjectState ("x", x, "y", y, "z", z));
+                    }
                 } else {
                     // ModifyColumns consumes the 2D update placement field
                     // `origin`; CREATE must never receive this field and
@@ -1691,7 +1702,10 @@ GS::ObjectState BuildNativeMutationParameters (
                     CopyObjectField (*payload, "origin", mapped, "origin");
                 }
                 CopyDoubleField (*payload, "height", mapped, "height");
+                // `offset` is the candidate writer's spelling of `elevation`.
                 CopyDoubleField (*payload, "offset", mapped, "bottomOffset");
+                if (operation != "create")
+                    CopyDoubleField (*payload, "elevation", mapped, "bottomOffset");
                 CopyDoubleField (*payload, "rotation", mapped, "axisRotationAngle");
                 CopyDoubleField (*payload, "slant", mapped, "slantAngle");
                 const GS::ObjectState* dimensions = payload->Get ("dimensions");
