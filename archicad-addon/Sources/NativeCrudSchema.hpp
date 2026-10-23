@@ -1,0 +1,105 @@
+#pragma once
+
+#include "CommandBase.hpp"
+
+// Data table of the native CRUD field vocabulary and the capability schema hashes.  Data only:
+// one constexpr array per list, one row per element type, no logic.  NativeCrudCapabilities.cpp
+// iterates TypeFields to emit writableFields, createFields, createPlacementFields and
+// updateFields.  The lists mirror NATIVE_WRITABLE_FIELDS, NATIVE_CREATE_FIELDS,
+// NATIVE_UPDATE_FIELDS and NATIVE_CREATE_PLACEMENT_FIELDS in src/native-crud.ts.
+namespace NativeCrudSchema {
+
+struct FieldList {
+    const char* const* names;
+    GSSize count;
+};
+
+struct TypeFieldLists {
+    const char* typeName;
+    FieldList writable;
+    FieldList create;
+    FieldList update;
+};
+
+constexpr const char* CapabilitySchemaHash = "2d0676a3fb6c40100f07a7492d9a9e8eec1e29dc6646c31ba8d594dfe25a9d8e";
+constexpr const char* CapabilitySchemaV3Hash = "602487f50c363bc7c99cf96bb96a9f5d4a9331473dde8be8bcd2f884230b80b5";
+
+constexpr const char* CreatePlacementFields[] = { "storyIndex" };
+constexpr GSSize CreatePlacementFieldCount = sizeof (CreatePlacementFields) / sizeof (CreatePlacementFields[0]);
+
+constexpr const char* ZoneWritableFields[] = { "name", "number", "category", "polygon", "stampPlacement" };
+constexpr const char* ZoneCreateFields[] = { "name", "number", "category", "polygon", "stampPlacement" };
+constexpr const char* ZoneUpdateFields[] = { "name", "number", "category", "polygon", "stampPlacement" };
+
+constexpr const char* WallWritableFields[] = { "begCoordinate", "endCoordinate", "elevation", "height", "thickness", "offset", "structure", "composite", "referenceLine", "flipped" };
+constexpr const char* WallCreateFields[] = { "begCoordinate", "endCoordinate", "elevation", "height", "thickness", "offset", "structure", "composite", "referenceLine", "flipped" };
+constexpr const char* WallUpdateFields[] = { "begCoordinate", "endCoordinate", "elevation", "height", "thickness", "offset", "structure", "composite", "referenceLine", "flipped" };
+
+constexpr const char* ColumnWritableFields[] = { "origin", "elevation", "height", "rotation", "dimensions" };
+constexpr const char* ColumnCreateFields[] = { "origin", "elevation", "height", "rotation", "dimensions" };
+constexpr const char* ColumnUpdateFields[] = { "origin", "elevation", "height", "rotation", "dimensions" };
+
+constexpr const char* TextWritableFields[] = { "richText", "coordinate", "anchor", "angle", "width", "height", "pen", "fixedSize", "nonBreaking" };
+constexpr const char* TextCreateFields[] = { "richText", "coordinate", "anchor", "angle", "width", "height", "pen", "fixedSize", "nonBreaking" };
+constexpr const char* TextUpdateFields[] = { "richText", "coordinate", "anchor", "angle", "width", "height", "pen", "fixedSize", "nonBreaking" };
+
+constexpr const char* LineWritableFields[] = { "begin", "end", "lineType", "pen", "roomSeparator" };
+constexpr const char* LineCreateFields[] = { "begin", "end", "lineType", "pen", "roomSeparator" };
+constexpr const char* LineUpdateFields[] = { "begin", "end", "lineType", "pen", "roomSeparator" };
+
+constexpr const char* ArcWritableFields[] = { "origin", "radius", "ratio", "axisAngle", "beginAngle", "endAngle", "reflected", "lineType", "pen", "roomSeparator" };
+constexpr const char* ArcCreateFields[] = { "origin", "radius", "ratio", "axisAngle", "beginAngle", "endAngle", "reflected", "lineType", "pen", "roomSeparator" };
+constexpr const char* ArcUpdateFields[] = { "origin", "radius", "ratio", "axisAngle", "beginAngle", "endAngle", "reflected", "lineType", "pen", "roomSeparator" };
+
+constexpr const char* HatchWritableFields[] = { "polygon", "fill", "contourPen", "foregroundPen", "backgroundPen" };
+constexpr const char* HatchCreateFields[] = { "polygon", "fill", "contourPen", "foregroundPen", "backgroundPen" };
+constexpr const char* HatchUpdateFields[] = { "polygon", "fill", "contourPen", "foregroundPen", "backgroundPen" };
+
+constexpr const char* DoorWritableFields[] = { "offset", "sill", "width", "height", "orientation" };
+constexpr const char* DoorCreateFields[] = { "ownerWallId", "offset", "sill", "width", "height", "orientation" };
+constexpr const char* DoorUpdateFields[] = { "offset", "sill", "width", "height", "orientation" };
+
+constexpr const char* WindowWritableFields[] = { "offset", "sill", "width", "height", "orientation" };
+constexpr const char* WindowCreateFields[] = { "ownerWallId", "offset", "sill", "width", "height", "orientation" };
+constexpr const char* WindowUpdateFields[] = { "offset", "sill", "width", "height", "orientation" };
+
+constexpr TypeFieldLists TypeFields[] = {
+    { "Zone",
+      { ZoneWritableFields, sizeof (ZoneWritableFields) / sizeof (ZoneWritableFields[0]) },
+      { ZoneCreateFields, sizeof (ZoneCreateFields) / sizeof (ZoneCreateFields[0]) },
+      { ZoneUpdateFields, sizeof (ZoneUpdateFields) / sizeof (ZoneUpdateFields[0]) } },
+    { "Wall",
+      { WallWritableFields, sizeof (WallWritableFields) / sizeof (WallWritableFields[0]) },
+      { WallCreateFields, sizeof (WallCreateFields) / sizeof (WallCreateFields[0]) },
+      { WallUpdateFields, sizeof (WallUpdateFields) / sizeof (WallUpdateFields[0]) } },
+    { "Column",
+      { ColumnWritableFields, sizeof (ColumnWritableFields) / sizeof (ColumnWritableFields[0]) },
+      { ColumnCreateFields, sizeof (ColumnCreateFields) / sizeof (ColumnCreateFields[0]) },
+      { ColumnUpdateFields, sizeof (ColumnUpdateFields) / sizeof (ColumnUpdateFields[0]) } },
+    { "Text",
+      { TextWritableFields, sizeof (TextWritableFields) / sizeof (TextWritableFields[0]) },
+      { TextCreateFields, sizeof (TextCreateFields) / sizeof (TextCreateFields[0]) },
+      { TextUpdateFields, sizeof (TextUpdateFields) / sizeof (TextUpdateFields[0]) } },
+    { "Line",
+      { LineWritableFields, sizeof (LineWritableFields) / sizeof (LineWritableFields[0]) },
+      { LineCreateFields, sizeof (LineCreateFields) / sizeof (LineCreateFields[0]) },
+      { LineUpdateFields, sizeof (LineUpdateFields) / sizeof (LineUpdateFields[0]) } },
+    { "Arc",
+      { ArcWritableFields, sizeof (ArcWritableFields) / sizeof (ArcWritableFields[0]) },
+      { ArcCreateFields, sizeof (ArcCreateFields) / sizeof (ArcCreateFields[0]) },
+      { ArcUpdateFields, sizeof (ArcUpdateFields) / sizeof (ArcUpdateFields[0]) } },
+    { "Hatch",
+      { HatchWritableFields, sizeof (HatchWritableFields) / sizeof (HatchWritableFields[0]) },
+      { HatchCreateFields, sizeof (HatchCreateFields) / sizeof (HatchCreateFields[0]) },
+      { HatchUpdateFields, sizeof (HatchUpdateFields) / sizeof (HatchUpdateFields[0]) } },
+    { "Door",
+      { DoorWritableFields, sizeof (DoorWritableFields) / sizeof (DoorWritableFields[0]) },
+      { DoorCreateFields, sizeof (DoorCreateFields) / sizeof (DoorCreateFields[0]) },
+      { DoorUpdateFields, sizeof (DoorUpdateFields) / sizeof (DoorUpdateFields[0]) } },
+    { "Window",
+      { WindowWritableFields, sizeof (WindowWritableFields) / sizeof (WindowWritableFields[0]) },
+      { WindowCreateFields, sizeof (WindowCreateFields) / sizeof (WindowCreateFields[0]) },
+      { WindowUpdateFields, sizeof (WindowUpdateFields) / sizeof (WindowUpdateFields[0]) } },
+};
+
+} // namespace NativeCrudSchema
