@@ -24,33 +24,6 @@
 #include "ExtendedElementCommands.hpp"
 #include "ElementMutationCommands.hpp"
 #include "NativeCrudCommands.hpp"
-#if defined (TAPIR_ENABLE_NATIVE_DISPOSABLE_CHANNEL_PROBE)
-#include "NativeDisposableChannel.hpp"
-#endif
-#if defined (TAPIR_ENABLE_NATIVE_DISPOSABLE_PERMIT)
-#include "NativeDisposablePermit.hpp"
-#endif
-#if defined (TAPIR_ENABLE_NATIVE_DISPOSABLE_COLUMN)
-#include "NativeDisposableColumnCommands.hpp"
-#endif
-#if defined (TAPIR_ENABLE_NATIVE_DISPOSABLE_LINE)
-#include "NativeDisposableLineCommands.hpp"
-#endif
-#if defined (TAPIR_ENABLE_NATIVE_DISPOSABLE_ARC)
-#include "NativeDisposableArcCommands.hpp"
-#endif
-#if defined (TAPIR_ENABLE_NATIVE_DISPOSABLE_HATCH)
-#include "NativeDisposableHatchCommands.hpp"
-#endif
-#if defined (TAPIR_ENABLE_NATIVE_DISPOSABLE_ZONE)
-#include "NativeDisposableZoneCommands.hpp"
-#endif
-#if defined (TAPIR_ENABLE_NATIVE_DISPOSABLE_DOOR)
-#include "NativeDisposableDoorCommands.hpp"
-#endif
-#if defined (TAPIR_ENABLE_NATIVE_DISPOSABLE_WINDOW)
-#include "NativeDisposableWindowCommands.hpp"
-#endif
 #include "ElementGroupingCommands.hpp"
 #include "AttributeCommands.hpp"
 #include "TeamworkCommands.hpp"
@@ -58,9 +31,7 @@
 #include "LibraryCommands.hpp"
 #include "PropertyCommands.hpp"
 #include "ClassificationCommands.hpp"
-#if !defined (TAPIR_ENABLE_NATIVE_DISPOSABLE_WINDOW)
 #include "FavoritesCommands.hpp"
-#endif
 #include "MigrationHelper.hpp"
 #include "NavigatorCommands.hpp"
 #include "DocumentCreationCommands.hpp"
@@ -360,13 +331,6 @@ GSErrCode Initialize (void)
         AddCommandGroup (projectCommands);
     }
 
-#if !defined (TAPIR_ENABLE_NATIVE_DISPOSABLE_COLUMN) && !defined (TAPIR_ENABLE_NATIVE_DISPOSABLE_LINE) && !defined (TAPIR_ENABLE_NATIVE_DISPOSABLE_ARC) && !defined (TAPIR_ENABLE_NATIVE_DISPOSABLE_HATCH) && !defined (TAPIR_ENABLE_NATIVE_DISPOSABLE_ZONE) && !defined (TAPIR_ENABLE_NATIVE_DISPOSABLE_DOOR) && !defined (TAPIR_ENABLE_NATIVE_DISPOSABLE_WINDOW)
-    // The disposable Column, Line, Arc, Hatch and Zone APX profiles are compile-only isolated
-    // contracts. Keep the complete ordinary Element Commands registration
-    // block out of either profile: ordinary creators, modifiers,
-    // geometry/normalization, notifications and broad native CRUD must not be
-    // discoverable there.
-#if !defined (TAPIR_ENABLE_NATIVE_DISPOSABLE_WINDOW)
     { // Element Commands
         CommandGroup elementCommands ("Element Commands");
         err |= RegisterCommand<GetSelectedElementsCommand> (
@@ -469,12 +433,10 @@ GSErrCode Initialize (void)
             elementCommands, "1.0.8",
             "Sets the given GDL parameters of the given elements."
         );
-#if !defined (TAPIR_ENABLE_NATIVE_DISPOSABLE_COLUMN)
         err |= RegisterCommand<CreateColumnsCommand> (
             elementCommands, "1.0.3",
             "Creates Column elements based on the given parameters."
         );
-#endif
         err |= RegisterCommand<CreateWallsCommand> (
             elementCommands, "1.4.0",
             "Creates Wall elements based on the given parameters."
@@ -618,21 +580,14 @@ GSErrCode Initialize (void)
             elementCommands, "1.4.0",
             "Modifies Slab elements based on the given parameters."
         );
-#if !defined (TAPIR_ENABLE_NATIVE_DISPOSABLE_COLUMN)
-        // The isolated disposable Column profile has its own unavailable
-        // contract marker.  Keep broad ordinary Column writers at this
-        // registration boundary only for ordinary builds.
         err |= RegisterCommand<ModifyColumnsCommand> (
             elementCommands, "1.4.0",
             "Modifies Column elements based on the given parameters."
         );
-#endif
-#if !defined (TAPIR_ENABLE_NATIVE_DISPOSABLE_COLUMN)
         err |= RegisterCommand<MutateElementsCommand> (
             elementCommands, "1.0.0",
             "Executes a typed native create, update or delete operation for Wall, Slab, Column, Beam or Text elements and returns native readback."
         );
-#endif
         err |= RegisterCommand<GetNativeCrudCapabilitiesCommand> (
             elementCommands, "1.0.0",
             "Returns the versioned, developer-only native CRUD capability matrix."
@@ -659,12 +614,10 @@ GSErrCode Initialize (void)
             elementCommands, "1.0.0",
             "Returns the explicit per-file native receipt-history boundary."
         );
-#if !defined (TAPIR_ENABLE_NATIVE_DISPOSABLE_COLUMN) && !defined (TAPIR_ENABLE_NATIVE_DISPOSABLE_LINE)
         err |= RegisterCommand<MutateNativeElementsCommand> (
             elementCommands, "1.0.0",
             "Executes one typed native forward mutation and returns a factual receipt."
         );
-#endif
         err |= RegisterCommand<NormalizeTextClusterCommand> (
             elementCommands, "1.0.0",
             "Atomically replaces one simulated multiline Text cluster with one wrapped Text element."
@@ -711,8 +664,6 @@ GSErrCode Initialize (void)
         );
         AddCommandGroup (elementCommands);
     }
-#endif
-#endif
 
     { // Element grouping Commands
         CommandGroup elementGroupingCommands ("Element grouping Commands");
@@ -723,7 +674,6 @@ GSErrCode Initialize (void)
         AddCommandGroup (elementGroupingCommands);
     }
 
-#if !defined (TAPIR_ENABLE_NATIVE_DISPOSABLE_DOOR) && !defined (TAPIR_ENABLE_NATIVE_DISPOSABLE_WINDOW)
     { // Favorites Commands
         CommandGroup favoritesCommands ("Favorites Commands");
         err |= RegisterCommand<GetFavoritesByTypeCommand> (
@@ -752,7 +702,6 @@ GSErrCode Initialize (void)
         );
         AddCommandGroup (favoritesCommands);
     }
-#endif
 
     { // Property Commands
         CommandGroup propertyCommands ("Property Commands");
@@ -829,7 +778,6 @@ GSErrCode Initialize (void)
         AddCommandGroup (classificationCommands);
     }
 
-#if !defined (TAPIR_ENABLE_NATIVE_DISPOSABLE_ARC) && !defined (TAPIR_ENABLE_NATIVE_DISPOSABLE_HATCH) && !defined (TAPIR_ENABLE_NATIVE_DISPOSABLE_ZONE)
     { // Attribute Commands
         CommandGroup attributeCommands ("Attribute Commands");
         err |= RegisterCommand<GetAttributesByTypeCommand> (
@@ -848,12 +796,10 @@ GSErrCode Initialize (void)
             attributeCommands, "1.2.4",
             "Creates or overwrites Layer Combination attributes based on the given parameters."
         );
-#if !defined (TAPIR_ENABLE_NATIVE_DISPOSABLE_LINE)
         err |= RegisterCommand<CreateLinesCommand> (
             attributeCommands, "1.5.4",
             "Creates or overwrites Line attributes based on the given parameters."
         );
-#endif
         err |= RegisterCommand<CreateFillsCommand> (
             attributeCommands, "1.5.4",
             "Creates or overwrites Fill attributes based on the given parameters."
@@ -936,7 +882,6 @@ GSErrCode Initialize (void)
         );
         AddCommandGroup (attributeCommands);
     }
-#endif
 
     { // IFC Commands
         CommandGroup ifcCommands ("IFC Commands");
@@ -1260,60 +1205,6 @@ GSErrCode Initialize (void)
             developerCommands, "1.0.7",
             "Generates files for the documentation. Used by Tapir developers only."
         );
-#if defined (TAPIR_ENABLE_NATIVE_DISPOSABLE_CHANNEL_PROBE)
-        err |= RegisterCommand<NativeDisposableChannelProbeCommand> (
-            developerCommands, "1.0.0",
-            "Test-only zero-write disposable channel binding probe; returns non-live evidence and never mutates Archicad."
-        );
-#endif
-#if defined (TAPIR_ENABLE_NATIVE_DISPOSABLE_PERMIT)
-        err |= RegisterCommand<NativeDisposablePermitContractCommand> (
-            developerCommands, "1.0.0",
-            "Test-only compile-only disposable permit contract marker; never consumes authority or mutates Archicad."
-        );
-#endif
-#if defined (TAPIR_ENABLE_NATIVE_DISPOSABLE_COLUMN)
-        err |= RegisterCommand<NativeDisposableColumnContractCommand> (
-            developerCommands, "1.0.0",
-            "Test-only compile-only disposable Column executor marker; unavailable without authenticated native context."
-        );
-#endif
-#if defined (TAPIR_ENABLE_NATIVE_DISPOSABLE_LINE)
-        err |= RegisterCommand<NativeDisposableLineContractCommand> (
-            developerCommands, "1.0.0",
-            "Test-only compile-only disposable Line candidate marker; unavailable without authenticated native context."
-        );
-#endif
-#if defined (TAPIR_ENABLE_NATIVE_DISPOSABLE_ARC)
-        err |= RegisterCommand<NativeDisposableArcContractCommand> (
-            developerCommands, "1.0.0",
-            "Test-only compile-only disposable Arc candidate marker; unavailable without authenticated native context."
-        );
-#endif
-#if defined (TAPIR_ENABLE_NATIVE_DISPOSABLE_HATCH)
-        err |= RegisterCommand<NativeDisposableHatchContractCommand> (
-            developerCommands, "1.0.0",
-            "Test-only compile-only disposable Hatch candidate marker; unavailable without authenticated native context."
-        );
-#endif
-#if defined (TAPIR_ENABLE_NATIVE_DISPOSABLE_ZONE)
-        err |= RegisterCommand<NativeDisposableZoneContractCommand> (
-            developerCommands, "1.0.0",
-            "Test-only compile-only disposable Zone candidate/readback marker; unavailable without authenticated native context."
-        );
-#endif
-#if defined (TAPIR_ENABLE_NATIVE_DISPOSABLE_DOOR)
-        err |= RegisterCommand<NativeDisposableDoorContractCommand> (
-            developerCommands, "1.0.0",
-            "Test-only compile-only disposable Door contract marker; unavailable without authenticated native context."
-        );
-#endif
-#if defined (TAPIR_ENABLE_NATIVE_DISPOSABLE_WINDOW)
-        err |= RegisterCommand<NativeDisposableWindowContractCommand> (
-            developerCommands, "1.0.0",
-            "Test-only compile-only disposable Window contract marker; unavailable without authenticated native context."
-        );
-#endif
         AddCommandGroup (developerCommands);
     }
 
