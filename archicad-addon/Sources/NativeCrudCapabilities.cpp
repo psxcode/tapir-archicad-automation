@@ -1,7 +1,7 @@
 #include "NativeCrudCommands.hpp"
 
 #include "NativeCrudInternal.hpp"
-#include "NativeCrudSchema.hpp"
+#include "NativeCrudSchema.generated.hpp"
 
 #include "ElementCommands.hpp"
 #include "ElementCreationCommands.hpp"
