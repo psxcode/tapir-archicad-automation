@@ -66,10 +66,11 @@ GS::ObjectState GetNativeCrudCapabilitiesCommand::Execute (const GS::ObjectState
     response.Add ("limits", GS::ObjectState (
         "maxItems", static_cast<Int32> (MaxMutationItems),
         "maxDiscoverReferences", static_cast<Int32> (MaxDiscoveryReferences),
-        "maxHistoryEntries", static_cast<Int32> (MaxMutationItems),
+        "maxHistoryEntries", static_cast<Int32> (NativeCrudInternal::MaxHistoryEntries),
         "impactClosure", static_cast<Int32> (MaxImpactElements)));
     const auto& elementTypes = response.AddList<GS::ObjectState> ("elementTypes");
-    for (const char* typeName : { "Zone", "Wall", "Column", "Text", "Line", "Arc", "Hatch", "Door", "Window" }) {
+    for (const TypeCapabilities& row : CrudTypes) {
+        const char* typeName = row.typeName;
         GS::ObjectState type;
         type.Add ("elementType", typeName);
         type.Add ("contracted", GS::ObjectState (
@@ -78,13 +79,9 @@ GS::ObjectState GetNativeCrudCapabilitiesCommand::Execute (const GS::ObjectState
             "update", true,
             "delete", true));
         type.Add ("read", true);
-        const bool doorVerifiedWriter = GS::UniString (typeName) == "Door";
-        const bool windowVerifiedWriter = GS::UniString (typeName) == "Window";
-        const bool lineVerifiedWriter = GS::UniString (typeName) == "Line";
-        const bool arcVerifiedWriter = GS::UniString (typeName) == "Arc";
-        const bool hatchVerifiedWriter = GS::UniString (typeName) == "Hatch";
-        const bool validatedWriter = GS::UniString (typeName) == "Wall" || GS::UniString (typeName) == "Text" || GS::UniString (typeName) == "Zone" || GS::UniString (typeName) == "Column" || lineVerifiedWriter || arcVerifiedWriter || hatchVerifiedWriter || doorVerifiedWriter || windowVerifiedWriter;
-        const bool updateValidatedWriter = validatedWriter || GS::UniString (typeName) == "Column";
+        // The verified writer bits come from the typed schema (NATIVE_VERIFIED_CAPABILITY_BITS).
+        const bool validatedWriter = row.create;
+        const bool updateValidatedWriter = row.update;
         type.Add ("create", validatedWriter);
         type.Add ("update", updateValidatedWriter);
         type.Add ("delete", true);

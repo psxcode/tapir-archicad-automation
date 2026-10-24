@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CommandBase.hpp"
+#include "NativeCrudSchema.generated.hpp"
 
 #include <initializer_list>
 #include <string>
@@ -30,11 +31,14 @@ constexpr const char* ImpactEvidenceVersion = "native-impact-evidence-v1";
 
 constexpr const char* ImpactMetadataKey = "nativeImpact";
 
-constexpr GSSize MaxMutationItems = 25;
+// The limits are generated from NATIVE_SCHEMA_LIMITS (src/native/schema/capability.ts).
+constexpr GSSize MaxMutationItems = NativeCrudSchema::MaxItems;
 
-constexpr GSSize MaxDiscoveryReferences = 100;
+constexpr GSSize MaxDiscoveryReferences = NativeCrudSchema::MaxDiscoverReferences;
 
-constexpr GSSize MaxImpactElements = 256;
+constexpr GSSize MaxHistoryEntries = NativeCrudSchema::MaxHistoryEntries;
+
+constexpr GSSize MaxImpactElements = NativeCrudSchema::ImpactClosure;
 
 struct NativeImpactEnvelope {
     GS::ObjectState envelope;
@@ -135,6 +139,8 @@ GS::ObjectState BuildNativeMutationParameters (
 // NativeCrudValidation.cpp: typed payload validators, writer gates and mutation item validation
 bool HasNativeCrudTestFaultMetadata (const GS::ObjectState* semanticMetadata);
 bool HasOnlyObjectStateFields (const GS::ObjectState& value, const std::initializer_list<const char*>& allowedFields);
+
+bool HasOnlyObjectStateFields (const GS::ObjectState& value, const NativeCrudSchema::FieldList& allowedFields);
 GS::Optional<GS::UniString> ValidateZoneTypedWriter (
     const GS::UniString& operation,
     const GS::Array<GS::ObjectState>& items);

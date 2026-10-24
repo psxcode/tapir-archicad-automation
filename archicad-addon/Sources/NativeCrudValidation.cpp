@@ -31,6 +31,18 @@ bool HasNativeCrudTestFaultMetadata (const GS::ObjectState* semanticMetadata)
     return semanticMetadata != nullptr && semanticMetadata->Contains ("nativeCrudTestFaultAfterFirstApplied");
 }
 
+bool HasOnlyObjectStateFields (const GS::ObjectState& value, const NativeCrudSchema::FieldList& allowedFields)
+{
+    for (const GS::String& fieldName : value.GetFieldNames ()) {
+        bool allowed = false;
+        for (GSSize i = 0; i < allowedFields.count && !allowed; ++i)
+            allowed = fieldName == GS::String (allowedFields.names[i]);
+        if (!allowed)
+            return false;
+    }
+    return true;
+}
+
 bool HasOnlyObjectStateFields (const GS::ObjectState& value, const std::initializer_list<const char*>& allowedFields)
 {
     const GS::HashSet<GS::String> fieldNames = value.GetFieldNames ();
@@ -173,14 +185,13 @@ GS::Optional<GS::UniString> ValidateArcTypedPayloads (
     const GS::UniString& operation,
     const GS::Array<GS::ObjectState>& items)
 {
-    const std::initializer_list<const char*> allowedFields = {
-        "origin", "radius", "ratio", "axisAngle", "beginAngle", "endAngle", "reflected", "lineType", "pen", "roomSeparator"
-    };
+    // The Arc CREATE fields of the typed schema; the Arc UPDATE fields are the same list.
+    const NativeCrudSchema::FieldList allowedFields = { NativeCrudSchema::ArcCreateFields, sizeof (NativeCrudSchema::ArcCreateFields) / sizeof (NativeCrudSchema::ArcCreateFields[0]) };
     for (GSSize index = 0; index < static_cast<GSSize> (items.GetSize ()); ++index) {
         const GS::ObjectState* shape = items[index].Get (operation == "create" ? "payload" : "patch");
         if (shape == nullptr || shape->GetFieldNames ().IsEmpty () || !HasOnlyObjectStateFields (*shape, allowedFields))
             return "Arc typed payload must contain a non-empty patch with only declared Arc fields.";
-        if (operation == "create" && shape->GetFieldNames ().GetSize () != 10)
+        if (operation == "create" && static_cast<GSSize> (shape->GetFieldNames ().GetSize ()) != allowedFields.count)
             return "Arc CREATE must provide all ten typed element fields; placement is separate.";
         const GS::ObjectState* origin = shape->Get ("origin");
         if (origin != nullptr) {
@@ -234,10 +245,11 @@ bool HatchSegmentsIntersect (const API_Coord& a, const API_Coord& b, const API_C
 
 GS::Optional<GS::UniString> ValidateHatchTypedShape (const GS::ObjectState& shape, const GS::UniString& operation)
 {
-    const std::initializer_list<const char*> allowedFields = { "polygon", "fill", "contourPen", "foregroundPen", "backgroundPen" };
+    // The Hatch CREATE fields of the typed schema; the Hatch UPDATE fields are the same list.
+    const NativeCrudSchema::FieldList allowedFields = { NativeCrudSchema::HatchCreateFields, sizeof (NativeCrudSchema::HatchCreateFields) / sizeof (NativeCrudSchema::HatchCreateFields[0]) };
     if (shape.GetFieldNames ().IsEmpty () || !HasOnlyObjectStateFields (shape, allowedFields))
         return "Hatch payload must contain only its typed simple-polygon and style fields.";
-    if (operation == "create" && shape.GetFieldNames ().GetSize () != 5)
+    if (operation == "create" && static_cast<GSSize> (shape.GetFieldNames ().GetSize ()) != allowedFields.count)
         return "Hatch CREATE requires polygon and all four style fields; story placement is separate.";
     const GS::ObjectState* polygon = shape.Get ("polygon");
     if (polygon != nullptr) {

@@ -25,6 +25,19 @@ struct TypeFieldLists {
     FieldList update;
 };
 
+// Verified writer bits of one CRUD element type; the rows are in schema type order.
+struct TypeCapabilities {
+    const char* typeName;
+    bool create;
+    bool update;
+};
+
+// NATIVE_SCHEMA_LIMITS.
+constexpr GSSize MaxItems = 25;
+constexpr GSSize MaxDiscoverReferences = 100;
+constexpr GSSize MaxHistoryEntries = 25;
+constexpr GSSize ImpactClosure = 256;
+
 constexpr const char* CapabilitySchemaHash = "2d0676a3fb6c40100f07a7492d9a9e8eec1e29dc6646c31ba8d594dfe25a9d8e";
 constexpr const char* CapabilitySchemaV3Hash = "602487f50c363bc7c99cf96bb96a9f5d4a9331473dde8be8bcd2f884230b80b5";
 
@@ -104,6 +117,18 @@ constexpr TypeFieldLists TypeFields[] = {
       { WindowWritableFields, sizeof (WindowWritableFields) / sizeof (WindowWritableFields[0]) },
       { WindowCreateFields, sizeof (WindowCreateFields) / sizeof (WindowCreateFields[0]) },
       { WindowUpdateFields, sizeof (WindowUpdateFields) / sizeof (WindowUpdateFields[0]) } },
+};
+
+constexpr TypeCapabilities CrudTypes[] = {
+    { "Zone", true, true },
+    { "Wall", true, true },
+    { "Column", true, true },
+    { "Text", true, true },
+    { "Line", true, true },
+    { "Arc", true, true },
+    { "Hatch", true, true },
+    { "Door", true, true },
+    { "Window", true, true },
 };
 
 } // namespace NativeCrudSchema
