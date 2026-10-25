@@ -1830,7 +1830,8 @@ GS::Optional<GS::UniString> RenderMarqueePrintCommand::GetInputParametersSchema 
             "usePrinterRes": { "type": "boolean" },
             "printGhost": { "type": "boolean" },
             "newSheet": { "type": "boolean" },
-            "printAlignment": { "type": "string" }
+            "printAlignment": { "type": "string" },
+            "expectedPrinterName": { "type": "string", "description": "Refuse before any UI change unless Archicad's selected printer has exactly this name." }
         },
         "additionalProperties": false,
         "required": ["xMin", "yMin", "xMax", "yMax"]
@@ -1845,10 +1846,50 @@ GS::Optional<GS::UniString> RenderMarqueePrintCommand::GetResponseSchema () cons
             "storyIndex": { "type": "integer" },
             "backgroundDatabaseRestored": { "type": "boolean" },
             "temporaryMarqueeCleared": { "type": "boolean" },
-            "focusChangedDuringRender": { "type": "boolean" }
-        },
-        "required": ["backgroundDatabaseRestored", "temporaryMarqueeCleared", "focusChangedDuringRender"]
+            "focusChangedDuringRender": { "type": "boolean" },
+            "printer": { "type": "object" }
+        }
     })";
+    // No "required" list: a refusal or failure carries success/error instead of
+    // the success flags and must still pass Tapir's response validation (M-20).
+    // A oneOf would be stricter but has crashed Archicad's validator (E-026).
+}
+
+// Archicad's selected printer as the print call will use it: name, page
+// orientation and, when Archicad reports it, the printable area in metres
+// from the paper's top-left corner. Read-only; the API cannot set any of it.
+static bool ReadSelectedPrinter (GS::ObjectState& printer, GS::UniString& name)
+{
+    API_MiscPrinterInfo printerInfo = {};
+    if (TAPIR_ProjectOperation_GetMiscPrinterInfo (&printerInfo) != NoError)
+        return false;
+    printerInfo.name[sizeof (printerInfo.name) - 1] = '\0';
+    name = GS::UniString (printerInfo.name, CC_System);
+    printer.Add ("name", name);
+    printer.Add ("orientation", printerInfo.orientPortrait ? "portrait" : "landscape");
+
+    API_PrintPars printPars = {};
+    if (TAPIR_ProjectOperation_GetPrinterPars (&printPars) == NoError &&
+        std::isfinite (printPars.left) && std::isfinite (printPars.top) &&
+        std::isfinite (printPars.right) && std::isfinite (printPars.bottom) &&
+        printPars.right > printPars.left && printPars.bottom > printPars.top) {
+        GS::ObjectState printableArea;
+        printableArea.Add ("left", printPars.left);
+        printableArea.Add ("top", printPars.top);
+        printableArea.Add ("right", printPars.right);
+        printableArea.Add ("bottom", printPars.bottom);
+        printer.Add ("printableArea", printableArea);
+    }
+    return true;
+}
+
+// A failure returned before ACAPI_ProjectOperation_Print was called: no page
+// can reach the render inbox, so the caller need not quarantine it.
+static GS::ObjectState NotPrintedResult (GSErrCode errorCode, const GS::UniString& errorMessage)
+{
+    GS::ObjectState failure = CreateFailedExecutionResult (errorCode, errorMessage);
+    failure.Add ("printAttempted", false);
+    return failure;
 }
 
 GS::ObjectState RenderMarqueePrintCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl& /*processControl*/) const
@@ -1858,21 +1899,41 @@ GS::ObjectState RenderMarqueePrintCommand::Execute (const GS::ObjectState& param
     bool multiStory = false;
     if (!parameters.Get ("xMin", xMin) || !parameters.Get ("yMin", yMin) ||
         !parameters.Get ("xMax", xMax) || !parameters.Get ("yMax", yMax)) {
-        return CreateFailedExecutionResult (APIERR_BADPARS, "xMin, yMin, xMax and yMax are required.");
+        return NotPrintedResult (APIERR_BADPARS, "xMin, yMin, xMax and yMax are required.");
     }
     parameters.Get ("storyIndex", requestedStory);
     parameters.Get ("multiStory", multiStory);
     if (!std::isfinite (xMin) || !std::isfinite (yMin) || !std::isfinite (xMax) || !std::isfinite (yMax) ||
         xMin >= xMax || yMin >= yMax)
-        return CreateFailedExecutionResult (APIERR_BADPARS, "Marquee bounds must have positive area.");
+        return NotPrintedResult (APIERR_BADPARS, "Marquee bounds must have positive area.");
+
+    // The print goes to whatever printer Archicad has cached for this project.
+    // Check it before touching the database or the marquee: a physical printer
+    // or an interactive PDF queue must never receive a render.
+    GS::ObjectState printer;
+    GS::UniString printerName;
+    const bool printerKnown = ReadSelectedPrinter (printer, printerName);
+    GS::UniString expectedPrinterName;
+    if (parameters.Get ("expectedPrinterName", expectedPrinterName) && !expectedPrinterName.IsEmpty ()) {
+        if (!printerKnown || printerName != expectedPrinterName) {
+            GS::ObjectState refusal = NotPrintedResult (APIERR_REFUSEDCMD, printerKnown
+                ? "Archicad's selected printer is not the render queue; nothing was printed."
+                : "Archicad's selected printer could not be read; nothing was printed.");
+            refusal.Add ("refusal", "printer_not_selected");
+            refusal.Add ("expectedPrinterName", expectedPrinterName);
+            if (printerKnown)
+                refusal.Add ("printer", printer);
+            return refusal;
+        }
+    }
 
     API_SelectionInfo selectionBefore = {};
     const GSErrCode selectionErr = ACAPI_Selection_Get (&selectionBefore, nullptr, false);
     const GS::OnExit selectionBeforeGuard ([&selectionBefore] () { ReleaseSelectionInfoHandles (selectionBefore); });
     if (selectionErr != NoError && selectionErr != APIERR_NOSEL)
-        return CreateErrorResponse (selectionErr, "Failed to inspect the operator focus before rendering.");
+        return NotPrintedResult (selectionErr, "Failed to inspect the operator focus before rendering.");
     if (selectionErr == NoError && selectionBefore.typeID == API_SelElems) {
-        return CreateFailedExecutionResult (APIERR_REFUSEDCMD, "Render refuses to change marquee while an element selection is active.");
+        return NotPrintedResult (APIERR_REFUSEDCMD, "Render refuses to change marquee while an element selection is active.");
     }
     const bool hadOriginalMarquee = selectionErr == NoError &&
         (selectionBefore.typeID == API_MarqueePoly || selectionBefore.typeID == API_MarqueeHorBox || selectionBefore.typeID == API_MarqueeRotBox);
@@ -1880,11 +1941,12 @@ GS::ObjectState RenderMarqueePrintCommand::Execute (const GS::ObjectState& param
     API_DatabaseInfo startingDatabase = {};
     GSErrCode operationErr = ACAPI_Database_GetCurrentDatabase (&startingDatabase);
     if (operationErr != NoError) {
-        return CreateFailedExecutionResult (operationErr, "Failed to read the starting database.");
+        return NotPrintedResult (operationErr, "Failed to read the starting database.");
     }
 
     bool databaseChanged = false;
     bool marqueeSet = false;
+    bool printAttempted = false;
     GS::UniString failureMessage;
     if (requestedStory >= 0) {
         API_DatabaseInfo targetDatabase = {};
@@ -1945,6 +2007,7 @@ GS::ObjectState RenderMarqueePrintCommand::Execute (const GS::ObjectState& param
                 }
             }
         }
+        printAttempted = true;
         operationErr = ACAPI_ProjectOperation_Print (&printPars);
         if (operationErr != NoError)
             failureMessage = "Failed to print the temporary marquee.";
@@ -1992,8 +2055,11 @@ GS::ObjectState RenderMarqueePrintCommand::Execute (const GS::ObjectState& param
             }
         }
     }
-    if (operationErr != NoError)
-        return CreateFailedExecutionResult (operationErr, failureMessage);
+    if (operationErr != NoError) {
+        GS::ObjectState failure = CreateFailedExecutionResult (operationErr, failureMessage);
+        failure.Add ("printAttempted", printAttempted);
+        return failure;
+    }
 
     GS::ObjectState response;
     if (requestedStory >= 0)
@@ -2001,6 +2067,8 @@ GS::ObjectState RenderMarqueePrintCommand::Execute (const GS::ObjectState& param
     response.Add ("backgroundDatabaseRestored", true);
     response.Add ("temporaryMarqueeCleared", !focusChangedDuringRender);
     response.Add ("focusChangedDuringRender", focusChangedDuringRender);
+    if (printerKnown)
+        response.Add ("printer", printer);
     return response;
 }
 

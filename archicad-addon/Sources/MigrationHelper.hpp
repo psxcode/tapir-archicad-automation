@@ -426,6 +426,24 @@ inline GSErrCode TAPIR_ProjectOperation_SavePdf (const API_FileSavePars* savePar
 #endif
 }
 
+inline GSErrCode TAPIR_ProjectOperation_GetMiscPrinterInfo (API_MiscPrinterInfo* printerInfo)
+{
+#ifdef ServerMainVers_2700
+    return ACAPI_ProjectOperation_GetMiscPrinterInfo (printerInfo);
+#else
+    return ACAPI_Environment (APIEnv_GetMiscPrinterInfoID, printerInfo, nullptr);
+#endif
+}
+
+inline GSErrCode TAPIR_ProjectOperation_GetPrinterPars (API_PrintPars* printPars)
+{
+#ifdef ServerMainVers_2700
+    return ACAPI_ProjectOperation_GetPrinterPars (printPars);
+#else
+    return ACAPI_Environment (APIEnv_GetPrinterParsID, printPars, nullptr);
+#endif
+}
+
 inline GSErrCode TAPIR_ProjectOperation_CatchProjectEvent (GSFlags eventTypes, APIProjectEventHandlerProc* handlerProc)
 {
 #ifdef ServerMainVers_2700
