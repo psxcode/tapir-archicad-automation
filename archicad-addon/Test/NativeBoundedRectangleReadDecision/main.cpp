@@ -45,6 +45,22 @@ int main ()
 		ClassifyFinalRead (true, true, false) == FinalAction::ReturnRows,
 		"A verified, restored in-limit read may return rows.");
 
+	passed &= Require (
+		ClassifyCandidateHeader (true, false, 64, 64) == CandidateHeaderAction::Inspect,
+		"A readable candidate header is inspected regardless of unresolved references.");
+	passed &= Require (
+		ClassifyCandidateHeader (false, true, 0, 64) == CandidateHeaderAction::ReportUnresolved,
+		"An unresolved (not found) header is reported, not fatal.");
+	passed &= Require (
+		ClassifyCandidateHeader (false, true, 63, 64) == CandidateHeaderAction::ReportUnresolved,
+		"The 64th unresolved reference is still reported.");
+	passed &= Require (
+		ClassifyCandidateHeader (false, true, 64, 64) == CandidateHeaderAction::RefuseTooManyUnresolved,
+		"The 65th unresolved reference refuses the read.");
+	passed &= Require (
+		ClassifyCandidateHeader (false, false, 0, 64) == CandidateHeaderAction::Fail,
+		"Any other header error still fails the read.");
+
 	if (passed) std::cout << "Bounded rectangle read decision regression passed.\n";
 	return passed ? 0 : 1;
 }

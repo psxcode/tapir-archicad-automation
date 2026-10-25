@@ -2,6 +2,8 @@
 
 #include "NativeCrudInternal.hpp"
 
+#include "BoundedRectangleReadDecision.hpp"
+
 #include "ElementCommands.hpp"
 #include "ElementCreationCommands.hpp"
 #include "ExtendedElementCommands.hpp"
@@ -19,6 +21,8 @@ using namespace NativeCrudInternal;
 namespace {
 
 constexpr GSSize MaxDiscoveryCandidates = 4096;
+// The same bound as the TypeScript rectangle reader (D-288).
+constexpr GSSize MaxUnresolvedDiscoveryReferences = 64;
 
 GS::ObjectState CoordinateBounds (const API_Box3D& bounds)
 {
@@ -61,6 +65,13 @@ GS::ObjectState BuildReferencesFromSnapshots (const GS::ObjectState& snapshotsRe
     }
     response.Add ("count", static_cast<Int32> (snapshots.GetSize ()));
     return response;
+}
+
+void AddUnresolvedReferences (GS::ObjectState& response, const GS::Array<GS::ObjectState>& unresolvedReferences)
+{
+    if (unresolvedReferences.IsEmpty ()) return;
+    const auto& rows = response.AddList<GS::ObjectState> ("unresolvedReferences");
+    for (const GS::ObjectState& row : unresolvedReferences) rows (row);
 }
 
 GS::ObjectState CompactHistoryEntry (const GS::ObjectState& receipt, const bool detail)
@@ -186,6 +197,7 @@ GS::ObjectState DiscoverNativeElementsCommand::Execute (const GS::ObjectState& p
     double maxX = 0.0;
     double maxY = 0.0;
     GS::Array<GS::ObjectState> ids;
+    GS::Array<GS::ObjectState> unresolvedReferences;
     if (hasBounds) {
         const GS::ObjectState* bounds = parameters.Get ("bounds");
         if (bounds == nullptr)
@@ -212,6 +224,8 @@ GS::ObjectState DiscoverNativeElementsCommand::Execute (const GS::ObjectState& p
             return CreateErrorResponse (APIERR_BADPARS, "Bounded discovery did not return an element-reference list.");
         if (ids.GetSize () > MaxDiscoveryCandidates)
             return CreateErrorResponse (APIERR_BADPARS, "NARROW_SCOPE_REQUIRED: bounded discovery exceeded the finite raw-candidate limit.");
+        GS::Array<GS::ObjectState> rectUnresolved;
+        rectResult.Get ("unresolvedElements", rectUnresolved);
 
         // GetElementsInRect returns every element type intersecting the
         // rectangle. Apply exact type/story and native element bounds before
@@ -229,9 +243,34 @@ GS::ObjectState DiscoverNativeElementsCommand::Execute (const GS::ObjectState& p
             API_Elem_Head header = {};
             header.guid = guid;
             const GSErrCode headerError = ACAPI_Element_GetHeader (&header);
-            if (headerError != NoError)
-                return CreateErrorResponse (headerError, "Bounded discovery could not verify a candidate element header; coverage is incomplete.");
             seenGuids.Push (guid);
+            const auto headerAction = BoundedRectangleReadDecision::ClassifyCandidateHeader (
+                headerError == NoError, headerError == APIERR_BADID,
+                static_cast<unsigned long long> (unresolvedReferences.GetSize ()),
+                static_cast<unsigned long long> (MaxUnresolvedDiscoveryReferences));
+            if (headerAction == BoundedRectangleReadDecision::CandidateHeaderAction::ReportUnresolved) {
+                // The marquee lists a reference whose header Archicad does not
+                // resolve (D-288). Its type, story and bounds are unknown: it is
+                // reported as unresolved, never as a match or as an absence.
+                GS::ObjectState unresolved (
+                    "elementId", CreateGuidObjectState (guid),
+                    "reason", "native_header_unavailable",
+                    "nativeError", static_cast<Int32> (headerError));
+                for (const GS::ObjectState& rectRow : rectUnresolved) {
+                    const GS::ObjectState* rectId = rectRow.Get ("elementId");
+                    Int32 neigId = 0;
+                    if (rectId != nullptr && GetGuidFromObjectState (*rectId) == guid && rectRow.Get ("neigId", neigId)) {
+                        unresolved.Add ("neigId", neigId);
+                        break;
+                    }
+                }
+                unresolvedReferences.Push (unresolved);
+                continue;
+            }
+            if (headerAction == BoundedRectangleReadDecision::CandidateHeaderAction::RefuseTooManyUnresolved)
+                return CreateErrorResponse (APIERR_BADPARS, "NARROW_SCOPE_REQUIRED: bounded discovery found more than 64 references whose header Archicad does not resolve; coverage is incomplete.");
+            if (headerAction == BoundedRectangleReadDecision::CandidateHeaderAction::Fail)
+                return CreateErrorResponse (headerError, "Bounded discovery could not verify a candidate element header; coverage is incomplete.");
 
             if (!typeName.IsEmpty () && GetElemTypeId (header) != typeID)
                 continue;
@@ -312,6 +351,7 @@ GS::ObjectState DiscoverNativeElementsCommand::Execute (const GS::ObjectState& p
         const auto& elements = result.AddList<GS::ObjectState> ("elements");
         for (const GS::ObjectState& row : detailRows) elements (row);
         result.Add ("complete", dimensionCoverageComplete);
+        AddUnresolvedReferences (result, unresolvedReferences);
         return result;
     }
     bool complete = false;
@@ -353,6 +393,7 @@ GS::ObjectState DiscoverNativeElementsCommand::Execute (const GS::ObjectState& p
     const auto& outputReferences = filtered.AddList<GS::ObjectState> ("references");
     for (const GS::ObjectState& reference : referenceRows) outputReferences (reference);
     filtered.Add ("scope", hasDocument ? "documentTargetKey" : hasStory ? "story" : "bounds");
+    AddUnresolvedReferences (filtered, unresolvedReferences);
     return filtered;
 }
 

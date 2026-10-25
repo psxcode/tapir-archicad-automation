@@ -3227,6 +3227,19 @@ GS::Optional<GS::UniString> GetElementsInRectCommand::GetResponseSchema () const
                             "required": ["elementId", "elementType"]
                         }
                     },
+                    "unresolvedElements": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "elementId": { "$ref": "#/ElementId" },
+                                "neigId": { "type": "integer" },
+                                "headerError": { "type": "integer" }
+                            },
+                            "additionalProperties": false,
+                            "required": ["elementId", "neigId", "headerError"]
+                        }
+                    },
                     "elementCount": { "type": "integer" },
                     "focusRestored": { "type": "boolean" },
                     "error": { "$ref": "#/Error" },
@@ -3337,6 +3350,10 @@ GS::ObjectState GetElementsInRectCommand::Execute (const GS::ObjectState& parame
         boundedErr == NoError,
         boundedErr == APIERR_NOSEL,
         pageRequired);
+    // A marquee can list references whose header Archicad does not resolve
+    // (D-288). Keep them in `elements`, and report the marquee neig kind and
+    // the header error so the caller can name what it could not read.
+    GS::Array<GS::ObjectState> unresolvedElements;
     if (selectionReadAction == BoundedRectangleReadDecision::SelectionReadAction::CollectRows) {
         for (const API_Neig& selectedNeig : selectedNeigs) {
             const API_Guid guid = GetParentElemOfSectElem (selectedNeig.guid);
@@ -3345,7 +3362,14 @@ GS::ObjectState GetElementsInRectCommand::Execute (const GS::ObjectState& parame
 
             API_Elem_Head elemHead = {};
             elemHead.guid = guid;
-            if (ACAPI_Element_GetHeader (&elemHead) != NoError) continue;
+            const GSErrCode headerErr = ACAPI_Element_GetHeader (&elemHead);
+            if (headerErr != NoError) {
+                unresolvedElements.Push (GS::ObjectState (
+                    "elementId", CreateGuidObjectState (guid),
+                    "neigId", static_cast<Int32> (selectedNeig.neigID),
+                    "headerError", static_cast<Int32> (headerErr)));
+                continue;
+            }
             GS::ObjectState focusElement (
                 "elementId", CreateGuidObjectState (guid),
                 "elementType", GetElementTypeNonLocalizedName (GetElemTypeId (elemHead)));
@@ -3423,6 +3447,10 @@ GS::ObjectState GetElementsInRectCommand::Execute (const GS::ObjectState& parame
             0);
     }
 
+    if (!unresolvedElements.IsEmpty ()) {
+        const auto& unresolved = response.AddList<GS::ObjectState> ("unresolvedElements");
+        for (const GS::ObjectState& row : unresolvedElements) unresolved (row);
+    }
     response.Add ("elementCount", elementCount);
     response.Add ("focusRestored", true);
     return response;

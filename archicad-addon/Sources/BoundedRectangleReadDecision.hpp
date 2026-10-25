@@ -36,4 +36,26 @@ inline constexpr FinalAction ClassifyFinalRead (
 	return FinalAction::ReturnRows;
 }
 
+enum class CandidateHeaderAction {
+	Inspect,
+	ReportUnresolved,
+	RefuseTooManyUnresolved,
+	Fail
+};
+
+// D-288 in bounded discovery: a marquee reference whose header Archicad does
+// not resolve (APIERR_BADID) is reported, up to a fixed bound, instead of
+// failing the read. Every other header error still fails the read.
+inline constexpr CandidateHeaderAction ClassifyCandidateHeader (
+	bool headerRead,
+	bool headerNotFound,
+	unsigned long long unresolvedSoFar,
+	unsigned long long unresolvedLimit)
+{
+	if (headerRead) return CandidateHeaderAction::Inspect;
+	if (!headerNotFound) return CandidateHeaderAction::Fail;
+	if (unresolvedSoFar >= unresolvedLimit) return CandidateHeaderAction::RefuseTooManyUnresolved;
+	return CandidateHeaderAction::ReportUnresolved;
+}
+
 } // namespace BoundedRectangleReadDecision
