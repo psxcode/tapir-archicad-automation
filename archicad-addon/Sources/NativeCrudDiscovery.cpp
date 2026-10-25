@@ -17,10 +17,10 @@
 #include <vector>
 
 using namespace NativeCrudInternal;
+using BoundedRectangleReadDecision::DiscoveryBoundsIntersect;
 
 namespace {
 
-constexpr GSSize MaxDiscoveryCandidates = 4096;
 // The same bound as the TypeScript rectangle reader (D-288).
 constexpr GSSize MaxUnresolvedDiscoveryReferences = 64;
 
@@ -37,12 +37,6 @@ bool IsFiniteOrderedDiscoveryBounds (double minX, double minY, double maxX, doub
 {
     return std::isfinite (minX) && std::isfinite (minY) && std::isfinite (maxX) && std::isfinite (maxY)
         && minX <= maxX && minY <= maxY;
-}
-
-bool DiscoveryBoundsIntersect (double minX, double minY, double maxX, double maxY,
-    double queryMinX, double queryMinY, double queryMaxX, double queryMaxY)
-{
-    return maxX >= queryMinX && minX <= queryMaxX && maxY >= queryMinY && minY <= queryMaxY;
 }
 
 GS::ObjectState BuildReferencesFromSnapshots (const GS::ObjectState& snapshotsResponse)
@@ -198,108 +192,98 @@ GS::ObjectState DiscoverNativeElementsCommand::Execute (const GS::ObjectState& p
     double maxY = 0.0;
     GS::Array<GS::ObjectState> ids;
     GS::Array<GS::ObjectState> unresolvedReferences;
-    if (hasBounds) {
-        const GS::ObjectState* bounds = parameters.Get ("bounds");
-        if (bounds == nullptr)
-            return CreateErrorResponse (APIERR_BADPARS, "bounds is unavailable.");
-        if (!bounds->Get ("minX", minX) || !bounds->Get ("minY", minY) ||
-            !bounds->Get ("maxX", maxX) || !bounds->Get ("maxY", maxY))
-            return CreateErrorResponse (APIERR_BADPARS, "bounds requires numeric minX, minY, maxX and maxY.");
-        if (!IsFiniteOrderedDiscoveryBounds (minX, minY, maxX, maxY))
-            return CreateErrorResponse (APIERR_BADPARS, "bounds must be finite and ordered.");
-        GS::ObjectState rectParameters;
-        rectParameters.Add ("bounds", GS::ObjectState (
-            "xMin", minX, "yMin", minY,
-            "xMax", maxX, "yMax", maxY));
-        rectParameters.Add ("multiStory", true);
-        rectParameters.Add ("pageSize", static_cast<Int32> (MaxDiscoveryCandidates));
-        const GS::ObjectState rectResult = GetElementsInRectCommand ().Execute (rectParameters, processControl);
-        if (rectResult.Get ("error") != nullptr)
-            return rectResult;
-        bool rawPageRequired = false;
-        rectResult.Get ("pageRequired", rawPageRequired);
-        if (rawPageRequired)
-            return CreateErrorResponse (APIERR_BADPARS, "NARROW_SCOPE_REQUIRED: bounded discovery exceeded the finite raw-candidate limit.");
-        if (!rectResult.Get ("elements", ids))
-            return CreateErrorResponse (APIERR_BADPARS, "Bounded discovery did not return an element-reference list.");
-        if (ids.GetSize () > MaxDiscoveryCandidates)
-            return CreateErrorResponse (APIERR_BADPARS, "NARROW_SCOPE_REQUIRED: bounded discovery exceeded the finite raw-candidate limit.");
-        GS::Array<GS::ObjectState> rectUnresolved;
-        rectResult.Get ("unresolvedElements", rectUnresolved);
+    // Every accepted scope carries a bounds rectangle (checked above), so
+    // discovery never falls back to a project-wide element list.
+    const GS::ObjectState* bounds = parameters.Get ("bounds");
+    if (bounds == nullptr)
+        return CreateErrorResponse (APIERR_BADPARS, "NARROW_SCOPE_REQUIRED: native discovery requires a bounds rectangle.");
+    if (!bounds->Get ("minX", minX) || !bounds->Get ("minY", minY) ||
+        !bounds->Get ("maxX", maxX) || !bounds->Get ("maxY", maxY))
+        return CreateErrorResponse (APIERR_BADPARS, "bounds requires numeric minX, minY, maxX and maxY.");
+    if (!IsFiniteOrderedDiscoveryBounds (minX, minY, maxX, maxY))
+        return CreateErrorResponse (APIERR_BADPARS, "bounds must be finite and ordered.");
 
-        // GetElementsInRect returns every element type intersecting the
-        // rectangle. Apply exact type/story and native element bounds before
-        // the 100-reference cap or exact snapshot reads, so unrelated types
-        // and marquee false positives cannot crowd out the requested scope.
-        GS::Array<GS::ObjectState> scopedIds;
-        GS::Array<API_Guid> seenGuids;
-        for (const GS::ObjectState& id : ids) {
-            const API_Guid guid = GetRequestedElementGuid (id);
-            if (guid == APINULLGuid)
-                return CreateErrorResponse (APIERR_BADPARS, "Bounded discovery returned an invalid element GUID.");
-            if (seenGuids.Contains (guid))
-                continue;
-
-            API_Elem_Head header = {};
-            header.guid = guid;
-            const GSErrCode headerError = ACAPI_Element_GetHeader (&header);
-            seenGuids.Push (guid);
-            const auto headerAction = BoundedRectangleReadDecision::ClassifyCandidateHeader (
-                headerError == NoError, headerError == APIERR_BADID,
-                static_cast<unsigned long long> (unresolvedReferences.GetSize ()),
-                static_cast<unsigned long long> (MaxUnresolvedDiscoveryReferences));
-            if (headerAction == BoundedRectangleReadDecision::CandidateHeaderAction::ReportUnresolved) {
-                // The marquee lists a reference whose header Archicad does not
-                // resolve (D-288). Its type, story and bounds are unknown: it is
-                // reported as unresolved, never as a match or as an absence.
-                GS::ObjectState unresolved (
-                    "elementId", CreateGuidObjectState (guid),
-                    "reason", "native_header_unavailable",
-                    "nativeError", static_cast<Int32> (headerError));
-                for (const GS::ObjectState& rectRow : rectUnresolved) {
-                    const GS::ObjectState* rectId = rectRow.Get ("elementId");
-                    Int32 neigId = 0;
-                    if (rectId != nullptr && GetGuidFromObjectState (*rectId) == guid && rectRow.Get ("neigId", neigId)) {
-                        unresolved.Add ("neigId", neigId);
-                        break;
-                    }
-                }
-                unresolvedReferences.Push (unresolved);
-                continue;
-            }
-            if (headerAction == BoundedRectangleReadDecision::CandidateHeaderAction::RefuseTooManyUnresolved)
-                return CreateErrorResponse (APIERR_BADPARS, "NARROW_SCOPE_REQUIRED: bounded discovery found more than 64 references whose header Archicad does not resolve; coverage is incomplete.");
-            if (headerAction == BoundedRectangleReadDecision::CandidateHeaderAction::Fail)
-                return CreateErrorResponse (headerError, "Bounded discovery could not verify a candidate element header; coverage is incomplete.");
-
-            if (!typeName.IsEmpty () && GetElemTypeId (header) != typeID)
-                continue;
-            if (hasStory && static_cast<Int32> (header.floorInd) != storyIndex)
-                continue;
-
-            API_Box3D elementBounds = {};
-            const GSErrCode boundsError = ACAPI_Element_CalcBounds (&header, &elementBounds);
-            if (boundsError != NoError || !IsFiniteOrderedDiscoveryBounds (
-                    elementBounds.xMin, elementBounds.yMin, elementBounds.xMax, elementBounds.yMax))
-                return CreateErrorResponse (boundsError != NoError ? boundsError : APIERR_BADPARS,
-                    "Bounded discovery could not verify finite native bounds for a candidate; coverage is incomplete.");
-            if (!DiscoveryBoundsIntersect (elementBounds.xMin, elementBounds.yMin, elementBounds.xMax, elementBounds.yMax,
-                    minX, minY, maxX, maxY))
-                continue;
-            scopedIds.Push (id);
-        }
-        ids = scopedIds;
+    // D-321: discovery enumerates the Floor Plan database by element type and
+    // filters by the exact header type, story and native bounds. It never
+    // installs a temporary marquee: a marquee is the UI focus (refused while
+    // the operator or the agent has a selection), a multi-story box counts
+    // every story against a candidate limit, and marquee membership omits
+    // hidden-layer elements, doors and windows (V1-037). Only references of the
+    // requested type, story and rectangle reach the 100-reference cap.
+    API_DatabaseInfo database = {};
+    const GSErrCode databaseError = ACAPI_Database_GetCurrentDatabase (&database);
+    if (databaseError != NoError)
+        return CreateErrorResponse (databaseError, "Bounded discovery could not verify the current database.");
+    if (database.typeID != APIWind_FloorPlanID)
+        return CreateErrorResponse (APIERR_BADPARS, "Bounded discovery reads the Floor Plan database; the active window shows another database. Open the story's floor plan and retry.");
+    // An untyped request covers the supported native types only; other
+    // element types (dimensions, labels, objects, views) have their own
+    // typed reads, and some of them have no plan bounds at all.
+    GS::Array<API_ElemTypeID> enumeratedTypes;
+    if (typeName.IsEmpty ()) {
+        for (const API_ElemTypeID supported : { API_ZoneID, API_WallID, API_ColumnID, API_TextID, API_LineID,
+                 API_ArcID, API_CircleID, API_HatchID, API_DoorID, API_WindowID })
+            enumeratedTypes.Push (supported);
     } else {
-        GS::ObjectState listParameters;
-        if (!typeName.IsEmpty ()) listParameters.Add ("elementType", typeName);
-        listParameters.Add ("pageSize", static_cast<Int32> (MaxDiscoveryReferences + 1));
-        const GS::ObjectState listResult = typeName.IsEmpty ()
-            ? GetAllElementsCommand ().Execute (listParameters, processControl)
-            : GetElementsByTypeCommand ().Execute (listParameters, processControl);
-        listResult.Get ("elements", ids);
+        enumeratedTypes.Push (typeID);
+    }
+    GS::Array<API_Guid> candidates;
+    for (const API_ElemTypeID enumeratedType : enumeratedTypes) {
+        GS::Array<API_Guid> typeCandidates;
+        const GSErrCode listError = ACAPI_Element_GetElemList (enumeratedType, &typeCandidates);
+        if (listError != NoError)
+            return CreateErrorResponse (listError, "Bounded discovery could not enumerate the requested element type.");
+        candidates.Append (typeCandidates);
+    }
+
+    // Each element list holds a GUID once and the types are disjoint, so the
+    // candidate loop is linear.
+    for (const API_Guid& guid : candidates) {
+        if (guid == APINULLGuid)
+            return CreateErrorResponse (APIERR_BADPARS, "Bounded discovery enumerated an invalid element GUID.");
+
+        API_Elem_Head header = {};
+        header.guid = guid;
+        const GSErrCode headerError = ACAPI_Element_GetHeader (&header);
+        const auto headerAction = BoundedRectangleReadDecision::ClassifyCandidateHeader (
+            headerError == NoError, headerError == APIERR_BADID,
+            static_cast<unsigned long long> (unresolvedReferences.GetSize ()),
+            static_cast<unsigned long long> (MaxUnresolvedDiscoveryReferences));
+        if (headerAction == BoundedRectangleReadDecision::CandidateHeaderAction::ReportUnresolved) {
+            // An enumerated reference whose header Archicad does not resolve
+            // (D-288). Its type, story and bounds are unknown: it is reported
+            // as unresolved, never as a match or as an absence.
+            unresolvedReferences.Push (GS::ObjectState (
+                "elementId", CreateGuidObjectState (guid),
+                "reason", "native_header_unavailable",
+                "nativeError", static_cast<Int32> (headerError)));
+            continue;
+        }
+        if (headerAction == BoundedRectangleReadDecision::CandidateHeaderAction::RefuseTooManyUnresolved)
+            return CreateErrorResponse (APIERR_BADPARS, "NARROW_SCOPE_REQUIRED: bounded discovery found more than 64 references whose header Archicad does not resolve; coverage is incomplete.");
+        if (headerAction == BoundedRectangleReadDecision::CandidateHeaderAction::Fail)
+            return CreateErrorResponse (headerError, "Bounded discovery could not verify a candidate element header; coverage is incomplete.");
+
+        if (!typeName.IsEmpty () && GetElemTypeId (header) != typeID)
+            continue;
+        if (hasStory && static_cast<Int32> (header.floorInd) != storyIndex)
+            continue;
+
+        API_Box3D elementBounds = {};
+        const GSErrCode boundsError = ACAPI_Element_CalcBounds (&header, &elementBounds);
+        if (boundsError != NoError || !IsFiniteOrderedDiscoveryBounds (
+                elementBounds.xMin, elementBounds.yMin, elementBounds.xMax, elementBounds.yMax))
+            return CreateErrorResponse (boundsError != NoError ? boundsError : APIERR_BADPARS,
+                "Bounded discovery could not verify finite native bounds for a candidate; coverage is incomplete.");
+        if (!DiscoveryBoundsIntersect (elementBounds.xMin, elementBounds.yMin, elementBounds.xMax, elementBounds.yMax,
+                minX, minY, maxX, maxY))
+            continue;
+        ids.Push (CreateElementIdObjectState (guid));
     }
     if (ids.GetSize () > MaxDiscoveryReferences)
-        return CreateErrorResponse (APIERR_BADPARS, "NARROW_SCOPE_REQUIRED: discovery exceeded the 100-reference cap.");
+        return CreateErrorResponse (APIERR_BADPARS, GS::UniString::Printf (
+            "NARROW_SCOPE_REQUIRED: discovery matched %d references in the requested scope, above the 100-reference cap; narrow the rectangle.",
+            static_cast<int> (ids.GetSize ())));
     if (requestedDimensionFamily) {
         GS::Array<GS::ObjectState> detailRows;
         bool dimensionCoverageComplete = true;

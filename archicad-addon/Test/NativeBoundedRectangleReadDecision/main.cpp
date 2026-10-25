@@ -61,6 +61,20 @@ int main ()
 		ClassifyCandidateHeader (false, false, 0, 64) == CandidateHeaderAction::Fail,
 		"Any other header error still fails the read.");
 
+	// D-321: an element touching the rectangle edge is in scope; a disjoint one is not.
+	passed &= Require (
+		DiscoveryBoundsIntersect (0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 2.0, 2.0),
+		"Bounds touching the rectangle corner intersect it.");
+	passed &= Require (
+		DiscoveryBoundsIntersect (-5.0, 0.4, 5.0, 0.6, 0.0, 0.0, 1.0, 1.0),
+		"An element crossing the rectangle intersects it.");
+	passed &= Require (
+		!DiscoveryBoundsIntersect (1.0001, 0.0, 2.0, 1.0, 0.0, 0.0, 1.0, 1.0),
+		"Bounds right of the rectangle do not intersect it.");
+	passed &= Require (
+		!DiscoveryBoundsIntersect (0.0, -2.0, 1.0, -0.0001, 0.0, 0.0, 1.0, 1.0),
+		"Bounds below the rectangle do not intersect it.");
+
 	if (passed) std::cout << "Bounded rectangle read decision regression passed.\n";
 	return passed ? 0 : 1;
 }

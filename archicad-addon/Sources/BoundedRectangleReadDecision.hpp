@@ -58,4 +58,13 @@ inline constexpr CandidateHeaderAction ClassifyCandidateHeader (
 	return CandidateHeaderAction::ReportUnresolved;
 }
 
+// D-321: bounded discovery keeps an enumerated element of the requested type
+// and story when its native bounds touch or overlap the requested rectangle.
+inline constexpr bool DiscoveryBoundsIntersect (
+	double minX, double minY, double maxX, double maxY,
+	double queryMinX, double queryMinY, double queryMaxX, double queryMaxY)
+{
+	return maxX >= queryMinX && minX <= queryMaxX && maxY >= queryMinY && minY <= queryMaxY;
+}
+
 } // namespace BoundedRectangleReadDecision
