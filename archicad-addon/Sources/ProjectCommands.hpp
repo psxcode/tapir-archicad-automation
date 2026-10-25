@@ -190,12 +190,34 @@ public:
     virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
 };
 
-// Explicit benchmark/UI-focus command.  Unlike the render commands this keeps
+// Explicit UI-focus command (D-319).  Unlike the render commands this keeps
 // the requested marquee in Archicad after the call returns.
 class SetMarqueeCommand : public CommandBase
 {
 public:
     SetMarqueeCommand ();
+    virtual GS::String GetName () const override;
+    virtual GS::Optional<GS::UniString> GetInputParametersSchema () const override;
+    virtual GS::Optional<GS::UniString> GetResponseSchema () const override;
+    virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
+};
+
+// Clears a running marquee; an individual element selection is left untouched (D-319).
+class ClearMarqueeCommand : public CommandBase
+{
+public:
+    ClearMarqueeCommand ();
+    virtual GS::String GetName () const override;
+    virtual GS::Optional<GS::UniString> GetInputParametersSchema () const override;
+    virtual GS::Optional<GS::UniString> GetResponseSchema () const override;
+    virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
+};
+
+// Clears the individual element selection; a running marquee is left untouched (D-319).
+class DeselectAllElementsCommand : public CommandBase
+{
+public:
+    DeselectAllElementsCommand ();
     virtual GS::String GetName () const override;
     virtual GS::Optional<GS::UniString> GetInputParametersSchema () const override;
     virtual GS::Optional<GS::UniString> GetResponseSchema () const override;

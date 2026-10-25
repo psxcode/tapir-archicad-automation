@@ -2872,6 +2872,10 @@ GS::Optional<GS::UniString> GetSelectedElementsCommand::GetInputParametersSchema
             "pageSize": {
                 "type": "integer",
                 "minimum": 1
+            },
+            "summaryOnly": {
+                "type": "boolean",
+                "description": "Return only the focus kind, the counts and the marquee shape, without element rows, whatever the selection size."
             }
         },
         "additionalProperties": false,
@@ -3076,6 +3080,23 @@ GS::ObjectState GetSelectedElementsCommand::Execute (const GS::ObjectState& para
     const GS::OnExit selectionSummaryGuard ([&selectionSummary] () { ReleaseSelectionInfo (selectionSummary); });
     if (summaryErr != NoError && summaryErr != APIERR_NOSEL) {
         return CreateErrorResponse (summaryErr, "Failed to retrieve the active selection summary.");
+    }
+    bool summaryOnly = false;
+    parameters.Get ("summaryOnly", summaryOnly);
+    if (summaryOnly) {
+        GS::ObjectState summary;
+        summary.AddList<GS::ObjectState> ("elements");
+        summary.AddList<GS::ObjectState> ("focusElements");
+        const API_SelTypeID summaryType = summaryErr == APIERR_NOSEL ? API_SelEmpty : selectionSummary.typeID;
+        summary.Add ("selectionType", SelectionTypeToString (summaryType));
+        summary.Add ("elementRelationship",
+            summaryType == API_SelElems ? "individually_selected" :
+            IsMarqueeSelection (summaryType) ? "inside_or_intersecting_marquee" : "none");
+        summary.Add ("selectedElementCount", summaryErr == APIERR_NOSEL ? 0 : selectionSummary.sel_nElem);
+        summary.Add ("editableElementCount", summaryErr == APIERR_NOSEL ? 0 : selectionSummary.sel_nElemEdit);
+        if (IsMarqueeSelection (summaryType) && !AddMarqueeToResponse (summary, selectionSummary, "live_query"))
+            return CreateErrorResponse (APIERR_BADPARS, "The active marquee contains invalid or oversized geometry.");
+        return summary;
     }
     if (summaryErr == NoError && selectionSummary.sel_nElem > pageSize) {
         return CreateNativePageRequiredResponse (

@@ -322,7 +322,11 @@ GSErrCode Initialize (void)
         );
         err |= RegisterCommand<SetMarqueeCommand> (
             projectCommands, "1.5.16",
-            "Sets a persistent rectangular marquee for explicit benchmark focus without changing the story or individual element selection."
+            "Sets a persistent rectangular marquee for explicit UI focus without changing the story or individual element selection."
+        );
+        err |= RegisterCommand<ClearMarqueeCommand> (
+            projectCommands, "1.5.17",
+            "Clears the running marquee and verifies the empty focus. An individual element selection is left untouched."
         );
         err |= RegisterCommand<RebuildViewCommand> (
             projectCommands, "1.5.0",
@@ -360,6 +364,10 @@ GSErrCode Initialize (void)
         err |= RegisterCommand<ChangeSelectionOfElementsCommand> (
             elementCommands, "1.0.7",
             "Adds/removes a number of elements to/from the current selection."
+        );
+        err |= RegisterCommand<DeselectAllElementsCommand> (
+            elementCommands, "1.5.17",
+            "Clears the individual element selection and verifies the empty focus. A running marquee is left untouched."
         );
         err |= RegisterCommand<FilterElementsCommand> (
             elementCommands, "1.0.7",

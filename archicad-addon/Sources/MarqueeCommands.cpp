@@ -1,5 +1,6 @@
 #include "ProjectCommands.hpp"
 #include "NativeOwnership.hpp"
+#include "MigrationHelper.hpp"
 
 #include <cmath>
 
@@ -158,7 +159,7 @@ GS::ObjectState SetMarqueeCommand::Execute (const GS::ObjectState& parameters, G
     if (previousErr == NoError && previousSelection.typeID == API_SelElems) {
         return CreateFailedExecutionResult (
             APIERR_REFUSEDCMD,
-            "SetMarquee refuses to replace an active individual element selection. Clear the selection or use a marquee-only benchmark context.");
+            "SetMarquee refuses to replace an active individual element selection. Clear the selection first (DeselectAllElements).");
     }
 
     API_SelectionInfo requested = {};
@@ -172,7 +173,7 @@ GS::ObjectState SetMarqueeCommand::Execute (const GS::ObjectState& parameters, G
 
     const GSErrCode setErr = ACAPI_Selection_SetMarquee (&requested);
     if (setErr != NoError) {
-        return CreateErrorResponse (setErr, "Failed to set the persistent benchmark marquee.");
+        return CreateErrorResponse (setErr, "Failed to set the persistent marquee.");
     }
 
     API_SelectionInfo currentSelection = {};
@@ -197,4 +198,139 @@ GS::ObjectState SetMarqueeCommand::Execute (const GS::ObjectState& parameters, G
     response.Add ("currentFocus", FocusObject (currentSelection, currentErr));
 
     return response;
+}
+
+namespace {
+
+static const char* FocusChangeResponseSchema = R"({
+        "type": "object",
+        "properties": {
+            "status": { "type": "string", "enum": ["cleared", "already_clear"] },
+            "verificationStatus": { "type": "string", "enum": ["verified", "unavailable", "mismatch"] },
+            "previousFocus": { "type": "object" },
+            "currentFocus": { "type": "object" }
+        },
+        "additionalProperties": false,
+        "required": ["status", "verificationStatus", "previousFocus", "currentFocus"]
+    })";
+
+static const char* EmptyInputSchema = R"({
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false,
+        "required": []
+    })";
+
+// Reads the focus again after a clear and reports it next to the focus before.
+static GS::ObjectState FocusChangeResponse (
+    bool changed,
+    const API_SelectionInfo& previousSelection,
+    GSErrCode previousErr,
+    bool (*isCleared) (const API_SelectionInfo&, GSErrCode))
+{
+    API_SelectionInfo currentSelection = {};
+    const GSErrCode currentErr = ACAPI_Selection_Get (&currentSelection, nullptr, false);
+    const GS::OnExit currentSelectionGuard ([&currentSelection] () { ReleaseSelectionInfo (currentSelection); });
+    const bool verificationUnavailable = currentErr != NoError && currentErr != APIERR_NOSEL;
+
+    GS::ObjectState response;
+    response.Add ("status", changed ? "cleared" : "already_clear");
+    response.Add ("verificationStatus",
+        verificationUnavailable ? "unavailable" : isCleared (currentSelection, currentErr) ? "verified" : "mismatch");
+    response.Add ("previousFocus", FocusObject (previousSelection, previousErr));
+    response.Add ("currentFocus", FocusObject (currentSelection, currentErr));
+    return response;
+}
+
+static bool HasNoMarquee (const API_SelectionInfo& selection, GSErrCode selectionErr)
+{
+    return selectionErr == APIERR_NOSEL || !IsMarqueeSelection (selection.typeID);
+}
+
+static bool HasNoElementSelection (const API_SelectionInfo& selection, GSErrCode selectionErr)
+{
+    return selectionErr == APIERR_NOSEL || selection.typeID != API_SelElems || selection.sel_nElem == 0;
+}
+
+} // namespace
+
+ClearMarqueeCommand::ClearMarqueeCommand () :
+    CommandBase (CommonSchema::Used)
+{
+}
+
+GS::String ClearMarqueeCommand::GetName () const
+{
+    return "ClearMarquee";
+}
+
+GS::Optional<GS::UniString> ClearMarqueeCommand::GetInputParametersSchema () const
+{
+    return GS::UniString (EmptyInputSchema);
+}
+
+GS::Optional<GS::UniString> ClearMarqueeCommand::GetResponseSchema () const
+{
+    return GS::UniString (FocusChangeResponseSchema);
+}
+
+GS::ObjectState ClearMarqueeCommand::Execute (const GS::ObjectState& /*parameters*/, GS::ProcessControl& /*processControl*/) const
+{
+    API_SelectionInfo previousSelection = {};
+    const GSErrCode previousErr = ACAPI_Selection_Get (&previousSelection, nullptr, false);
+    const GS::OnExit previousSelectionGuard ([&previousSelection] () { ReleaseSelectionInfo (previousSelection); });
+    if (previousErr != NoError && previousErr != APIERR_NOSEL) {
+        return CreateErrorResponse (previousErr, "Failed to inspect the operator focus before clearing the marquee.");
+    }
+    if (HasNoMarquee (previousSelection, previousErr)) {
+        return FocusChangeResponse (false, previousSelection, previousErr, HasNoMarquee);
+    }
+
+    API_SelectionInfo emptySelection = {};
+    emptySelection.typeID = API_SelEmpty;
+    const GSErrCode clearErr = ACAPI_Selection_SetMarquee (&emptySelection);
+    if (clearErr != NoError) {
+        return CreateErrorResponse (clearErr, "Failed to clear the marquee.");
+    }
+    return FocusChangeResponse (true, previousSelection, previousErr, HasNoMarquee);
+}
+
+DeselectAllElementsCommand::DeselectAllElementsCommand () :
+    CommandBase (CommonSchema::Used)
+{
+}
+
+GS::String DeselectAllElementsCommand::GetName () const
+{
+    return "DeselectAllElements";
+}
+
+GS::Optional<GS::UniString> DeselectAllElementsCommand::GetInputParametersSchema () const
+{
+    return GS::UniString (EmptyInputSchema);
+}
+
+GS::Optional<GS::UniString> DeselectAllElementsCommand::GetResponseSchema () const
+{
+    return GS::UniString (FocusChangeResponseSchema);
+}
+
+GS::ObjectState DeselectAllElementsCommand::Execute (const GS::ObjectState& /*parameters*/, GS::ProcessControl& /*processControl*/) const
+{
+    API_SelectionInfo previousSelection = {};
+    const GSErrCode previousErr = ACAPI_Selection_Get (&previousSelection, nullptr, false);
+    const GS::OnExit previousSelectionGuard ([&previousSelection] () { ReleaseSelectionInfo (previousSelection); });
+    if (previousErr != NoError && previousErr != APIERR_NOSEL) {
+        return CreateErrorResponse (previousErr, "Failed to inspect the operator focus before clearing the selection.");
+    }
+    // A running marquee is not an individual selection: leave it to ClearMarquee.
+    if (HasNoElementSelection (previousSelection, previousErr)) {
+        return FocusChangeResponse (false, previousSelection, previousErr, HasNoElementSelection);
+    }
+
+    const GSErrCode deselectErr = ACAPI_Selection_DeselectAll ();
+    if (deselectErr != NoError) {
+        return CreateErrorResponse (deselectErr, "Failed to clear the element selection.");
+    }
+    return FocusChangeResponse (true, previousSelection, previousErr, HasNoElementSelection);
 }
