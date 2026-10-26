@@ -3513,6 +3513,7 @@ GS::Optional<GS::UniString> GetPlanElementsInBoundsCommand::GetResponseSchema ()
                                 "elementId": { "$ref": "#/ElementId" },
                                 "elementType": { "type": "string" },
                                 "floorIndex": { "type": "integer" },
+                                "layerIndex": { "type": "integer" },
                                 "bounds": {
                                     "type": "object",
                                     "properties": {
@@ -3658,10 +3659,12 @@ GS::ObjectState GetPlanElementsInBoundsCommand::Execute (const GS::ObjectState& 
             if (matched > pageSize)
                 continue;
             elements (CreateElementIdObjectState (guid));
+            // D-323: the header already carries the layer; no attribute read is needed.
             focusElements (GS::ObjectState (
                 "elementId", CreateGuidObjectState (guid),
                 "elementType", GetElementTypeNonLocalizedName (typeId),
                 "floorIndex", static_cast<Int32> (header.floorInd),
+                "layerIndex", GetAttributeIndex (header.layer),
                 "bounds", GS::ObjectState (
                     "xMin", elementBounds.xMin, "yMin", elementBounds.yMin,
                     "xMax", elementBounds.xMax, "yMax", elementBounds.yMax)));

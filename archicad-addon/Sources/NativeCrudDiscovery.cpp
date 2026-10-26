@@ -53,6 +53,8 @@ GS::ObjectState BuildReferencesFromSnapshots (const GS::ObjectState& snapshotsRe
         if (snapshot.Get ("elementType", type)) reference.Add ("elementType", type);
         Int32 story = 0;
         if (snapshot.Get ("storyIndex", story)) reference.Add ("storyIndex", story);
+        Int32 layer = 0;
+        if (snapshot.Get ("layerIndex", layer)) reference.Add ("layerIndex", layer);
         const GS::ObjectState* bounds = snapshot.Get ("bounds");
         if (bounds != nullptr) reference.Add ("bounds", *bounds);
         references (reference);

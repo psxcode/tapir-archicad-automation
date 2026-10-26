@@ -304,6 +304,13 @@ GS::ObjectState SnapshotFromDetailRow (const GS::ObjectState& row, const GS::Uni
     Int32 floorIndex = 0;
     if (row.Get ("floorIndex", floorIndex))
         snapshot.Add ("storyIndex", floorIndex);
+    // D-323: the element's layer attribute index rides on the snapshot top
+    // level, outside writableState, so the fingerprint stays unchanged. The
+    // key is omitted when the detail row does not carry it (for example a
+    // drafting-profile row); a client must not guess a layer.
+    Int32 layerIndex = 0;
+    if (row.Get ("layerIndex", layerIndex) && layerIndex > 0)
+        snapshot.Add ("layerIndex", layerIndex);
     const GS::ObjectState* bounds = row.Get ("bounds");
     if (bounds != nullptr) {
         double xMin = 0.0;
