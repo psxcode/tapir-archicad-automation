@@ -3456,6 +3456,235 @@ GS::ObjectState GetElementsInRectCommand::Execute (const GS::ObjectState& parame
     return response;
 }
 
+GetPlanElementsInBoundsCommand::GetPlanElementsInBoundsCommand () :
+    CommandBase (CommonSchema::Used)
+{
+}
+
+GS::String GetPlanElementsInBoundsCommand::GetName () const
+{
+    return "GetPlanElementsInBounds";
+}
+
+GS::Optional<GS::UniString> GetPlanElementsInBoundsCommand::GetInputParametersSchema () const
+{
+    return R"({
+        "type": "object",
+        "properties": {
+            "bounds": {
+                "type": "object",
+                "properties": {
+                    "xMin": { "type": "number" },
+                    "yMin": { "type": "number" },
+                    "xMax": { "type": "number" },
+                    "yMax": { "type": "number" }
+                },
+                "additionalProperties": false,
+                "required": ["xMin", "yMin", "xMax", "yMax"]
+            },
+            "storyIndex": { "type": "integer" },
+            "elementTypes": {
+                "type": "array",
+                "items": { "type": "string", "minLength": 1 },
+                "minItems": 1,
+                "uniqueItems": true
+            },
+            "pageSize": {
+                "type": "integer",
+                "minimum": 1
+            }
+        },
+        "additionalProperties": false,
+        "required": ["bounds", "storyIndex", "elementTypes"]
+    })";
+}
+
+GS::Optional<GS::UniString> GetPlanElementsInBoundsCommand::GetResponseSchema () const
+{
+    return R"({
+        "type": "object",
+        "properties": {
+                    "elements": { "$ref": "#/Elements" },
+                    "focusElements": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "elementId": { "$ref": "#/ElementId" },
+                                "elementType": { "type": "string" },
+                                "floorIndex": { "type": "integer" },
+                                "bounds": {
+                                    "type": "object",
+                                    "properties": {
+                                        "xMin": { "type": "number" }, "yMin": { "type": "number" },
+                                        "xMax": { "type": "number" }, "yMax": { "type": "number" }
+                                    },
+                                    "additionalProperties": false,
+                                    "required": ["xMin", "yMin", "xMax", "yMax"]
+                                }
+                            },
+                            "additionalProperties": false,
+                            "required": ["elementId", "elementType", "floorIndex", "bounds"]
+                        }
+                    },
+                    "unresolvedElements": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "elementId": { "$ref": "#/ElementId" },
+                                "headerError": { "type": "integer" }
+                            },
+                            "additionalProperties": false,
+                            "required": ["elementId", "headerError"]
+                        }
+                    },
+                    "elementCount": { "type": "integer" },
+                    "candidateCount": { "type": "integer" },
+                    "error": { "$ref": "#/Error" },
+                    "pageRequired": { "type": "boolean", "enum": [true] },
+                    "resourceLimit": { "type": "boolean", "enum": [true] },
+                    "code": { "type": "string" },
+                    "message": { "type": "string" },
+                    "enumerated": { "type": "integer" },
+                    "emitted": { "type": "integer" }
+        },
+        "additionalProperties": false
+    })";
+}
+
+GS::ObjectState GetPlanElementsInBoundsCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl& /*processControl*/) const
+{
+    // D-322: a bounded plan read enumerates the Floor Plan database by element
+    // type and keeps elements whose header story equals storyIndex and whose
+    // native bounds intersect the rectangle. It never draws a marquee or reads
+    // the selection, the active story or the viewport, so an operator or agent
+    // selection does not block it, hidden layers and hosted openings are found,
+    // and other stories are never counted.
+    constexpr GSSize MaxUnresolvedPlanReferences = 64;
+    const GS::ObjectState* bounds = parameters.Get ("bounds");
+    double xMin = 0.0, yMin = 0.0, xMax = 0.0, yMax = 0.0;
+    if (bounds == nullptr || !bounds->Get ("xMin", xMin) || !bounds->Get ("yMin", yMin) ||
+        !bounds->Get ("xMax", xMax) || !bounds->Get ("yMax", yMax)) {
+        return CreateErrorResponse (APIERR_BADPARS, "bounds.xMin, bounds.yMin, bounds.xMax and bounds.yMax are required.");
+    }
+    if (!std::isfinite (xMin) || !std::isfinite (yMin) || !std::isfinite (xMax) || !std::isfinite (yMax) ||
+        xMin >= xMax || yMin >= yMax) {
+        return CreateErrorResponse (APIERR_BADPARS, "Rectangle bounds must have positive area.");
+    }
+    Int32 storyIndex = 0;
+    if (!parameters.Get ("storyIndex", storyIndex))
+        return CreateErrorResponse (APIERR_BADPARS, "storyIndex is required.");
+    GS::Array<GS::UniString> typeNames;
+    if (!parameters.Get ("elementTypes", typeNames) || typeNames.IsEmpty ())
+        return CreateErrorResponse (APIERR_BADPARS, "elementTypes must name at least one element type.");
+    GS::Array<API_ElemTypeID> typeIds;
+    for (const GS::UniString& typeName : typeNames) {
+        const API_ElemTypeID typeId = GetElementTypeFromNonLocalizedName (typeName);
+        if (typeId == API_ZombieElemID)
+            return CreateErrorResponse (APIERR_BADPARS, "elementTypes contains an unknown element type: " + typeName);
+        if (!typeIds.Contains (typeId))
+            typeIds.Push (typeId);
+    }
+    Int32 pageSize = std::numeric_limits<Int32>::max ();
+    if (!ReadNativePageSize (parameters, pageSize, pageSize))
+        return CreateErrorResponse (APIERR_BADPARS, "pageSize must be a positive integer.");
+
+    API_DatabaseInfo database = {};
+    const GSErrCode databaseError = ACAPI_Database_GetCurrentDatabase (&database);
+    if (databaseError != NoError)
+        return CreateErrorResponse (databaseError, "The bounded plan read could not verify the current database.");
+    if (database.typeID != APIWind_FloorPlanID)
+        return CreateErrorResponse (APIERR_BADPARS, "FLOOR_PLAN_DATABASE_REQUIRED: the bounded plan read uses the Floor Plan database; the active window shows another database. Open a floor plan window and retry.");
+
+    GS::ObjectState response;
+    const auto& elements = response.AddList<GS::ObjectState> ("elements");
+    const auto& focusElements = response.AddList<GS::ObjectState> ("focusElements");
+    GS::Array<GS::ObjectState> unresolvedElements;
+    GS::Array<API_Guid> unresolvedGuids;
+    Int32 candidateCount = 0;
+    Int32 matched = 0;
+    for (const API_ElemTypeID typeId : typeIds) {
+        GS::Array<API_Guid> candidates;
+        const GSErrCode listError = ACAPI_Element_GetElemList (typeId, &candidates);
+        if (listError != NoError)
+            return CreateErrorResponse (listError, "The bounded plan read could not enumerate a requested element type.");
+        for (const API_Guid& guid : candidates) {
+            ++candidateCount;
+            API_Elem_Head header = {};
+            header.guid = guid;
+            const GSErrCode headerError = ACAPI_Element_GetHeader (&header);
+            const auto headerAction = BoundedRectangleReadDecision::ClassifyCandidateHeader (
+                headerError == NoError, headerError == APIERR_BADID,
+                static_cast<unsigned long long> (unresolvedElements.GetSize ()),
+                static_cast<unsigned long long> (MaxUnresolvedPlanReferences));
+            if (headerAction == BoundedRectangleReadDecision::CandidateHeaderAction::ReportUnresolved) {
+                // Listed but without a header (D-288): type, story and bounds
+                // are unknown, so it is neither a match nor an absence.
+                unresolvedElements.Push (GS::ObjectState (
+                    "elementId", CreateGuidObjectState (guid),
+                    "headerError", static_cast<Int32> (headerError)));
+                unresolvedGuids.Push (guid);
+                continue;
+            }
+            if (headerAction == BoundedRectangleReadDecision::CandidateHeaderAction::RefuseTooManyUnresolved)
+                return CreateErrorResponse (APIERR_BADPARS, "NARROW_SCOPE_REQUIRED: the bounded plan read found more than 64 references whose header Archicad does not resolve; coverage is incomplete.");
+            if (headerAction == BoundedRectangleReadDecision::CandidateHeaderAction::Fail)
+                return CreateErrorResponse (headerError, "The bounded plan read could not verify an element header; coverage is incomplete.");
+            if (GetElemTypeId (header) != typeId || static_cast<Int32> (header.floorInd) != storyIndex)
+                continue;
+
+            API_Box3D elementBounds = {};
+            const GSErrCode boundsError = ACAPI_Element_CalcBounds (&header, &elementBounds);
+            if (boundsError != NoError || !IsFiniteBounds (elementBounds) ||
+                elementBounds.xMin > elementBounds.xMax || elementBounds.yMin > elementBounds.yMax)
+                return CreateErrorResponse (boundsError != NoError ? boundsError : APIERR_BADPARS,
+                    "The bounded plan read could not verify finite native bounds for an element on the requested story; coverage is incomplete.");
+            if (!BoundedRectangleReadDecision::DiscoveryBoundsIntersect (
+                    elementBounds.xMin, elementBounds.yMin, elementBounds.xMax, elementBounds.yMax,
+                    xMin, yMin, xMax, yMax))
+                continue;
+            if (typeId == API_ObjectID) {
+                // Like GetElementsByType: an Object owned by another element is a part of it, not a plan Object.
+                API_Element object = {};
+                object.header.guid = guid;
+                const GSErrCode objectError = ACAPI_Element_Get (&object);
+                if (objectError != NoError)
+                    return CreateErrorResponse (objectError, "The bounded plan read could not verify an Object owner; coverage is incomplete.");
+                if (object.object.owner != APINULLGuid)
+                    continue;
+            }
+            ++matched;
+            if (matched > pageSize)
+                continue;
+            elements (CreateElementIdObjectState (guid));
+            focusElements (GS::ObjectState (
+                "elementId", CreateGuidObjectState (guid),
+                "elementType", GetElementTypeNonLocalizedName (typeId),
+                "floorIndex", static_cast<Int32> (header.floorInd),
+                "bounds", GS::ObjectState (
+                    "xMin", elementBounds.xMin, "yMin", elementBounds.yMin,
+                    "xMax", elementBounds.xMax, "yMax", elementBounds.yMax)));
+        }
+    }
+    // The page covers every returned reference, unresolved ones included.
+    const Int32 returned = matched + static_cast<Int32> (unresolvedGuids.GetSize ());
+    if (returned > pageSize)
+        return CreateNativePageRequiredResponse (
+            "The bounded plan read matched more elements than the requested page; no partial rows were returned.",
+            returned,
+            0);
+    for (const API_Guid& guid : unresolvedGuids)
+        elements (CreateElementIdObjectState (guid));
+    if (!unresolvedElements.IsEmpty ()) {
+        const auto& unresolved = response.AddList<GS::ObjectState> ("unresolvedElements");
+        for (const GS::ObjectState& row : unresolvedElements) unresolved (row);
+    }
+    response.Add ("elementCount", returned);
+    response.Add ("candidateCount", candidateCount);
+    return response;
+}
+
 ChangeSelectionOfElementsCommand::ChangeSelectionOfElementsCommand () :
     CommandBase (CommonSchema::Used)
 {

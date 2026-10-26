@@ -345,6 +345,10 @@ GSErrCode Initialize (void)
             elementCommands, "1.5.13",
             "Returns elements intersecting a bounded model-coordinate rectangle without enumerating the whole database. It requires no active individual selection, temporarily uses the native marquee mode, and restores the prior marquee or empty focus."
         );
+        err |= RegisterCommand<GetPlanElementsInBoundsCommand> (
+            elementCommands, "1.5.18",
+            "Returns the Floor Plan elements of the requested types whose header story equals storyIndex and whose native bounds intersect a model-coordinate rectangle. It enumerates by type, draws no marquee and ignores the selection, the marquee, the active story and the viewport; hidden-layer elements are included."
+        );
         err |= RegisterCommand<GetOrthogonalDraftingProjectionCommand> (
             elementCommands, "1.5.15",
             "Returns a disposable read-only projection of orthogonal Line and PolyLine drafting segments for sheet discovery. Curved, diagonal, and degenerate geometry is discarded without changing operator focus."
