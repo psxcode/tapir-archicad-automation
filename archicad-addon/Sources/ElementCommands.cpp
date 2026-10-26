@@ -1748,8 +1748,16 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                     PerfTrace::ScopeTimer timer (PerfTrace::Phase::TypeMemo);
                     AddPolygonFromMemoCoords (elem.header.guid, typeSpecificDetails, "coordinates", "arcs");
                 }
-                if (!draftingProfile)
+                if (!draftingProfile) {
                     typeSpecificDetails.Add ("zCoordinate", GetZPos (elem.header.floorInd, 0, stories));
+                    Int32 lineTypeIndex;
+                    {
+                        PerfTrace::ScopeTimer timer (PerfTrace::Phase::AttrLookup);
+                        lineTypeIndex = GetAttributeIndex (elem.polyLine.ltypeInd);
+                    }
+                    typeSpecificDetails.Add ("lineTypeIndex", lineTypeIndex);
+                }
+                typeSpecificDetails.Add ("linePen", static_cast<Int32> (elem.polyLine.linePen.penIndex));
                 typeSpecificDetails.Add ("arrowData", CreateArrowDataObjectState (elem.polyLine.arrowData));
             } break;
 
