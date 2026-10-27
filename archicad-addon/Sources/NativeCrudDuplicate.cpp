@@ -724,12 +724,27 @@ GS::ObjectState DuplicateElementsByOffsetCommand::Execute (const GS::ObjectState
 
     // Each copy sits in a new group exactly when its source does.  Archicad does not
     // recreate a group of one element, so such a group is counted apart.  The groups keep
-    // their partition: the copies of one source group share one new group, and a new group
-    // holds copies of one source group only (a split or merge is counted per copy).
+    // their partition at the direct and at the root level: the copies of one source group share
+    // one new group, and a new group holds copies of one source group only (a split or merge is
+    // counted per copy).  The documented API reaches no level in between: a split of a middle
+    // group of a hierarchy three or more deep is not seen.
     Int32 groupStateDiffers = 0;
     Int32 groupPartitionDiffers = 0;
     GS::HashTable<API_Guid, API_Guid> copyGroupOfSourceGroup;
     GS::HashTable<API_Guid, API_Guid> sourceGroupOfCopyGroup;
+    // A source group maps to one copy group and back; false on a split or merge.
+    const auto keepsPartition = [] (GS::HashTable<API_Guid, API_Guid>& forward, GS::HashTable<API_Guid, API_Guid>& backward,
+                                    const API_Guid& sourceGroup, const API_Guid& copyGroup) {
+        const API_Guid* knownCopyGroup = forward.GetPtr (sourceGroup);
+        const API_Guid* knownSourceGroup = backward.GetPtr (copyGroup);
+        const bool kept = (knownCopyGroup == nullptr || *knownCopyGroup == copyGroup)
+            && (knownSourceGroup == nullptr || *knownSourceGroup == sourceGroup);
+        if (knownCopyGroup == nullptr) forward.Add (sourceGroup, copyGroup);
+        if (knownSourceGroup == nullptr) backward.Add (copyGroup, sourceGroup);
+        return kept;
+    };
+    GS::HashTable<API_Guid, API_Guid> copyRootOfSourceRoot;
+    GS::HashTable<API_Guid, API_Guid> sourceRootOfCopyRoot;
     Int32 singleMemberGroupsDropped = 0;
     Int32 copyInSourceGroup = 0;
     Int32 groupsUnreadable = 0;
@@ -754,13 +769,18 @@ GS::ObjectState DuplicateElementsByOffsetCommand::Execute (const GS::ObjectState
         } else if (sourceGroup == APINULLGuid && copyGroup != APINULLGuid)
             ++groupStateDiffers;
         else if (sourceGroup != APINULLGuid && copyGroup != APINULLGuid) {
-            const API_Guid* knownCopyGroup = copyGroupOfSourceGroup.GetPtr (sourceGroup);
-            const API_Guid* knownSourceGroup = sourceGroupOfCopyGroup.GetPtr (copyGroup);
-            if ((knownCopyGroup != nullptr && *knownCopyGroup != copyGroup)
-                || (knownSourceGroup != nullptr && *knownSourceGroup != sourceGroup))
+            API_Guid sourceRoot = APINULLGuid;
+            API_Guid copyRoot = APINULLGuid;
+            if (ACAPI_Grouping_GetRootGroup (sources[index].guid, &sourceRoot) != NoError
+                || ACAPI_Grouping_GetRootGroup (neigs[index].guid, &copyRoot) != NoError) {
+                ++groupsUnreadable;
+                continue;
+            }
+            // Both levels are recorded for every copy, so a later copy is checked against both.
+            const bool directKept = keepsPartition (copyGroupOfSourceGroup, sourceGroupOfCopyGroup, sourceGroup, copyGroup);
+            const bool rootKept = keepsPartition (copyRootOfSourceRoot, sourceRootOfCopyRoot, sourceRoot, copyRoot);
+            if (!directKept || !rootKept)
                 ++groupPartitionDiffers;
-            if (knownCopyGroup == nullptr) copyGroupOfSourceGroup.Add (sourceGroup, copyGroup);
-            if (knownSourceGroup == nullptr) sourceGroupOfCopyGroup.Add (copyGroup, sourceGroup);
         }
     }
 
