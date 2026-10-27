@@ -86,6 +86,23 @@ public:
     virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
 };
 
+// Copies a bounded set of elements by one offset in one undoable Archicad Drag-copy.  The
+// set is refused whole when any member is missing, hotlinked, not editable, on another
+// story, an opening listed apart from its host, or part of an incomplete group.  Hidden and
+// locked layers of the set are lifted for the Drag and restored in the same undo step.  The
+// receipt names the created elements, the source-to-copy pairs and the re-link facts; a
+// lookup returns the receipt of an earlier dispatch without copying again.
+class DuplicateElementsByOffsetCommand : public CommandBase
+{
+public:
+    DuplicateElementsByOffsetCommand ();
+    virtual GS::String GetName () const override;
+    virtual GS::Optional<GS::UniString> GetInputParametersSchema () const override;
+    virtual GS::Optional<GS::UniString> GetResponseSchema () const override;
+    virtual GS::Optional<GS::UniString> GetRawResponseSchema () const override;
+    virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
+};
+
 // Developer-only automatic Zone refresh abstraction.  AC28's
 // ZoneBoundaryQuery::Modifier::Update is diagnostic/calculated-boundary
 // evidence, so the portable native implementation currently uses one

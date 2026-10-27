@@ -107,10 +107,6 @@ Int64 NextCachedReceiptSequence ()
     return SequenceCounter ().fetch_add (1) + 1;
 }
 
-} // namespace NativeCrudInternal
-
-namespace {
-
 std::string UtcTimestamp ()
 {
     const std::chrono::system_clock::time_point now = std::chrono::system_clock::now ();
@@ -125,6 +121,10 @@ std::string UtcTimestamp ()
     std::strftime (value, sizeof (value), "%Y-%m-%dT%H:%M:%SZ", &utc);
     return value;
 }
+
+} // namespace NativeCrudInternal
+
+namespace {
 
 bool ReceiptPrimaryGuidsMatch (
     const GS::ObjectState& receipt,

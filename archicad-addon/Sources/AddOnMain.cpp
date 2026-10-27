@@ -628,6 +628,10 @@ GSErrCode Initialize (void)
             elementCommands, "1.0.0",
             "Atomically replaces one simulated multiline Text cluster with one wrapped Text element."
         );
+        err |= RegisterCommand<DuplicateElementsByOffsetCommand> (
+            elementCommands, "1.0.0",
+            "Copies a bounded element set by one offset in one undoable Drag-copy and reports the created elements."
+        );
         err |= RegisterCommand<UpdateAutomaticZoneGeometryCommand> (
             elementCommands, "1.0.0",
             "Developer-only, one-zone automatic geometry refresh/recreate transaction; not exposed through Production MCP."

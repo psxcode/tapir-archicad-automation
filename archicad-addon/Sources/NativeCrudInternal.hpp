@@ -77,6 +77,7 @@ GS::ObjectState ExactSnapshots (
 GS::Optional<GS::ObjectState> FindCachedReceipt (const GS::UniString& operationId, const GS::UniString& expectedScope);
 void RememberCachedReceipt (const GS::ObjectState& receipt);
 Int64 NextCachedReceiptSequence ();
+std::string UtcTimestamp ();
 bool ReceiptRequestIdentityMatches (
     const GS::ObjectState& receipt,
     const GS::UniString& expectedScope,
