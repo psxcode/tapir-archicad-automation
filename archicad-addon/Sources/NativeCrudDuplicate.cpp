@@ -181,7 +181,8 @@ GSErrCode DirectGroupSize (const API_Guid& group, GSSize& size)
 }
 
 // The elements a copy refers to: the host of an opening, the parent of a label, the
-// elements a dimension measures.  A failed read is an error, never an empty list.
+// elements a linear, radial or angle dimension measures, the element a level dimension
+// sits on.  A failed read is an error, never an empty list.
 GSErrCode LinkedElements (const API_Guid& guid, const API_ElemTypeID typeID, GS::Array<API_Guid>& linked)
 {
     linked.Clear ();
@@ -209,6 +210,19 @@ GSErrCode LinkedElements (const API_Guid& guid, const API_ElemTypeID typeID, GS:
             for (GSSize index = 0; index < count; ++index)
                 linked.Push ((*memo.dimElems)[index].base.base.guid);
         }
+    } else if (typeID == API_RadialDimensionID || typeID == API_AngleDimensionID || typeID == API_LevelDimensionID) {
+        API_Element element = {};
+        element.header.guid = guid;
+        const GSErrCode error = ACAPI_Element_Get (&element);
+        if (error != NoError)
+            return error;
+        if (typeID == API_RadialDimensionID)
+            linked.Push (element.radialDimension.base.base.guid);
+        else if (typeID == API_LevelDimensionID)
+            linked.Push (element.levelDimension.parentGuid);
+        else
+            for (const API_DimBase& base : element.angleDimension.base)
+                linked.Push (base.base.guid);
     }
     return NoError;
 }
@@ -709,8 +723,13 @@ GS::ObjectState DuplicateElementsByOffsetCommand::Execute (const GS::ObjectState
     }
 
     // Each copy sits in a new group exactly when its source does.  Archicad does not
-    // recreate a group of one element, so such a group is counted apart.
+    // recreate a group of one element, so such a group is counted apart.  The groups keep
+    // their partition: the copies of one source group share one new group, and a new group
+    // holds copies of one source group only (a split or merge is counted per copy).
     Int32 groupStateDiffers = 0;
+    Int32 groupPartitionDiffers = 0;
+    GS::HashTable<API_Guid, API_Guid> copyGroupOfSourceGroup;
+    GS::HashTable<API_Guid, API_Guid> sourceGroupOfCopyGroup;
     Int32 singleMemberGroupsDropped = 0;
     Int32 copyInSourceGroup = 0;
     Int32 groupsUnreadable = 0;
@@ -734,6 +753,15 @@ GS::ObjectState DuplicateElementsByOffsetCommand::Execute (const GS::ObjectState
                 ++groupStateDiffers;
         } else if (sourceGroup == APINULLGuid && copyGroup != APINULLGuid)
             ++groupStateDiffers;
+        else if (sourceGroup != APINULLGuid && copyGroup != APINULLGuid) {
+            const API_Guid* knownCopyGroup = copyGroupOfSourceGroup.GetPtr (sourceGroup);
+            const API_Guid* knownSourceGroup = sourceGroupOfCopyGroup.GetPtr (copyGroup);
+            if ((knownCopyGroup != nullptr && *knownCopyGroup != copyGroup)
+                || (knownSourceGroup != nullptr && *knownSourceGroup != sourceGroup))
+                ++groupPartitionDiffers;
+            if (knownCopyGroup == nullptr) copyGroupOfSourceGroup.Add (sourceGroup, copyGroup);
+            if (knownSourceGroup == nullptr) sourceGroupOfCopyGroup.Add (copyGroup, sourceGroup);
+        }
     }
 
     const bool dispatchComplete = undoError == NoError && editError == NoError && layerError == NoError;
@@ -778,6 +806,7 @@ GS::ObjectState DuplicateElementsByOffsetCommand::Execute (const GS::ObjectState
     receipt.Add ("links", links);
     GS::ObjectState groups ("groupedSources", groupedSources, "stateDiffers", groupStateDiffers, "singleMemberGroupsDropped", singleMemberGroupsDropped);
     groups.Add ("copyInSourceGroup", copyInSourceGroup);
+    groups.Add ("partitionDiffers", groupPartitionDiffers);
     groups.Add ("unreadable", groupsUnreadable);
     receipt.Add ("groups", groups);
     receipt.Add ("sourceState", sourceState);
