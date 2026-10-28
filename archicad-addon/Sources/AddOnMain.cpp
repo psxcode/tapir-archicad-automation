@@ -18,6 +18,7 @@
 
 #include "ApplicationCommands.hpp"
 #include "ProjectCommands.hpp"
+#include "HistorySnapshotCommands.hpp"
 #include "ElementCommands.hpp"
 #include "ElementGDLParameterCommands.hpp"
 #include "ElementCreationCommands.hpp"
@@ -1214,6 +1215,14 @@ GSErrCode Initialize (void)
         err |= RegisterCommand<GenerateDocumentationCommand> (
             developerCommands, "1.0.7",
             "Generates files for the documentation. Used by Tapir developers only."
+        );
+        err |= RegisterCommand<SaveElementsAsModuleCommand> (
+            developerCommands, "0.1.0",
+            "Developer-only history snapshot probe (D-345): saves exact elements into a new module file; not exposed through Production MCP."
+        );
+        err |= RegisterCommand<PlaceModuleAsElementsCommand> (
+            developerCommands, "0.1.0",
+            "Developer-only history snapshot probe (D-345): places a module once and breaks the hotlink in one undo step; not exposed through Production MCP."
         );
         AddCommandGroup (developerCommands);
     }
