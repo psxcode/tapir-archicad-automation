@@ -1416,6 +1416,15 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                 typeSpecificDetails.Add ("fillPenOverridden", elem.hatch.fillPen.IsOverriden ());
                 typeSpecificDetails.Add ("hatchOrientationType", static_cast<Int32> (elem.hatch.hatchOrientation.type));
                 typeSpecificDetails.Add ("hatchOrientationFlags", static_cast<Int32> (elem.hatch.hatchOrientation.flags));
+                // EC-024: CalcBounds can retain distant fill handles. A contour-only spatial
+                // proof must first exclude a visible area note outside the polygon.
+                typeSpecificDetails.Add ("showArea", elem.hatch.showArea);
+                typeSpecificDetails.Add ("areaNotePosition", Create2DCoordinateObjectState (elem.hatch.note.pos));
+                typeSpecificDetails.Add ("hatchOrientationOrigin", Create2DCoordinateObjectState (elem.hatch.hatchOrientation.origo));
+                typeSpecificDetails.Add ("hatchOrientationMatrix00", elem.hatch.hatchOrientation.matrix00);
+                typeSpecificDetails.Add ("hatchOrientationMatrix01", elem.hatch.hatchOrientation.matrix01);
+                typeSpecificDetails.Add ("hatchOrientationMatrix10", elem.hatch.hatchOrientation.matrix10);
+                typeSpecificDetails.Add ("hatchOrientationMatrix11", elem.hatch.hatchOrientation.matrix11);
                 {
                     PerfTrace::ScopeTimer timer (PerfTrace::Phase::TypeMemo);
                     AddPolygonWithHolesFromMemoCoords (elem.header.guid, typeSpecificDetails, "polygonOutline", "polygonArcs", "holes", "polygonOutline", "polygonArcs");

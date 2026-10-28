@@ -7,6 +7,8 @@
 
 #include <chrono>
 #include <cmath>
+#include <map>
+#include <string>
 
 using namespace NativeCrudInternal;
 
@@ -75,6 +77,10 @@ GSErrCode CreatedOwner (const API_Guid& guid, const API_ElemTypeID typeID, API_G
             owner = element.object.owner;
         return error;
     }
+    // Drafting peers expanded by a group are never owned BIM sub-elements.
+    if (typeID == API_LineID || typeID == API_TextID || typeID == API_HatchID || typeID == API_PolyLineID
+        || typeID == API_ArcID || typeID == API_CircleID || typeID == API_SplineID || typeID == API_HotspotID)
+        return NoError;
     API_HierarchicalOwnerType ownerType = API_RootHierarchicalOwner;
     API_HierarchicalElemType elemType = API_UnknownElemType;
     API_Guid elemGuid = guid;
@@ -180,6 +186,46 @@ GSErrCode DirectGroupSize (const API_Guid& group, GSSize& size)
     return error;
 }
 
+std::string GroupKey (const API_Guid& guid)
+{
+    return std::string (APIGuidToString (guid).ToCStr ().Get ());
+}
+
+// D-336: targeted original-state proof, never an expansion of the copied set.
+struct GroupMemberState {
+    API_Guid guid = APINULLGuid;
+    API_Guid direct = APINULLGuid;
+    API_Guid root = APINULLGuid;
+    UInt64 stamp = 0;
+};
+using GroupStates = std::map<std::string, GroupMemberState>;
+using GroupRoots = std::map<std::string, API_Guid>;
+
+bool ReadGroupStates (const GroupRoots& roots, GroupStates& states)
+{
+    states.clear ();
+    for (const auto& entry : roots) {
+        GS::Array<API_Guid> members;
+        if (ACAPI_Grouping_GetAllGroupedElems (entry.second, &members) != NoError || members.IsEmpty ()
+            || members.GetSize () > MaxDuplicateSources)
+            return false;
+        for (const API_Guid& guid : members) {
+            API_Elem_Head header = {};
+            header.guid = guid;
+            GroupMemberState state;
+            state.guid = guid;
+            if (ACAPI_Element_GetHeader (&header) != NoError || GroupOf (guid, state.direct) != NoError
+                || ACAPI_Grouping_GetRootGroup (guid, &state.root) != NoError || state.root != entry.second)
+                return false;
+            state.stamp = header.modiStamp;
+            states[GroupKey (guid)] = state;
+            if (states.size () > MaxDuplicateSources)
+                return false;
+        }
+    }
+    return true;
+}
+
 // The elements a copy refers to: the host of an opening, the parent of a label, the
 // elements a linear, radial or angle dimension measures, the element a level dimension
 // sits on.  A failed read is an error, never an empty list.
@@ -247,6 +293,7 @@ struct DuplicateSource {
     short floorIndex = 0;
     UInt64 modiStamp = 0;
     API_Guid rootGroup = APINULLGuid;
+    API_Guid directGroup = APINULLGuid;
 };
 
 // An opening Archicad copies with a listed host.
@@ -263,7 +310,7 @@ DuplicateElementsByOffsetCommand::DuplicateElementsByOffsetCommand () : CommandB
 GS::String DuplicateElementsByOffsetCommand::GetName () const { return "DuplicateElementsByOffset"; }
 GS::Optional<GS::UniString> DuplicateElementsByOffsetCommand::GetInputParametersSchema () const
 {
-    return R"({"type":"object","properties":{"contractVersion":{"type":"string"},"operationId":{"type":"string"},"expectedFileScopeKey":{"type":"string"},"requestHash":{"type":"string"},"operation":{"type":"string","enum":["duplicate_by_offset"]},"mode":{"type":"string","enum":["dispatch","dryRun","lookup"]},"description":{"type":"string"},"origin":{"type":"string","enum":["NATIVE","SEMANTIC"]},"operatorNote":{"type":"string","maxLength":1000},"expectedSourceState":{"type":"string"},"semanticMetadata":{"type":"object"},"offset":{"type":"object","properties":{"x":{"type":"number"},"y":{"type":"number"}},"required":["x","y"],"additionalProperties":false},"elements":{"type":"array","minItems":1,"maxItems":20000,"items":{"type":"object","properties":{"elementId":{"type":"object","properties":{"guid":{"type":"string"}},"required":["guid"]}},"required":["elementId"],"additionalProperties":false}}},"additionalProperties":false,"required":["contractVersion","operationId","expectedFileScopeKey","requestHash","operation","mode","description","offset","elements"]})";
+    return R"({"type":"object","properties":{"contractVersion":{"type":"string"},"operationId":{"type":"string"},"expectedFileScopeKey":{"type":"string"},"requestHash":{"type":"string"},"operation":{"type":"string","enum":["duplicate_by_offset"]},"mode":{"type":"string","enum":["dispatch","dryRun","lookup"]},"description":{"type":"string"},"origin":{"type":"string","enum":["NATIVE","SEMANTIC"]},"operatorNote":{"type":"string","maxLength":1000},"groupPolicy":{"type":"string","enum":["require_complete","selected_members"]},"expectedSourceState":{"type":"string"},"semanticMetadata":{"type":"object"},"offset":{"type":"object","properties":{"x":{"type":"number"},"y":{"type":"number"}},"required":["x","y"],"additionalProperties":false},"elements":{"type":"array","minItems":1,"maxItems":20000,"items":{"type":"object","properties":{"elementId":{"type":"object","properties":{"guid":{"type":"string"}},"required":["guid"]}},"required":["elementId"],"additionalProperties":false}}},"additionalProperties":false,"required":["contractVersion","operationId","expectedFileScopeKey","requestHash","operation","mode","description","offset","elements"]})";
 }
 GS::Optional<GS::UniString> DuplicateElementsByOffsetCommand::GetResponseSchema () const { return {}; }
 GS::Optional<GS::UniString> DuplicateElementsByOffsetCommand::GetRawResponseSchema () const { return {}; }
@@ -295,6 +342,11 @@ GS::ObjectState DuplicateElementsByOffsetCommand::Execute (const GS::ObjectState
         return DuplicateError ("DuplicateElementsByOffset identity is invalid.");
     parameters.Get ("origin", origin);
     parameters.Get ("operatorNote", operatorNote);
+    GS::UniString groupPolicy = "require_complete";
+    parameters.Get ("groupPolicy", groupPolicy);
+    if (groupPolicy != "require_complete" && groupPolicy != "selected_members")
+        return DuplicateError ("Unknown duplicate groupPolicy.");
+    const bool selectedMembers = groupPolicy == "selected_members";
     if (operationId.GetLength () > 200 || description.GetLength () > 500 || operatorNote.GetLength () > 1000)
         return DuplicateError ("DuplicateElementsByOffset identity exceeds the native length limit.");
 
@@ -334,7 +386,7 @@ GS::ObjectState DuplicateElementsByOffsetCommand::Execute (const GS::ObjectState
     }
 
     // Read every source fresh.  A copy is dispatched only when the whole set is copyable as
-    // one piece: one story, editable, not hotlinked, groups complete and openings carried by
+    // one piece: one story, editable, not hotlinked, groups checked under the explicit policy and openings carried by
     // their host instead of listed on their own.
     GS::Array<DuplicateSource> sources;
     GS::HashSet<API_Guid> requested;
@@ -342,6 +394,9 @@ GS::ObjectState DuplicateElementsByOffsetCommand::Execute (const GS::ObjectState
     GSSize refusalCount = 0;
     Int32 liftedLayerSources = 0;
     Int32 groupedSources = 0;
+    GroupRoots partialRoots;
+    GroupStates originalGroupStates;
+    std::map<std::string, GSSize> selectedDirectCounts;
     GS::Array<LiftedLayer> liftedLayers;
     GS::Array<API_Guid> liftedSources;
     // A refusal names the source and the reason; the TypeScript side turns the codes into
@@ -403,6 +458,8 @@ GS::ObjectState DuplicateElementsByOffsetCommand::Execute (const GS::ObjectState
         if (group == APINULLGuid)
             continue;
         ++groupedSources;
+        source.directGroup = group;
+        ++selectedDirectCounts[GroupKey (group)];
         API_Guid rootGroup = APINULLGuid;
         GS::Array<API_Guid> members;
         if (ACAPI_Grouping_GetRootGroup (source.guid, &rootGroup) != NoError || rootGroup == APINULLGuid
@@ -414,6 +471,10 @@ GS::ObjectState DuplicateElementsByOffsetCommand::Execute (const GS::ObjectState
         for (const API_Guid& member : members) {
             if (requested.Contains (member))
                 continue;
+            if (selectedMembers) {
+                partialRoots[GroupKey (rootGroup)] = rootGroup;
+                break;
+            }
             API_Elem_Head outside = {};
             outside.guid = member;
             const bool readable = ACAPI_Element_GetHeader (&outside) == NoError;
@@ -427,6 +488,9 @@ GS::ObjectState DuplicateElementsByOffsetCommand::Execute (const GS::ObjectState
             break;
         }
     }
+
+    if (selectedMembers && !ReadGroupStates (partialRoots, originalGroupStates))
+        refuse (sources[0].guid, sources[0].typeID, "PARTIAL_GROUP_STATE_UNREADABLE");
 
     // The openings Archicad will copy with their hosts, and the state the copy is planned on:
     // each source's modification stamp and root group, each carried opening's stamp and host.
@@ -455,10 +519,20 @@ GS::ObjectState DuplicateElementsByOffsetCommand::Execute (const GS::ObjectState
         }
     }
     StateDigest digest;
+    if (selectedMembers) {
+        // Stable GUID order includes the external members without copying or interpreting them.
+        for (const auto& entry : originalGroupStates) {
+            digest.Add (entry.second.guid);
+            digest.Add (entry.second.stamp);
+            digest.Add (entry.second.direct);
+            digest.Add (entry.second.root);
+        }
+    }
     for (const DuplicateSource& source : sources) {
         digest.Add (source.guid);
         digest.Add (source.modiStamp);
         digest.Add (source.rootGroup);
+        if (selectedMembers) digest.Add (source.directGroup);
     }
     for (const CarriedOpening& opening : carried) {
         digest.Add (opening.guid);
@@ -506,17 +580,18 @@ GS::ObjectState DuplicateElementsByOffsetCommand::Execute (const GS::ObjectState
     GS::Array<API_Neig> neigs;
     for (const DuplicateSource& source : sources)
         neigs.Push (API_Neig (source.guid));
-    // A whole group is copied as a group: Suspend Groups is off for the Drag and comes back
-    // as the operator had it.
-    bool groupModeNeedsRestore = groupedSources > 0 && groupsSuspended;
+    // Partial groups use Suspend Groups to prevent expansion beyond the selected set.
+    // Archicad preserves their subset partition. Restore the operator's original mode.
+    const bool desiredSuspend = selectedMembers && !partialRoots.empty ();
+    bool groupModeNeedsRestore = groupedSources > 0 && groupsSuspended != desiredSuspend;
     if (groupModeNeedsRestore) {
-        const GSErrCode error = TAPIR_Grouping_ChangeSuspendGroup (false);
+        const GSErrCode error = TAPIR_Grouping_ChangeSuspendGroup (desiredSuspend);
         if (error != NoError)
             return CreateErrorResponse (error, "Failed to turn Suspend Groups off for the copy.");
     }
-    const GS::OnExit groupModeGuard ([&groupModeNeedsRestore] () {
+    const GS::OnExit groupModeGuard ([&groupModeNeedsRestore, groupsSuspended] () {
         if (groupModeNeedsRestore)
-            TAPIR_Grouping_ChangeSuspendGroup (true);
+            TAPIR_Grouping_ChangeSuspendGroup (groupsSuspended);
     });
     GSErrCode editError = NoError;
     GSErrCode layerError = NoError;
@@ -551,7 +626,7 @@ GS::ObjectState DuplicateElementsByOffsetCommand::Execute (const GS::ObjectState
     const double elapsedMs = std::chrono::duration<double, std::milli> (std::chrono::steady_clock::now () - started).count ();
     GSErrCode groupModeRestoreError = NoError;
     if (groupModeNeedsRestore) {
-        groupModeRestoreError = TAPIR_Grouping_ChangeSuspendGroup (true);
+        groupModeRestoreError = TAPIR_Grouping_ChangeSuspendGroup (groupsSuspended);
         if (groupModeRestoreError == NoError)
             groupModeNeedsRestore = false;
     }
@@ -716,7 +791,7 @@ GS::ObjectState DuplicateElementsByOffsetCommand::Execute (const GS::ObjectState
         header.guid = guid;
         API_Guid owner = APINULLGuid;
         if (ACAPI_Element_GetHeader (&header) == NoError && CreatedOwner (guid, GetElemTypeId (header), owner) == NoError
-            && owner != APINULLGuid && createdGuids.Contains (owner))
+            && owner != APINULLGuid && owner != guid && createdGuids.Contains (owner))
             ++ownedByCopies;
         else
             ++unexpectedCreated;
@@ -748,6 +823,22 @@ GS::ObjectState DuplicateElementsByOffsetCommand::Execute (const GS::ObjectState
     Int32 singleMemberGroupsDropped = 0;
     Int32 copyInSourceGroup = 0;
     Int32 groupsUnreadable = 0;
+    Int32 originalStateDiffers = 0;
+    if (selectedMembers) {
+        GroupStates afterStates;
+        if (!ReadGroupStates (partialRoots, afterStates))
+            ++groupsUnreadable;
+        else {
+            for (const auto& entry : originalGroupStates) {
+                const auto found = afterStates.find (entry.first);
+                if (found == afterStates.end () || entry.second.stamp != found->second.stamp
+                    || entry.second.direct != found->second.direct || entry.second.root != found->second.root)
+                    ++originalStateDiffers;
+            }
+            for (const auto& entry : afterStates)
+                if (originalGroupStates.find (entry.first) == originalGroupStates.end ()) ++originalStateDiffers;
+        }
+    }
     for (UIndex index = 0; index < neigs.GetSize (); ++index) {
         if (neigs[index].guid == APINULLGuid || !createdGuids.Contains (neigs[index].guid)) continue;
         API_Guid sourceGroup = APINULLGuid;
@@ -762,7 +853,7 @@ GS::ObjectState DuplicateElementsByOffsetCommand::Execute (const GS::ObjectState
         else if (sourceGroup != APINULLGuid && copyGroup == APINULLGuid) {
             if (DirectGroupSize (sourceGroup, sourceGroupSize) != NoError)
                 ++groupsUnreadable;
-            else if (sourceGroupSize == 1)
+            else if (selectedMembers ? selectedDirectCounts[GroupKey (sourceGroup)] == 1 : sourceGroupSize == 1)
                 ++singleMemberGroupsDropped;
             else
                 ++groupStateDiffers;
@@ -828,6 +919,10 @@ GS::ObjectState DuplicateElementsByOffsetCommand::Execute (const GS::ObjectState
     groups.Add ("copyInSourceGroup", copyInSourceGroup);
     groups.Add ("partitionDiffers", groupPartitionDiffers);
     groups.Add ("unreadable", groupsUnreadable);
+    groups.Add ("policy", groupPolicy);
+    groups.Add ("partialRoots", static_cast<Int32> (partialRoots.size ()));
+    groups.Add ("originalMembersChecked", static_cast<Int32> (originalGroupStates.size ()));
+    groups.Add ("originalStateDiffers", originalStateDiffers);
     receipt.Add ("groups", groups);
     receipt.Add ("sourceState", sourceState);
     receipt.Add ("carriedCount", static_cast<Int32> (carried.GetSize ()));
