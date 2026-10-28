@@ -538,8 +538,16 @@ GS::Optional<GS::UniString> ValidateMutationItems (
     GS::Array<API_Guid> seenGuids;
     for (const GS::ObjectState& item : items) {
         if (operation == "create") {
-            if (!HasOnlyObjectStateFields (item, { "payload", "placement", "cloneSourceElementId", "historySnapshotRef" }))
-                return GS::UniString ("CREATE items accept only payload, placement and one source reference.");
+            if (!HasOnlyObjectStateFields (item, { "payload", "placement", "cloneSourceElementId", "historySnapshotRef", "absentElementId" }))
+                return GS::UniString ("CREATE items accept only payload, placement, one source reference and absentElementId.");
+            // D-347 stage 2b: a recreation names the deleted element it replaces; the command refuses
+            // when that element exists, so an Undo between plan and write cannot yield a duplicate.
+            if (item.Get ("absentElementId") != nullptr) {
+                if (items.GetSize () != 1)
+                    return GS::UniString ("absentElementId is accepted only in a CREATE with exactly one item.");
+                if (GetGuidFromObjectState (*item.Get ("absentElementId")) == APINULLGuid)
+                    return GS::UniString ("absentElementId must contain a valid GUID.");
+            }
             if (item.Get ("elementId") != nullptr || item.Get ("payload") == nullptr)
                 return GS::UniString ("CREATE items require payload and must not contain elementId.");
             const GS::ObjectState* payload = item.Get ("payload");
@@ -568,8 +576,13 @@ GS::Optional<GS::UniString> ValidateMutationItems (
         } else {
             if (operation == "update" && !HasOnlyObjectStateFields (item, { "elementId", "expectedFingerprint", "patch" }))
                 return GS::UniString ("UPDATE items accept only elementId, expectedFingerprint and patch.");
-            if (operation == "delete" && !HasOnlyObjectStateFields (item, { "elementId", "expectedFingerprint" }))
-                return GS::UniString ("DELETE items accept only elementId and expectedFingerprint.");
+            if (operation == "delete" && !HasOnlyObjectStateFields (item, { "elementId", "expectedFingerprint", "expectedLayerIndex" }))
+                return GS::UniString ("DELETE items accept only elementId, expectedFingerprint and expectedLayerIndex.");
+            if (operation == "delete" && item.Contains ("expectedLayerIndex")) {
+                Int32 expectedLayerIndex = 0;
+                if (!item.Get ("expectedLayerIndex", expectedLayerIndex))
+                    return GS::UniString ("expectedLayerIndex must be an integer layer attribute index.");
+            }
             const GS::ObjectState* id = item.Get ("elementId");
             if (id == nullptr || GetGuidFromObjectState (*id) == APINULLGuid)
                 return GS::UniString ("UPDATE/DELETE items require a valid elementId.");

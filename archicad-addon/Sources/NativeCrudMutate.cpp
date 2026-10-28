@@ -520,6 +520,22 @@ GS::ObjectState MutateNativeElementsCommand::Execute (const GS::ObjectState& par
         replay.Add ("duplicateOperation", true);
         return replay;
     }
+    // D-347 stage 2b: a recreation is refused while the element it replaces exists (an Undo of the
+    // deletion between the revert plan and this command must not leave a duplicate).
+    if (operation == "create") {
+        for (const GS::ObjectState& item : items) {
+            const GS::ObjectState* absentId = item.Get ("absentElementId");
+            if (absentId == nullptr) continue;
+            // Only BADID proves absence; any other header error leaves it unproven.
+            API_Elem_Head absentHeader = {};
+            absentHeader.guid = GetGuidFromObjectState (*absentId);
+            const GSErrCode absentError = ACAPI_Element_GetHeader (&absentHeader);
+            if (absentError == NoError)
+                return CreateErrorResponse (APIERR_BADID, "RECREATE_ORIGINAL_PRESENT: the element this CREATE recreates exists; nothing was created.");
+            if (absentError != APIERR_BADID)
+                return CreateErrorResponse (APIERR_BADID, "RECREATE_ABSENCE_UNPROVEN: the element this CREATE recreates could not be proven absent; nothing was created.");
+        }
+    }
     bool beforeComplete = operation == "create";
     GS::ObjectState before = operation == "create"
         ? GS::ObjectState ("elements", GS::ObjectState ())
@@ -550,6 +566,14 @@ GS::ObjectState MutateNativeElementsCommand::Execute (const GS::ObjectState& par
             GS::UniString actualFingerprint;
             if (matching == nullptr || !matching->Get ("fingerprint", actualFingerprint) || actualFingerprint != expectedFingerprint)
                 return CreateErrorResponse (APIERR_BADID, "STALE_NATIVE_SNAPSHOT: expectedFingerprint does not match the current native element.");
+            // The layer is outside the fingerprint; a DELETE that names it is refused when it moved (D-347 stage 2b).
+            if (item.Contains ("expectedLayerIndex")) {
+                Int32 expectedLayerIndex = 0;
+                Int32 actualLayerIndex = 0;
+                item.Get ("expectedLayerIndex", expectedLayerIndex);
+                if (!matching->Get ("layerIndex", actualLayerIndex) || actualLayerIndex != expectedLayerIndex)
+                    return CreateErrorResponse (APIERR_BADID, "STALE_NATIVE_SNAPSHOT: expectedLayerIndex does not match the current native element.");
+            }
         }
         const GS::Optional<GS::UniString> impactTypeError = ValidateNativeImpactSnapshotTypes (
             beforeRows,
