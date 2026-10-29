@@ -19,6 +19,7 @@
 #include "ApplicationCommands.hpp"
 #include "ProjectCommands.hpp"
 #include "HistorySnapshotCommands.hpp"
+#include "HistorySaveAsProbe.hpp"
 #include "ElementCommands.hpp"
 #include "ElementGDLParameterCommands.hpp"
 #include "ElementCreationCommands.hpp"
@@ -1224,6 +1225,12 @@ GSErrCode Initialize (void)
             developerCommands, "0.1.0",
             "Developer-only history snapshot probe (D-345): places a module once and breaks the hotlink in one undo step; not exposed through Production MCP."
         );
+#if defined(TAPIR_HISTORY_SAVE_AS_PROBE)
+        err |= RegisterCommand<ProbeSaveProjectAsCommand> (
+            developerCommands, "0.1.0",
+            "Developer-only Save As probe (D-351), isolated probe APX only: saves the open project under a new .pln path."
+        );
+#endif
         AddCommandGroup (developerCommands);
     }
 

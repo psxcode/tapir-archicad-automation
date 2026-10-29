@@ -12,6 +12,11 @@ option (TAPIR_ENABLE_NATIVE_CRUD_TEST_FAULT
     OFF
 )
 
+option (TAPIR_ENABLE_HISTORY_SAVE_AS_PROBE
+    "Compile the developer-only Save As probe command (D-351) into its isolated probe APX."
+    OFF
+)
+
 option (TAPIR_ENABLE_NATIVE_DIMENSION_CREATE_CANDIDATE
     "Compile the closed, private Dimension CREATE candidate producer into its isolated test APX."
     OFF
@@ -57,6 +62,8 @@ elseif (TAPIR_ENABLE_NATIVE_CRUD_TEST_FAULT)
     # This target name is intentionally distinct from the runtime APX.  The
     # disposable fault profile must never look deployable by filename alone.
     set (AddOnName "${AddOnName}_NativeCrudTestFault")
+elseif (TAPIR_ENABLE_HISTORY_SAVE_AS_PROBE)
+    set (AddOnName "${AddOnName}_HistorySaveAsProbe")
 endif ()
 
 project (${AddOnName})
@@ -85,6 +92,9 @@ if (TAPIR_ENABLE_NATIVE_DIMENSION_CREATE_POST_CREATE_FAULT)
     target_compile_definitions (AddOn PRIVATE TAPIR_ENABLE_NATIVE_DIMENSION_CREATE_POST_CREATE_FAULT=1)
 else ()
     target_compile_definitions (AddOn PRIVATE TAPIR_ENABLE_NATIVE_DIMENSION_CREATE_POST_CREATE_FAULT=0)
+endif ()
+if (TAPIR_ENABLE_HISTORY_SAVE_AS_PROBE)
+    target_compile_definitions (AddOn PRIVATE TAPIR_HISTORY_SAVE_AS_PROBE)
 endif ()
 if (TAPIR_ENABLE_NATIVE_CRUD_TEST_FAULT)
     # The ordinary profile deliberately does not define this macro.  The
