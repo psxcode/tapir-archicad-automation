@@ -8,6 +8,8 @@
 #include "ExtendedElementCommands.hpp"
 #include "MigrationHelper.hpp"
 #include "NativeOwnership.hpp"
+#include "NativeUndoable.hpp"
+#include "NotificationCommands.hpp"
 #include "NativeRichTextMemo.hpp"
 #include "ObjectStateJSONConversion.hpp"
 #include "NativeDimensionCreateWire.hpp"
@@ -16,6 +18,45 @@
 using namespace NativeCrudInternal;
 
 namespace {
+
+// The factual result of one typed Native mutation before its receipt is
+// published.  MutateNativeElements publishes it at once; a Native transaction
+// (D-357) publishes every operation only after the one undo step committed,
+// so a rolled-back operation never reaches the process-local receipt cache.
+struct NativeMutationPending {
+    bool ready = false;
+    GS::ObjectState before;
+    GS::ObjectState receipt;
+    GS::ObjectState mutationResult;
+    GS::ObjectState readback;
+    GS::ObjectState deleteReadback;
+    bool isDelete = false;
+};
+
+GS::ObjectState BuildNativeMutationResponse (const NativeMutationPending& outcome)
+{
+    GS::ObjectState response;
+    bool groupModeRestored = false;
+    if (outcome.mutationResult.Get ("groupModeRestored", groupModeRestored))
+        response.Add ("groupModeRestored", groupModeRestored);
+    Int32 groupModeRestoreError = 0;
+    if (outcome.mutationResult.Get ("groupModeRestoreError", groupModeRestoreError))
+        response.Add ("groupModeRestoreError", groupModeRestoreError);
+    // BuildReceipt deliberately has no durable side effect.  Give the APX
+    // response a process-local sequence for diagnostics and remember the
+    // factual receipt before returning it so MCP can reconcile a lost HTTP
+    // response without dispatching the Archicad command a second time.
+    GS::ObjectState receipt = outcome.receipt;
+    receipt.Add ("nativeSequence", NextCachedReceiptSequence ());
+    RememberCachedReceipt (receipt);
+    response.Add ("contractVersion", ContractVersion);
+    response.Add ("status", "success");
+    response.Add ("receipt", receipt);
+    response.Add ("mutationResult", outcome.mutationResult);
+    response.Add ("readback", outcome.readback);
+    if (outcome.isDelete) response.Add ("deleteReadback", outcome.deleteReadback);
+    return response;
+}
 
 GS::ObjectState ExecuteZoneMemoUpdate (
     const GS::Array<GS::ObjectState>& items,
@@ -38,6 +79,8 @@ GS::ObjectState ExecuteZoneMemoUpdate (
 
     GS::ObjectState setParameters;
     setParameters.Add ("nativeCrudZoneWriter", true);
+    // D-357: Native CRUD writes are all-or-nothing.
+    setParameters.Add ("nativeCrudAtomic", true);
     const auto& elementsWithDetails = setParameters.AddList<GS::ObjectState> ("elementsWithDetails");
     GS::ObjectState details;
     GS::ObjectState typeSpecificDetails = *mappedPayload;
@@ -136,15 +179,15 @@ GS::ObjectState DispatchMutation (
     if (typeID == API_HatchID && HasNativeCrudTestFaultMetadata (semanticMetadata))
         return CreateErrorResponse (APIERR_BADPARS, "Hatch test-fault metadata is unavailable to Native CRUD writes (D-307).");
     if (typeID == API_DoorID && (operation == "create" || operation == "update")) {
-        // Ordinary builds admit only the same markerless typed writer. Fault
-        // metadata was rejected above; the ordinary request must still use
-        // the narrow Door payload contract and exact source.
+        // Fault metadata was rejected above; the ordinary request must still
+        // use the narrow Door payload contract and an exact source template
+        // (marker-bearing templates are admitted under D-357).
         const GS::Optional<GS::UniString> writerError = ValidateDoorTypedPayloads (operation, items);
         if (writerError.HasValue ()) return CreateErrorResponse (APIERR_BADPARS, writerError.Get ());
         if (operation == "create") {
             for (const GS::ObjectState& item : items) {
                 const GS::ObjectState* source = item.Get ("cloneSourceElementId");
-                if (source == nullptr) return CreateErrorResponse (APIERR_BADPARS, "Door CREATE requires an exact markerless source template.");
+                if (source == nullptr) return CreateErrorResponse (APIERR_BADPARS, "Door CREATE requires an exact source template (cloneSourceElementId).");
                 const GS::Optional<GS::UniString> cloneError = ValidateDoorCloneSource (GetGuidFromObjectState (*source));
                 if (cloneError.HasValue ()) return CreateErrorResponse (APIERR_BADPARS, cloneError.Get ());
             }
@@ -156,42 +199,15 @@ GS::ObjectState DispatchMutation (
         if (operation == "create") {
             for (const GS::ObjectState& item : items) {
                 const GS::ObjectState* source = item.Get ("cloneSourceElementId");
-                if (source == nullptr) return CreateErrorResponse (APIERR_BADPARS, "Window CREATE requires an exact markerless source template.");
+                if (source == nullptr) return CreateErrorResponse (APIERR_BADPARS, "Window CREATE requires an exact source template (cloneSourceElementId).");
                 const GS::Optional<GS::UniString> cloneError = ValidateWindowCloneSource (GetGuidFromObjectState (*source));
                 if (cloneError.HasValue ()) return CreateErrorResponse (APIERR_BADPARS, cloneError.Get ());
             }
         }
     }
-    if (operation == "delete" && typeID == API_DoorID) {
-        // Door DELETE is markerless-only even for direct APX callers. Read
-        // every requested target immediately before entering the generic
-        // delete writer so the TypeScript preflight is not the only guard.
-        for (const GS::ObjectState& item : items) {
-            const GS::ObjectState* id = item.Get ("elementId");
-            const API_Guid requestedGuid = id == nullptr ? APINULLGuid : GetGuidFromObjectState (*id);
-            if (requestedGuid == APINULLGuid)
-                return CreateErrorResponse (APIERR_BADPARS, "Door DELETE requires an exact elementId GUID.");
-            API_Element target = {};
-            target.header.guid = requestedGuid;
-            if (ACAPI_Element_Get (&target) != NoError
-                || target.header.guid != requestedGuid
-                || GetElemTypeId (target.header) != API_DoorID
-                || target.door.openingBase.markGuid != APINULLGuid)
-                return CreateErrorResponse (APIERR_BADID, "Door DELETE requires a freshly resolved exact markerless target.");
-        }
-    }
-    if (operation == "delete" && typeID == API_WindowID) {
-        for (const GS::ObjectState& item : items) {
-            const GS::ObjectState* id = item.Get ("elementId");
-            const API_Guid requestedGuid = id == nullptr ? APINULLGuid : GetGuidFromObjectState (*id);
-            if (requestedGuid == APINULLGuid) return CreateErrorResponse (APIERR_BADPARS, "Window DELETE requires an exact elementId GUID.");
-            API_Element target = {};
-            target.header.guid = requestedGuid;
-            if (ACAPI_Element_Get (&target) != NoError || target.header.guid != requestedGuid
-                || GetElemTypeId (target.header) != API_WindowID || target.window.openingBase.markGuid != APINULLGuid)
-                return CreateErrorResponse (APIERR_BADID, "Window DELETE requires a freshly resolved exact markerless target.");
-        }
-    }
+    // D-357: Door/Window DELETE no longer requires a markerless target; the
+    // fresh snapshot and fingerprint checks in the Execute path still bind
+    // every requested GUID to its exact type and state.
     if (operation == "delete") {
         // ACAPI_Element_Delete expands an exact target to its complete group
         // when Suspend Groups is off. Native DELETE promises the requested
@@ -241,14 +257,13 @@ GS::ObjectState DispatchMutation (
         return mutationResult;
     }
     // Reuse existing undoable typed routes for verified types and the
-    // markerless Door writer.
-    // guard before this same typed Door path.
+    // Door/Window template writers.
     if (typeID == API_WallID || typeID == API_ColumnID || typeID == API_TextID || typeID == API_DoorID || typeID == API_WindowID ||
         typeID == API_LineID || typeID == API_ArcID || typeID == API_HatchID) {
         GS::ObjectState nativeParameters = BuildNativeMutationParameters (operation, typeName, items);
         nativeParameters.Add ("elementType", typeName);
-        if (operation == "update")
-            nativeParameters.Add ("nativeCrudAtomic", true);
+        // D-357: every Native CRUD batch is all-or-nothing.
+        nativeParameters.Add ("nativeCrudAtomic", true);
         if (typeID == API_HatchID && (operation == "create" || operation == "update"))
             nativeParameters.Add ("nativeCrudHatchWriter", true);
         if (typeID == API_DoorID && (operation == "create" || operation == "update"))
@@ -351,11 +366,20 @@ MutateNativeElementsCommand::MutateNativeElementsCommand () : CommandBase (Commo
 GS::String MutateNativeElementsCommand::GetName () const { return "MutateNativeElements"; }
 GS::Optional<GS::UniString> MutateNativeElementsCommand::GetInputParametersSchema () const
 {
-    return R"({"type":"object","properties":{"contractVersion":{"type":"string"},"operationId":{"type":"string"},"expectedFileScopeKey":{"type":"string"},"requestHash":{"type":"string"},"operation":{"type":"string","enum":["create","update","delete"]},"elementType":{"type":"string"},"items":{"type":"array","minItems":1,"maxItems":25,"items":{"type":"object"}},"origin":{"type":"string","enum":["NATIVE","SEMANTIC"]},"description":{"type":"string"},"operatorNote":{"type":"string","maxLength":1000},"semanticMetadata":{"type":"object"}},"additionalProperties":false,"required":["contractVersion","operationId","expectedFileScopeKey","requestHash","operation","elementType","items","description"]})";
+    return R"({"type":"object","properties":{"contractVersion":{"type":"string"},"operationId":{"type":"string"},"expectedFileScopeKey":{"type":"string"},"requestHash":{"type":"string"},"operation":{"type":"string","enum":["create","update","delete"]},"elementType":{"type":"string"},"items":{"type":"array","minItems":1,"maxItems":500,"items":{"type":"object"}},"origin":{"type":"string","enum":["NATIVE","SEMANTIC"]},"description":{"type":"string"},"operatorNote":{"type":"string","maxLength":1000},"semanticMetadata":{"type":"object"}},"additionalProperties":false,"required":["contractVersion","operationId","expectedFileScopeKey","requestHash","operation","elementType","items","description"]})";
 }
 GS::Optional<GS::UniString> MutateNativeElementsCommand::GetResponseSchema () const { return {}; }
 GS::Optional<GS::UniString> MutateNativeElementsCommand::GetRawResponseSchema () const { return {}; }
-GS::ObjectState MutateNativeElementsCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const
+namespace {
+
+// One typed Native mutation (the former MutateNativeElements body).  With
+// `pending == nullptr` the receipt is published and the full response is
+// returned.  Inside a Native transaction `pending` receives the unpublished
+// factual result and the call returns `{ status: "pending" }` or an error.
+GS::ObjectState ExecuteNativeMutationRequest (
+    const GS::ObjectState& parameters,
+    GS::ProcessControl& processControl,
+    NativeMutationPending* pending)
 {
     // D-307: the candidate writer vocabulary is retired. Forged candidate
     // metadata fails closed before any read, write or Dimension routing.
@@ -373,6 +397,10 @@ GS::ObjectState MutateNativeElementsCommand::Execute (const GS::ObjectState& par
     if (scopeError.HasValue ()) return ScopeError (scopeError);
     GS::UniString requestedType;
     if (parameters.Get ("elementType", requestedType) && requestedType == "Dimension") {
+        // The Dimension candidate publishes its own receipt inside its own
+        // command; it cannot be bound into one deferred transaction receipt.
+        if (pending != nullptr)
+            return CreateErrorResponse (APIERR_BADPARS, "NATIVE_TRANSACTION_UNSUPPORTED: Dimension writes cannot join a Native transaction; nothing was written.");
 #if TAPIR_ENABLE_NATIVE_DIMENSION_CREATE_CANDIDATE
         return ExecuteNativeDimensionCreateCandidate (parameters, processControl);
 #else
@@ -502,6 +530,10 @@ GS::ObjectState MutateNativeElementsCommand::Execute (const GS::ObjectState& par
     // request identity; an operation-id collision is never silently replayed.
     const GS::Optional<GS::ObjectState> cachedReceipt = FindCachedReceipt (operationId, scope);
     if (cachedReceipt.HasValue ()) {
+        // A transaction never replays: a known operationId refuses the whole
+        // transaction before (or, defensively, inside) its undo step.
+        if (pending != nullptr)
+            return NativeContractError ("DUPLICATE_OPERATION_CONFLICT", "operationId already has a native receipt; a Native transaction never replays an operation.");
         // The APX has no canonical request/patch hash implementation.  A
         // syntactically valid requestHash/patchHash is therefore not enough
         // to replay a Wall/Zone receipt: the MCP coordinator must reconcile
@@ -543,6 +575,7 @@ GS::ObjectState MutateNativeElementsCommand::Execute (const GS::ObjectState& par
         ? GS::ObjectState ("elements", GS::ObjectState ())
         : ExactSnapshots (impactIds, scope, processControl, beforeComplete);
     if (!beforeComplete && operation != "create") return CreateErrorResponse (APIERR_BADID, "SNAPSHOT_COVERAGE_INCOMPLETE: native before-state is incomplete; no mutation was dispatched.");
+    if (pending != nullptr) pending->before = before;
 
     if (operation == "update" || operation == "delete") {
         GS::Array<GS::ObjectState> beforeRows;
@@ -654,24 +687,671 @@ GS::ObjectState MutateNativeElementsCommand::Execute (const GS::ObjectState& par
     // D-350 R1: a module restore that did not complete is a known refusal only with the rollback proven.
     const char* statusOverride = moduleRestore && !dispatchComplete && !moduleRollbackProven ? "unknown" : nullptr;
     GS::ObjectState receipt = BuildReceipt (scope, operationId, operation, typeName, description, origin, requestHash, before, after, primaryAfterIds, receiptImpactIds, complete, dispatchComplete, semanticMetadata, operatorNote, &mutationResult, statusOverride, nullptr, hasImpactEnvelope ? &impact : nullptr);
+    NativeMutationPending outcome;
+    outcome.ready = true;
+    outcome.receipt = receipt;
+    outcome.mutationResult = mutationResult;
+    outcome.readback = after;
+    outcome.isDelete = operation == "delete";
+    outcome.deleteReadback = deleteReadback;
+    if (pending == nullptr) return BuildNativeMutationResponse (outcome);
+    outcome.before = pending->before;
+    *pending = outcome;
+    return GS::ObjectState ("status", "pending");
+}
+
+} // namespace
+
+GS::ObjectState MutateNativeElementsCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const
+{
+    return ExecuteNativeMutationRequest (parameters, processControl, nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// D-357: MutateNativeTransaction.  One call may mix element types and
+// CREATE/UPDATE/DELETE operations.  All operations run in order inside ONE
+// NativeUndoableCommand (one Archicad undo step).  Any refused, failed,
+// incomplete or partial operation makes the callback return an error, so
+// Archicad rolls the whole step back; nothing is published and no receipt is
+// remembered.  Receipts are published only after the undo step committed.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr const char* DefaultTransactionUndoName = "Sheet patch";
+constexpr USize MaxTransactionTextLength = 200;
+
+struct TransactionLabels {
+    GS::Array<GS::UniString> names;
+    GS::Array<API_Guid> guids;
+
+    bool Find (const GS::UniString& name, API_Guid& guid) const
+    {
+        for (UIndex index = 0; index < names.GetSize (); ++index) {
+            if (names[index] == name) {
+                guid = guids[index];
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
+struct TransactionFingerprints {
+    GS::Array<API_Guid> guids;
+    GS::Array<GS::UniString> values;
+
+    void Set (const API_Guid& guid, const GS::UniString& value)
+    {
+        for (UIndex index = 0; index < guids.GetSize (); ++index) {
+            if (guids[index] == guid) {
+                values[index] = value;
+                return;
+            }
+        }
+        guids.Push (guid);
+        values.Push (value);
+    }
+
+    bool Find (const API_Guid& guid, GS::UniString& value) const
+    {
+        for (UIndex index = 0; index < guids.GetSize (); ++index) {
+            if (guids[index] == guid) {
+                value = values[index];
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
+// A label reference is an object with exactly one string field `label`.
+bool IsLabelReference (const GS::ObjectState& value, GS::UniString& label)
+{
+    if (value.GetFieldCount () != 1 || !value.Contains ("label") || !value.IsString ("label"))
+        return false;
+    return value.Get ("label", label);
+}
+
+// Collects every label reference in one item.  At the item top level of a
+// CREATE the string field `label` is a definition and is skipped.  Label
+// references inside lists are refused: list rows cannot be rewritten in
+// place, and silently ignoring them would write an unresolved reference.
+GS::Optional<GS::UniString> CollectLabelReferences (
+    const GS::ObjectState& value,
+    bool itemTopLevel,
+    GS::Array<GS::UniString>& references)
+{
+    for (const GS::String& fieldName : value.GetFieldNames ()) {
+        if (itemTopLevel && fieldName == "label" && value.IsString (fieldName))
+            continue;
+        if (value.IsObject (fieldName)) {
+            const GS::ObjectState* child = value.Get (fieldName);
+            if (child == nullptr) continue;
+            GS::UniString label;
+            if (IsLabelReference (*child, label)) {
+                references.Push (label);
+                continue;
+            }
+            const GS::Optional<GS::UniString> nestedError = CollectLabelReferences (*child, false, references);
+            if (nestedError.HasValue ()) return nestedError;
+        } else if (value.IsList (fieldName)) {
+            GS::Array<GS::ObjectState> rows;
+            if (!value.Get (fieldName, rows)) continue;
+            for (const GS::ObjectState& row : rows) {
+                GS::Array<GS::UniString> nested;
+                GS::UniString label;
+                const GS::Optional<GS::UniString> nestedError = CollectLabelReferences (row, false, nested);
+                if (nestedError.HasValue ()) return nestedError;
+                if (IsLabelReference (row, label) || !nested.IsEmpty ())
+                    return GS::UniString ("label references are accepted only in object positions (elementId or a GUID object), not inside lists.");
+            }
+        }
+    }
+    return {};
+}
+
+// Rewrites every label reference of an owned deep copy in place into the
+// element-id shape `{ "guid": "<created GUID>" }`.
+GS::Optional<GS::UniString> ResolveLabelReferences (
+    GS::ObjectState& value,
+    bool itemTopLevel,
+    const TransactionLabels& labels)
+{
+    for (const GS::String& fieldName : value.GetFieldNames ()) {
+        if (itemTopLevel && fieldName == "label" && value.IsString (fieldName))
+            continue;
+        if (!value.IsObject (fieldName)) continue;
+        GS::ObjectState* child = const_cast<GS::ObjectState*> (value.Get (fieldName));
+        if (child == nullptr) continue;
+        GS::UniString label;
+        if (IsLabelReference (*child, label)) {
+            API_Guid guid = APINULLGuid;
+            if (!labels.Find (label, guid))
+                return GS::UniString ("label \"") + label + "\" is not defined by an earlier CREATE item of this transaction.";
+            child->Clear ();
+            child->Add ("guid", APIGuidToString (guid));
+            continue;
+        }
+        const GS::Optional<GS::UniString> nestedError = ResolveLabelReferences (*child, false, labels);
+        if (nestedError.HasValue ()) return nestedError;
+    }
+    return {};
+}
+
+// GS::ObjectState has no Remove; rebuild a CREATE item without its `label`.
+GS::Optional<GS::UniString> CopyItemWithoutLabel (const GS::ObjectState& source, GS::ObjectState& target)
+{
+    target.Clear ();
+    for (const GS::String& fieldName : source.GetFieldNames ()) {
+        if (fieldName == "label") continue;
+        switch (source.GetType (fieldName)) {
+            case GS::ObjectState::Bool: { bool v = false; source.Get (fieldName, v); target.Add (fieldName, v); break; }
+            case GS::ObjectState::Int: { Int64 v = 0; source.Get (fieldName, v); target.Add (fieldName, v); break; }
+            case GS::ObjectState::UInt: { UInt64 v = 0; source.Get (fieldName, v); target.Add (fieldName, v); break; }
+            case GS::ObjectState::Real: { double v = 0.0; source.Get (fieldName, v); target.Add (fieldName, v); break; }
+            case GS::ObjectState::String: { GS::UniString v; source.Get (fieldName, v); target.Add (fieldName, v); break; }
+            case GS::ObjectState::Object: {
+                const GS::ObjectState* child = source.Get (fieldName);
+                if (child == nullptr) return GS::UniString ("A labelled CREATE item has an unreadable object field.");
+                target.Add (fieldName, *child);
+                break;
+            }
+            case GS::ObjectState::List: {
+                GS::Array<GS::ObjectState> rows;
+                if (!source.Get (fieldName, rows))
+                    return GS::UniString ("A labelled CREATE item may carry only object lists beside its label.");
+                target.Add (fieldName, rows);
+                break;
+            }
+        }
+    }
+    return {};
+}
+
+API_Guid RowGuid (const GS::ObjectState& row)
+{
+    const GS::ObjectState* id = row.Get ("elementId");
+    return id == nullptr ? APINULLGuid : GetGuidFromObjectState (*id);
+}
+
+GS::ObjectState MakeTransactionError (const GS::UniString& code, const GS::UniString& message)
+{
+    GS::ObjectState error;
+    error.Add ("code", code);
+    error.Add ("message", message);
+    return error;
+}
+
+GS::ObjectState MakeTransactionError (GSErrCode code, const GS::UniString& message)
+{
+    GS::ObjectState error;
+    error.Add ("code", static_cast<Int32> (code));
+    error.Add ("message", message);
+    return error;
+}
+
+GS::ObjectState ErrorObjectOf (const GS::ObjectState& response, const GS::UniString& fallback)
+{
+    const GS::ObjectState* error = response.Get ("error");
+    if (error != nullptr) return *error;
+    return MakeTransactionError (GS::UniString ("NATIVE_TRANSACTION_OPERATION_FAILED"), fallback);
+}
+
+GS::ObjectState TransactionFailure (
+    const GS::UniString& transactionId,
+    const char* outcome,
+    const GS::ObjectState& error,
+    Int32 failedOperationIndex,
+    const GS::UniString& failedOperationId)
+{
     GS::ObjectState response;
-    bool groupModeRestored = false;
-    if (mutationResult.Get ("groupModeRestored", groupModeRestored))
-        response.Add ("groupModeRestored", groupModeRestored);
-    Int32 groupModeRestoreError = 0;
-    if (mutationResult.Get ("groupModeRestoreError", groupModeRestoreError))
-        response.Add ("groupModeRestoreError", groupModeRestoreError);
-    // BuildReceipt deliberately has no durable side effect.  Give the APX
-    // response a process-local sequence for diagnostics and remember the
-    // factual receipt before returning it so MCP can reconcile a lost HTTP
-    // response without dispatching the Archicad command a second time.
-    receipt.Add ("nativeSequence", NextCachedReceiptSequence ());
-    RememberCachedReceipt (receipt);
     response.Add ("contractVersion", ContractVersion);
-    response.Add ("status", "success");
-    response.Add ("receipt", receipt);
-    response.Add ("mutationResult", mutationResult);
-    response.Add ("readback", after);
-    if (operation == "delete") response.Add ("deleteReadback", deleteReadback);
+    response.Add ("transactionId", transactionId);
+    response.Add ("status", "failed");
+    response.Add ("committed", false);
+    response.Add ("outcome", outcome);
+    // Not "error": Archicad's JSON API turns an add-on answer with a
+    // top-level "error" into a failed command and drops everything else.
+    response.Add ("failure", error);
+    if (failedOperationIndex >= 0) {
+        response.Add ("failedOperationIndex", failedOperationIndex);
+        response.Add ("failedOperationId", failedOperationId);
+    }
+    return response;
+}
+
+GS::ObjectState TransactionRefusal (
+    const GS::UniString& transactionId,
+    const GS::UniString& message,
+    Int32 failedOperationIndex = -1,
+    const GS::UniString& failedOperationId = GS::UniString ())
+{
+    return TransactionFailure (transactionId, "refused", MakeTransactionError (APIERR_BADPARS, message), failedOperationIndex, failedOperationId);
+}
+
+// Independent postcondition of a rollback: every GUID created inside the
+// transaction is absent again, every pre-existing target is back at its first
+// observed fingerprint, and every target known only by GUID still exists.  An
+// empty fingerprint means "existence only".  `inspected` counts the elements
+// actually checked; a verdict with nothing inspected is not evidence.
+struct RollbackInspection {
+    UInt32 inspected = 0;
+    bool passed = false;
+};
+
+RollbackInspection VerifyTransactionRolledBack (
+    const GS::Array<API_Guid>& createdGuids,
+    const GS::Array<GS::ObjectState>& originalIds,
+    const GS::Array<GS::UniString>& originalFingerprints,
+    const GS::UniString& scope,
+    GS::ProcessControl& processControl)
+{
+    RollbackInspection inspection;
+    for (const API_Guid& guid : createdGuids) {
+        API_Elem_Head header = {};
+        header.guid = guid;
+        ++inspection.inspected;
+        if (ACAPI_Element_GetHeader (&header) != APIERR_BADID) return inspection;
+    }
+    if (!originalIds.IsEmpty ()) {
+        bool complete = false;
+        const GS::ObjectState snapshots = ExactSnapshots (originalIds, scope, processControl, complete);
+        if (!complete) return inspection;
+        GS::Array<GS::ObjectState> rows;
+        snapshots.Get ("elements", rows);
+        for (UIndex index = 0; index < originalIds.GetSize (); ++index) {
+            const API_Guid guid = GetGuidFromObjectState (originalIds[index]);
+            ++inspection.inspected;
+            bool matched = false;
+            for (const GS::ObjectState& row : rows) {
+                if (RowGuid (row) != guid) continue;
+                GS::UniString fingerprint;
+                matched = originalFingerprints[index].IsEmpty ()
+                    || (row.Get ("fingerprint", fingerprint) && fingerprint == originalFingerprints[index]);
+                break;
+            }
+            if (!matched) return inspection;
+        }
+    }
+    inspection.passed = inspection.inspected > 0;
+    return inspection;
+}
+
+} // namespace
+
+MutateNativeTransactionCommand::MutateNativeTransactionCommand () : CommandBase (CommonSchema::NotUsed) {}
+GS::String MutateNativeTransactionCommand::GetName () const { return "MutateNativeTransaction"; }
+GS::Optional<GS::UniString> MutateNativeTransactionCommand::GetInputParametersSchema () const
+{
+    return R"({"type":"object","properties":{"contractVersion":{"type":"string"},"transactionId":{"type":"string","minLength":1,"maxLength":200},"undoName":{"type":"string","minLength":1,"maxLength":200},"expectedFileScopeKey":{"type":"string"},"operations":{"type":"array","minItems":1,"items":{"type":"object","properties":{"operationId":{"type":"string","minLength":1,"maxLength":200},"operation":{"type":"string","enum":["create","update","delete"]},"elementType":{"type":"string"},"items":{"type":"array","minItems":1,"maxItems":500,"items":{"type":"object"}},"requestHash":{"type":"string"},"description":{"type":"string"},"origin":{"type":"string","enum":["NATIVE","SEMANTIC"]},"operatorNote":{"type":"string","maxLength":1000},"semanticMetadata":{"type":"object"}},"additionalProperties":false,"required":["operationId","operation","elementType","items"]}}},"additionalProperties":false,"required":["transactionId","expectedFileScopeKey","operations"]})";
+}
+GS::Optional<GS::UniString> MutateNativeTransactionCommand::GetResponseSchema () const { return {}; }
+GS::Optional<GS::UniString> MutateNativeTransactionCommand::GetRawResponseSchema () const { return {}; }
+GS::ObjectState MutateNativeTransactionCommand::Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const
+{
+    GS::UniString transactionId;
+    parameters.Get ("transactionId", transactionId);
+    if (transactionId.IsEmpty () || transactionId.GetLength () > MaxTransactionTextLength)
+        return TransactionRefusal (transactionId, "transactionId is required (1..200 characters).");
+    GS::UniString contract;
+    if (parameters.Get ("contractVersion", contract) && contract != ContractVersion)
+        return TransactionRefusal (transactionId, "contractVersion must be native-crud-v2 when present.");
+
+    // Same scope boundary as MutateNativeElements.
+    GS::ObjectState scopeParameters;
+    GS::UniString expectedScope;
+    parameters.Get ("expectedFileScopeKey", expectedScope);
+    scopeParameters.Add ("fileScopeKey", expectedScope);
+    const GS::Optional<GS::UniString> scopeError = ValidateScope (scopeParameters);
+    if (scopeError.HasValue ())
+        return TransactionRefusal (transactionId, scopeError.Get ());
+    const GS::UniString scope = CurrentSoloFileScope ().Get ();
+
+    GS::UniString undoName (DefaultTransactionUndoName);
+    if (parameters.Contains ("undoName")) {
+        parameters.Get ("undoName", undoName);
+        if (undoName.IsEmpty () || undoName.GetLength () > MaxTransactionTextLength)
+            return TransactionRefusal (transactionId, "undoName must contain 1..200 characters.");
+    }
+
+    GS::Array<GS::ObjectState> operations;
+    if (!parameters.Get ("operations", operations) || operations.IsEmpty ())
+        return TransactionRefusal (transactionId, "operations must contain at least one operation.");
+
+    // Static preflight, before the undo step opens: identities, label
+    // definitions and backward-only label references.
+    GS::Array<GS::UniString> operationIds;
+    GS::Array<GS::UniString> definedLabels;
+    bool needsGroupSuspension = false;
+    for (UIndex opIndex = 0; opIndex < operations.GetSize (); ++opIndex) {
+        const GS::ObjectState& op = operations[opIndex];
+        const Int32 index = static_cast<Int32> (opIndex);
+        GS::UniString operationId;
+        GS::UniString operation;
+        GS::UniString elementType;
+        GS::Array<GS::ObjectState> items;
+        if (!op.Get ("operationId", operationId) || operationId.IsEmpty () || operationId.GetLength () > MaxTransactionTextLength)
+            return TransactionRefusal (transactionId, "Every operation needs an operationId (1..200 characters).", index);
+        if (operationIds.Contains (operationId))
+            return TransactionRefusal (transactionId, "operationId appears twice in one transaction.", index, operationId);
+        operationIds.Push (operationId);
+        if (!op.Get ("operation", operation) || (operation != "create" && operation != "update" && operation != "delete"))
+            return TransactionRefusal (transactionId, "operation must be create, update or delete.", index, operationId);
+        if (!op.Get ("elementType", elementType) || elementType.IsEmpty ())
+            return TransactionRefusal (transactionId, "elementType is required.", index, operationId);
+        if (!op.Get ("items", items) || items.IsEmpty () || items.GetSize () > static_cast<USize> (MaxNativeWriteItems))
+            return TransactionRefusal (transactionId, "items must contain between 1 and 500 entries.", index, operationId);
+        if (operation != "create") needsGroupSuspension = true;
+        if (FindCachedReceipt (operationId, scope).HasValue ()) {
+            return TransactionFailure (transactionId, "refused",
+                MakeTransactionError (GS::UniString ("DUPLICATE_OPERATION_CONFLICT"), "operationId already has a native receipt; a Native transaction never replays an operation."),
+                index, operationId);
+        }
+        GS::Array<GS::UniString> labelsOfThisOperation;
+        for (const GS::ObjectState& item : items) {
+            GS::Array<GS::UniString> references;
+            const GS::Optional<GS::UniString> collectError = CollectLabelReferences (item, true, references);
+            if (collectError.HasValue ()) return TransactionRefusal (transactionId, collectError.Get (), index, operationId);
+            for (const GS::UniString& reference : references) {
+                if (!definedLabels.Contains (reference))
+                    return TransactionRefusal (transactionId, GS::UniString ("label \"") + reference + "\" must be defined by a CREATE item of an earlier operation.", index, operationId);
+            }
+            if (item.Contains ("moduleRestore")) {
+                // Module restore proves its own rollback with a separate
+                // undo step; inside the transaction step that proof is not
+                // real, so the request is refused instead of weakened.
+                return TransactionFailure (transactionId, "refused",
+                    MakeTransactionError (GS::UniString ("NATIVE_TRANSACTION_UNSUPPORTED"), "moduleRestore items cannot join a Native transaction; nothing was written."),
+                    index, operationId);
+            }
+            if (!item.Contains ("label")) continue;
+            GS::UniString label;
+            if (operation != "create" || !item.IsString ("label") || !item.Get ("label", label))
+                return TransactionRefusal (transactionId, "label is accepted only as a string on CREATE items.", index, operationId);
+            if (label.IsEmpty () || label.GetLength () > MaxTransactionTextLength)
+                return TransactionRefusal (transactionId, "label must contain 1..200 characters.", index, operationId);
+            if (definedLabels.Contains (label) || labelsOfThisOperation.Contains (label))
+                return TransactionRefusal (transactionId, "label is defined twice in one transaction.", index, operationId);
+            labelsOfThisOperation.Push (label);
+        }
+        for (const GS::UniString& label : labelsOfThisOperation) definedLabels.Push (label);
+    }
+
+    // Exact UPDATE/DELETE needs Suspend Groups.  Switch the UI mode once,
+    // outside the undo step, so no inner writer toggles it inside the step;
+    // restore the operator's prior mode on every exit path.
+    bool groupModeNeedsRestore = false;
+    if (needsGroupSuspension) {
+        bool groupsWereSuspended = false;
+        GSErrCode groupModeError = TAPIR_View_IsSuspendGroupOn (&groupsWereSuspended);
+        if (groupModeError != NoError)
+            return TransactionFailure (transactionId, "refused", MakeTransactionError (groupModeError, "Failed to read the Suspend Groups mode; nothing was written."), -1, GS::UniString ());
+        if (!groupsWereSuspended) {
+            groupModeError = TAPIR_Grouping_ChangeSuspendGroup (true);
+            if (groupModeError != NoError)
+                return TransactionFailure (transactionId, "refused", MakeTransactionError (groupModeError, "Failed to suspend groups for the Native transaction; nothing was written."), -1, GS::UniString ());
+            groupModeNeedsRestore = true;
+        }
+    }
+    const GS::OnExit groupModeGuard ([&groupModeNeedsRestore] () {
+        if (groupModeNeedsRestore)
+            TAPIR_Grouping_ChangeSuspendGroup (false);
+    });
+
+    TransactionLabels labels;
+    TransactionFingerprints fingerprints;
+    GS::Array<NativeMutationPending> completed;
+    GS::Array<GS::UniString> completedOperations;
+    NativeMutationPending failing;
+    GS::UniString failingOperation;
+    Int32 failedIndex = -1;
+    GS::UniString failedOperationId;
+    GS::ObjectState failedError;
+    GS::Array<API_Guid> failingTargets;
+    bool callbackRan = false;
+    bool callbackSucceeded = false;
+
+    // D-357: one element-event bracket for the whole step.  Nested writers
+    // skip their own bracket and queue New notifications until the commit.
+    API_NotifyElementType eventBracket = {};
+    eventBracket.notifID = APINotifyElement_BeginEvents;
+    AddElementNotificationClientCommand::ElementEventHandlerProc (&eventBracket);
+    const GSErrCode undoError = NativeUndoableCommand (undoName, [&] () -> GSErrCode {
+        callbackRan = true;
+        for (UIndex opIndex = 0; opIndex < operations.GetSize (); ++opIndex) {
+            failingTargets.Clear ();
+            const GS::ObjectState& op = operations[opIndex];
+            GS::UniString operationId;
+            GS::UniString operation;
+            GS::UniString elementType;
+            GS::Array<GS::ObjectState> items;
+            op.Get ("operationId", operationId);
+            op.Get ("operation", operation);
+            op.Get ("elementType", elementType);
+            op.Get ("items", items);
+            const auto fail = [&] (const GS::ObjectState& error) -> GSErrCode {
+                failedIndex = static_cast<Int32> (opIndex);
+                failedOperationId = operationId;
+                failingOperation = operation;
+                failedError = error;
+                return APIERR_CANCEL;
+            };
+
+            GS::ObjectState opParameters;
+            opParameters.Add ("contractVersion", ContractVersion);
+            opParameters.Add ("operationId", operationId);
+            opParameters.Add ("expectedFileScopeKey", expectedScope);
+            opParameters.Add ("operation", operation);
+            opParameters.Add ("elementType", elementType);
+            GS::UniString requestHash;
+            if (!op.Get ("requestHash", requestHash) || requestHash.IsEmpty ())
+                requestHash = GS::UniString ("0000000000000000000000000000000000000000000000000000000000000000");
+            opParameters.Add ("requestHash", requestHash);
+            GS::UniString description;
+            if (!op.Get ("description", description) || description.IsEmpty ())
+                description = undoName;
+            opParameters.Add ("description", description);
+            GS::UniString origin;
+            if (op.Get ("origin", origin)) opParameters.Add ("origin", origin);
+            GS::UniString operatorNote;
+            if (op.Get ("operatorNote", operatorNote)) opParameters.Add ("operatorNote", operatorNote);
+            const GS::ObjectState* semanticMetadata = op.Get ("semanticMetadata");
+            if (semanticMetadata != nullptr) opParameters.Add ("semanticMetadata", *semanticMetadata);
+
+            // Resolve labels into created GUIDs and complete omitted
+            // fingerprints of elements this transaction already changed.
+            GS::Array<GS::UniString> itemLabels;
+            GS::Array<GS::ObjectState> resolvedItems;
+            for (const GS::ObjectState& item : items) {
+                GS::UniString label;
+                const bool labelled = item.Contains ("label") && item.Get ("label", label);
+                itemLabels.Push (labelled ? label : GS::UniString ());
+                GS::ObjectState resolved;
+                if (labelled) {
+                    const GS::Optional<GS::UniString> copyError = CopyItemWithoutLabel (item, resolved);
+                    if (copyError.HasValue ()) return fail (MakeTransactionError (APIERR_BADPARS, copyError.Get ()));
+                } else {
+                    resolved = item;
+                }
+                const GS::Optional<GS::UniString> resolveError = ResolveLabelReferences (resolved, true, labels);
+                if (resolveError.HasValue ()) return fail (MakeTransactionError (APIERR_BADPARS, resolveError.Get ()));
+                if (operation != "create" && !resolved.Contains ("expectedFingerprint")) {
+                    const GS::ObjectState* id = resolved.Get ("elementId");
+                    GS::UniString fingerprint;
+                    if (id != nullptr && fingerprints.Find (GetGuidFromObjectState (*id), fingerprint))
+                        resolved.Add ("expectedFingerprint", fingerprint);
+                }
+                resolvedItems.Push (resolved);
+            }
+            opParameters.Add ("items", resolvedItems);
+            failingTargets.Clear ();
+            if (operation != "create") {
+                for (const GS::ObjectState& resolved : resolvedItems) {
+                    const GS::ObjectState* id = resolved.Get ("elementId");
+                    const API_Guid guid = id == nullptr ? APINULLGuid : GetGuidFromObjectState (*id);
+                    if (guid != APINULLGuid && !failingTargets.Contains (guid)) failingTargets.Push (guid);
+                }
+            }
+
+            NativeMutationPending pending;
+            const GS::ObjectState opResponse = ExecuteNativeMutationRequest (opParameters, processControl, &pending);
+            if (opResponse.Get ("error") != nullptr || !pending.ready) {
+                failing = pending;
+                return fail (ErrorObjectOf (opResponse, "The operation returned no factual result."));
+            }
+            GS::UniString receiptStatus;
+            pending.receipt.Get ("status", receiptStatus);
+            if (receiptStatus != "applied") {
+                failing = pending;
+                GS::ObjectState error = MakeTransactionError (GS::UniString ("NATIVE_TRANSACTION_OPERATION_NOT_APPLIED"),
+                    GS::UniString ("The operation finished with receipt status \"") + receiptStatus + "\"; the whole transaction was rolled back.");
+                error.Add ("receiptStatus", receiptStatus);
+                const GS::ObjectState* diagnostics = pending.receipt.Get ("transaction");
+                if (diagnostics != nullptr) error.Add ("operationDiagnostics", *diagnostics);
+                return fail (error);
+            }
+
+            if (operation == "create") {
+                GS::Array<GS::ObjectState> created;
+                pending.mutationResult.Get ("elements", created);
+                if (created.GetSize () != items.GetSize ()) {
+                    failing = pending;
+                    return fail (MakeTransactionError (GS::UniString ("NATIVE_TRANSACTION_CREATE_IDS_INCOMPLETE"), "CREATE did not return one exact GUID per item; labels cannot be bound."));
+                }
+                for (UIndex itemIndex = 0; itemIndex < items.GetSize (); ++itemIndex) {
+                    const API_Guid guid = RowGuid (created[itemIndex]);
+                    if (guid == APINULLGuid) {
+                        failing = pending;
+                        return fail (MakeTransactionError (GS::UniString ("NATIVE_TRANSACTION_CREATE_IDS_INCOMPLETE"), "CREATE returned an item without an exact GUID."));
+                    }
+                    if (!itemLabels[itemIndex].IsEmpty ()) {
+                        labels.names.Push (itemLabels[itemIndex]);
+                        labels.guids.Push (guid);
+                    }
+                }
+            }
+            GS::Array<GS::ObjectState> afterRows;
+            pending.readback.Get ("elements", afterRows);
+            for (const GS::ObjectState& row : afterRows) {
+                GS::UniString fingerprint;
+                const API_Guid guid = RowGuid (row);
+                if (guid != APINULLGuid && row.Get ("fingerprint", fingerprint))
+                    fingerprints.Set (guid, fingerprint);
+            }
+            completed.Push (pending);
+            completedOperations.Push (operation);
+        }
+        callbackSucceeded = true;
+        return NoError;
+    });
+    eventBracket = {};
+    eventBracket.notifID = APINotifyElement_EndEvents;
+    AddElementNotificationClientCommand::ElementEventHandlerProc (&eventBracket);
+
+    GSErrCode groupModeRestoreError = NoError;
+    if (groupModeNeedsRestore) {
+        groupModeRestoreError = TAPIR_Grouping_ChangeSuspendGroup (false);
+        if (groupModeRestoreError == NoError)
+            groupModeNeedsRestore = false;
+    }
+
+    if (undoError == NoError && callbackSucceeded) {
+        GS::ObjectState response;
+        response.Add ("contractVersion", ContractVersion);
+        response.Add ("transactionId", transactionId);
+        response.Add ("status", "success");
+        response.Add ("committed", true);
+        response.Add ("undoName", undoName);
+        const auto& operationResponses = response.AddList<GS::ObjectState> ("operations");
+        for (const NativeMutationPending& pending : completed)
+            operationResponses (BuildNativeMutationResponse (pending));
+        GS::ObjectState labelObject;
+        for (UIndex index = 0; index < labels.names.GetSize (); ++index)
+            labelObject.Add (GS::String (labels.names[index].ToCStr (CC_UTF8).Get ()), APIGuidToString (labels.guids[index]));
+        response.Add ("labels", labelObject);
+        if (needsGroupSuspension) {
+            response.Add ("groupModeRestored", groupModeRestoreError == NoError);
+            if (groupModeRestoreError != NoError)
+                response.Add ("groupModeRestoreError", static_cast<Int32> (groupModeRestoreError));
+        }
+        return response;
+    }
+
+    if (!callbackRan)
+        return TransactionFailure (transactionId, "refused", MakeTransactionError (undoError, "Archicad did not open the undo step; nothing was written."), -1, GS::UniString ());
+
+    // The callback ran.  Either it failed (Archicad rolls the step back) or
+    // the host reported an error after a successful callback.  In both cases
+    // verify the rollback independently; an unproven rollback is "unknown"
+    // and is never retried (D-281).
+    GS::Array<API_Guid> createdGuids;
+    GS::Array<GS::ObjectState> originalIds;
+    GS::Array<GS::UniString> originalFingerprints;
+    const auto collect = [&] (const NativeMutationPending& pending, const GS::UniString& operation) {
+        if (operation == "create" && pending.ready) {
+            GS::Array<GS::ObjectState> created;
+            pending.mutationResult.Get ("elements", created);
+            for (const GS::ObjectState& row : created) {
+                const API_Guid guid = RowGuid (row);
+                if (guid != APINULLGuid && !createdGuids.Contains (guid)) createdGuids.Push (guid);
+            }
+        }
+        GS::Array<GS::ObjectState> beforeRows;
+        pending.before.Get ("elements", beforeRows);
+        for (const GS::ObjectState& row : beforeRows) {
+            const API_Guid guid = RowGuid (row);
+            GS::UniString fingerprint;
+            if (guid == APINULLGuid || createdGuids.Contains (guid) || !row.Get ("fingerprint", fingerprint)) continue;
+            bool seen = false;
+            for (const GS::ObjectState& id : originalIds) {
+                if (GetGuidFromObjectState (id) == guid) { seen = true; break; }
+            }
+            if (seen) continue;
+            originalIds.Push (CreateGuidObjectState (guid));
+            originalFingerprints.Push (fingerprint);
+        }
+    };
+    for (UIndex index = 0; index < completed.GetSize (); ++index) collect (completed[index], completedOperations[index]);
+    collect (failing, failingOperation);
+    if (failedIndex >= 0) {
+        // Targets of the failing operation that no snapshot covered: the op
+        // failed before its write could start, so existence is the proof.
+        for (const API_Guid& guid : failingTargets) {
+            if (createdGuids.Contains (guid)) continue;
+            bool seen = false;
+            for (const GS::ObjectState& id : originalIds) {
+                if (GetGuidFromObjectState (id) == guid) { seen = true; break; }
+            }
+            if (seen) continue;
+            originalIds.Push (CreateGuidObjectState (guid));
+            originalFingerprints.Push (GS::UniString ());
+        }
+    }
+    const RollbackInspection inspection = VerifyTransactionRolledBack (createdGuids, originalIds, originalFingerprints, scope, processControl);
+    const bool rollbackVerified = inspection.passed;
+    const bool noEvidence = inspection.inspected == 0;
+    // With nothing to inspect, a failed callback plus an error from the undo
+    // step is still a rollback, but it is not claimed as verified.
+    const bool rolledBack = rollbackVerified || (noEvidence && !callbackSucceeded && undoError != NoError);
+    const char* outcome = rolledBack ? "rolled_back" : "unknown";
+    const auto addEvidence = [&] (GS::ObjectState& response) {
+        response.Add ("rollbackVerified", rollbackVerified);
+        response.Add ("rollbackEvidence", noEvidence ? "none" : "inspected");
+        response.Add ("rollbackInspectedElements", static_cast<Int32> (inspection.inspected));
+    };
+
+    if (callbackSucceeded) {
+        GS::ObjectState response = TransactionFailure (transactionId, outcome,
+            MakeTransactionError (undoError, rolledBack
+                ? GS::UniString ("Archicad reported an error after every operation succeeded; the rollback was verified, nothing is applied.")
+                : GS::UniString ("Archicad reported an error after every operation succeeded; the outcome is unknown and must not be retried.")),
+            -1, GS::UniString ());
+        addEvidence (response);
+        return response;
+    }
+    GS::ObjectState response = TransactionFailure (transactionId, outcome, failedError, failedIndex, failedOperationId);
+    addEvidence (response);
+    if (undoError != NoError) response.Add ("transactionError", static_cast<Int32> (undoError));
     return response;
 }

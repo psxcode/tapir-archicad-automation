@@ -1,4 +1,5 @@
 #include "ElementMutationInternal.hpp"
+#include "NativeUndoable.hpp"
 
 #include "ElementCommands.hpp"
 #include "ElementCreationCommands.hpp"
@@ -129,7 +130,7 @@ GS::ObjectState ExecuteHatchUpdate (const GS::Array<GS::ObjectState>& items, con
 #else
     (void) faultAfterFirstApplied;
 #endif
-    const GSErrCode undoError = ACAPI_CallUndoableCommand ("Update Native Hatches", [&] () -> GSErrCode {
+    const GSErrCode undoError = NativeUndoableCommand ("Update Native Hatches", [&] () -> GSErrCode {
         for (GSSize itemIndex = 0; itemIndex < static_cast<GSSize> (items.GetSize ()); ++itemIndex) {
             const GS::ObjectState& item = items[itemIndex];
             if (callbackError != NoError) {
@@ -385,7 +386,7 @@ GS::ObjectState ExecuteDraftingUpdate (
 #endif
     const GSSize itemCount = static_cast<GSSize> (items.GetSize ());
 
-    const GSErrCode undoError = ACAPI_CallUndoableCommand (typeID == API_LineID ? "Update Native Lines" : "Update Native Arcs", [&]() -> GSErrCode {
+    const GSErrCode undoError = NativeUndoableCommand (typeID == API_LineID ? "Update Native Lines" : "Update Native Arcs", [&]() -> GSErrCode {
         for (GSSize itemIndex = 0; itemIndex < itemCount; ++itemIndex) {
             const GS::ObjectState& item = items[itemIndex];
             const GS::ObjectState* elementId = item.Get ("elementId");

@@ -34,6 +34,11 @@ constexpr const char* ImpactMetadataKey = "nativeImpact";
 // The limits are generated from NATIVE_SCHEMA_LIMITS (src/native/schema/capability.ts).
 constexpr GSSize MaxMutationItems = NativeCrudSchema::MaxItems;
 
+// D-357: the Native write path (MutateNativeElements and every operation of a
+// MutateNativeTransaction) admits up to 500 items per operation.  Read
+// commands keep the generated MaxMutationItems cap.
+constexpr GSSize MaxNativeWriteItems = 500;
+
 constexpr GSSize MaxDiscoveryReferences = NativeCrudSchema::MaxDiscoverReferences;
 
 constexpr GSSize MaxHistoryEntries = NativeCrudSchema::MaxHistoryEntries;

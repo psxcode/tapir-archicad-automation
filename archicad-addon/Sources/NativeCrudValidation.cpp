@@ -112,7 +112,7 @@ GS::Optional<GS::UniString> ValidateZoneTypedWriter (
 {
     if (operation != "create" && operation != "update")
         return "The validated Zone typed writer only supports CREATE and UPDATE.";
-    if (items.IsEmpty () || items.GetSize () > MaxMutationItems)
+    if (items.IsEmpty () || items.GetSize () > MaxNativeWriteItems)
         return "The validated Zone typed writer requires a bounded non-empty item list.";
 
     const std::initializer_list<const char*> fields = {
@@ -305,7 +305,7 @@ GS::Optional<GS::UniString> ValidateHatchTypedPayloads (
     const GS::Array<GS::ObjectState>& items)
 {
     if (operation != "create" && operation != "update") return "Hatch typed writer supports only CREATE and UPDATE.";
-    if (items.IsEmpty () || items.GetSize () > MaxMutationItems) return "Hatch typed writer requires one to twenty-five items.";
+    if (items.IsEmpty () || items.GetSize () > MaxNativeWriteItems) return "Hatch typed writer requires one to 500 items.";
     for (const GS::ObjectState& item : items) {
         const GS::ObjectState* shape = item.Get (operation == "create" ? "payload" : "patch");
         if (shape == nullptr) return "Hatch item is missing its typed payload or patch.";
@@ -451,11 +451,9 @@ GS::Optional<GS::UniString> ValidateDoorCloneSource (const API_Guid& sourceGuid)
     if (ACAPI_LibraryPart_Get (&doorPart) != NoError || doorPart.missingDef || doorPart.version <= 0
         || doorPart.ownUnID[0] == '\0' || doorPart.file_UName[0] == '\0')
         return "Door clone source opening library identity/revision is incomplete.";
-    const API_Guid stampGuid = source.door.openingBase.markGuid;
-    if (stampGuid == APINULLGuid) return {};
-    // Marker-bearing copying is supplemental under D-272. Non-null identities,
-    // including identities that might be unresolved, fail closed here.
-    return "Door clone source is marker-bearing; this candidate packet accepts only factual markerless templates.";
+    // D-357: a marker-bearing template is admitted; the writer places the copy
+    // without sub-elements, so the created Door carries no marker of its own.
+    return {};
 }
 
 } // namespace NativeCrudInternal
@@ -482,7 +480,6 @@ GS::Optional<GS::UniString> ValidateWindowCloneSource (const API_Guid& sourceGui
     source.header.guid = sourceGuid;
     if (ACAPI_Element_Get (&source) != NoError || GetElemTypeId (source.header) != API_WindowID || source.header.guid != sourceGuid)
         return "Window clone source must resolve to the exact same-file native Window.";
-    if (source.window.openingBase.markGuid != APINULLGuid) return "Window clone source is marker-bearing; only factual markerless templates are admitted.";
     if (!WindowNativeTopologySupported (source))
         return "Window clone source is outside the directly observable centered, sill-linked, wall-associative native subset.";
     API_LibPart part = {};
@@ -599,8 +596,8 @@ GS::Optional<GS::UniString> ValidateMutationItems (
     const GS::UniString& typeName,
     const GS::Array<GS::ObjectState>& items)
 {
-    if (items.IsEmpty () || items.GetSize () > MaxMutationItems)
-        return GS::UniString ("items must contain between 1 and 25 entries.");
+    if (items.IsEmpty () || items.GetSize () > MaxNativeWriteItems)
+        return GS::UniString ("items must contain between 1 and 500 entries.");
     GS::Array<API_Guid> seenGuids;
     const bool moduleRestore = operation == "create" && IsModuleRestoreRequest (items);
     if (moduleRestore) {

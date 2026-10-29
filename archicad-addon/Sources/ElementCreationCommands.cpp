@@ -1,4 +1,5 @@
 #include "ElementCreationCommands.hpp"
+#include "NativeUndoable.hpp"
 #include "ExtendedElementCommands.hpp"
 #include "ObjectState.hpp"
 #include "MigrationHelper.hpp"
@@ -161,11 +162,15 @@ GS::ObjectState	CreateElementsCommandBase::Execute (const GS::ObjectState& param
         elemTypeID == API_LineID || elemTypeID == API_ArcID || elemTypeID == API_HatchID;
     GSErrCode callbackError = NoError;
 
+    // D-357: inside a Native transaction the outer command owns the event
+    // bracket, so a nested write never flushes the client queue mid-step.
+    const bool nestedInNativeTransaction = NativeUndoableScopeIsOpen ();
     API_NotifyElementType notification = {};
     notification.notifID = APINotifyElement_BeginEvents;
-    AddElementNotificationClientCommand::ElementEventHandlerProc (&notification);
+    if (!nestedInNativeTransaction)
+        AddElementNotificationClientCommand::ElementEventHandlerProc (&notification);
 
-    const GSErrCode undoErr = ACAPI_CallUndoableCommand ("Create " + elemTypeName, [&] () -> GSErrCode {
+    const GSErrCode undoErr = NativeUndoableCommand ("Create " + elemTypeName, [&] () -> GSErrCode {
         bool savedAutoTextFlag = false;
         const GSErrCode autoTextErr = ACAPI_AutoText_GetAutoTextFlag (&savedAutoTextFlag);
         if (autoTextErr != NoError) {
@@ -254,15 +259,20 @@ GS::ObjectState	CreateElementsCommandBase::Execute (const GS::ObjectState& param
 
     notification = {};
     notification.notifID = APINotifyElement_EndEvents;
-    AddElementNotificationClientCommand::ElementEventHandlerProc (&notification);
+    if (!nestedInNativeTransaction)
+        AddElementNotificationClientCommand::ElementEventHandlerProc (&notification);
 
     if (undoErr == NoError) {
-        for (const API_Elem_Head& createdHead : createdHeads) {
-            notification = {};
-            notification.notifID = APINotifyElement_New;
-            notification.elemHead = createdHead;
-            AddElementNotificationClientCommand::ElementEventHandlerProc (&notification);
-        }
+        // D-357: New is published only after the outermost undo step
+        // committed; a rolled-back Native transaction discards it.
+        NativeUndoableAfterCommit ([createdHeads] () {
+            for (const API_Elem_Head& createdHead : createdHeads) {
+                API_NotifyElementType created = {};
+                created.notifID = APINotifyElement_New;
+                created.elemHead = createdHead;
+                AddElementNotificationClientCommand::ElementEventHandlerProc (&created);
+            }
+        });
     }
 
     if (undoErr != NoError) {

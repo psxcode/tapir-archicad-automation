@@ -40,7 +40,7 @@ GS::Optional<GS::UniString> MutateElementsCommand::GetInputParametersSchema () c
             "items": {
                 "type": "array",
                 "minItems": 1,
-                "maxItems": 256,
+                "maxItems": 500,
                 "items": {
                     "type": "object",
                     "properties": {
@@ -323,7 +323,7 @@ GS::ObjectState MutateElementsCommand::Execute (
         return CreateErrorResponse (APIERR_BADPARS, "Missing required array field 'items'.");
     }
     if (items.IsEmpty () || items.GetSize () > MaxMutationItems) {
-        return CreateErrorResponse (APIERR_BADPARS, "'items' must contain between 1 and 256 entries.");
+        return CreateErrorResponse (APIERR_BADPARS, "'items' must contain between 1 and 500 entries.");
     }
 #if defined(TAPIR_NATIVE_CRUD_TEST_FAULT_AFTER_FIRST_APPLIED)
     if (nativeCrudTestFaultAfterFirstApplied && items.GetSize () != 2)

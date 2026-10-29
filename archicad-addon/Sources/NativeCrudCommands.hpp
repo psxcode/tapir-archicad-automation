@@ -71,6 +71,20 @@ public:
     virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
 };
 
+// D-357: several typed Native operations (mixed types, CREATE/UPDATE/DELETE)
+// in ONE Archicad undo step, all-or-nothing, with CREATE labels resolved into
+// the created GUIDs for later operations.
+class MutateNativeTransactionCommand : public CommandBase
+{
+public:
+    MutateNativeTransactionCommand ();
+    virtual GS::String GetName () const override;
+    virtual GS::Optional<GS::UniString> GetInputParametersSchema () const override;
+    virtual GS::Optional<GS::UniString> GetResponseSchema () const override;
+    virtual GS::Optional<GS::UniString> GetRawResponseSchema () const override;
+    virtual GS::ObjectState Execute (const GS::ObjectState& parameters, GS::ProcessControl& processControl) const override;
+};
+
 // Specialized atomic Text-cluster transaction used by semantic table
 // normalization.  This is intentionally separate from homogeneous CRUD:
 // one survivor is updated and the remaining exact Text GUIDs are deleted in

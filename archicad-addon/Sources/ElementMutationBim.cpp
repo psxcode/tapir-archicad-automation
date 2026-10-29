@@ -1,4 +1,5 @@
 #include "ElementMutationInternal.hpp"
+#include "NativeUndoable.hpp"
 
 #include "ElementCommands.hpp"
 #include "ElementCreationCommands.hpp"
@@ -223,7 +224,7 @@ GS::ObjectState ExecuteNativeCrudWallUpdate (const GS::Array<GS::ObjectState>& i
     GSErrCode callbackError = NoError;
     bool testFaultInjectedAfterFirstApplied = false;
 
-    const GSErrCode undoError = ACAPI_CallUndoableCommand ("Update Native Walls", [&]() -> GSErrCode {
+    const GSErrCode undoError = NativeUndoableCommand ("Update Native Walls", [&]() -> GSErrCode {
         for (GSSize index = 0; index < static_cast<GSSize> (items.GetSize ()); ++index) {
             const GS::ObjectState& item = items[index];
             if (callbackError != NoError) {

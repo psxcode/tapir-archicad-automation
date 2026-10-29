@@ -1,4 +1,5 @@
 #include "ElementMutationInternal.hpp"
+#include "NativeUndoable.hpp"
 
 #include "ElementCommands.hpp"
 #include "ElementCreationCommands.hpp"
@@ -233,11 +234,15 @@ GS::ObjectState ExecuteTextCreate (
     std::vector<API_Elem_Head> createdHeads;
     createdHeads.reserve (items.GetSize ());
 
+    // D-357: inside a Native transaction the outer command owns the event
+    // bracket, so a nested write never flushes the client queue mid-step.
+    const bool nestedInNativeTransaction = NativeUndoableScopeIsOpen ();
     API_NotifyElementType notification = {};
     notification.notifID = APINotifyElement_BeginEvents;
-    AddElementNotificationClientCommand::ElementEventHandlerProc (&notification);
+    if (!nestedInNativeTransaction)
+        AddElementNotificationClientCommand::ElementEventHandlerProc (&notification);
 
-    const GSErrCode undoError = ACAPI_CallUndoableCommand ("Create Rich Text", [&] () -> GSErrCode {
+    const GSErrCode undoError = NativeUndoableCommand ("Create Rich Text", [&] () -> GSErrCode {
         bool savedAutoTextFlag = false;
         const GSErrCode autoTextErr = ACAPI_AutoText_GetAutoTextFlag (&savedAutoTextFlag);
         if (autoTextErr != NoError) {
@@ -307,15 +312,20 @@ GS::ObjectState ExecuteTextCreate (
 
     notification = {};
     notification.notifID = APINotifyElement_EndEvents;
-    AddElementNotificationClientCommand::ElementEventHandlerProc (&notification);
+    if (!nestedInNativeTransaction)
+        AddElementNotificationClientCommand::ElementEventHandlerProc (&notification);
 
     if (undoError == NoError && callbackError == NoError) {
-        for (const API_Elem_Head& createdHead : createdHeads) {
-            notification = {};
-            notification.notifID = APINotifyElement_New;
-            notification.elemHead = createdHead;
-            AddElementNotificationClientCommand::ElementEventHandlerProc (&notification);
-        }
+        // D-357: New is published only after the outermost undo step
+        // committed; a rolled-back Native transaction discards it.
+        NativeUndoableAfterCommit ([createdHeads] () {
+            for (const API_Elem_Head& createdHead : createdHeads) {
+                API_NotifyElementType created = {};
+                created.notifID = APINotifyElement_New;
+                created.elemHead = createdHead;
+                AddElementNotificationClientCommand::ElementEventHandlerProc (&created);
+            }
+        });
     }
 
     if (undoError != NoError) {
@@ -341,7 +351,7 @@ GS::ObjectState ExecuteTextUpdate (
     const bool angleOnlySingleText = items.GetSize () == 1
         && IsAngleOnlyTextItem (items[0]);
 
-    const GSErrCode undoError = ACAPI_CallUndoableCommand (
+    const GSErrCode undoError = NativeUndoableCommand (
         angleOnlySingleText ? "Rotate Rich Text" : "Update Rich Text",
         [&] () -> GSErrCode {
         if (angleOnlySingleText) {

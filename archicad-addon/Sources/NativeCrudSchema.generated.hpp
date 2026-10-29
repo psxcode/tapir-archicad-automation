@@ -33,13 +33,13 @@ struct TypeCapabilities {
 };
 
 // NATIVE_SCHEMA_LIMITS.
-constexpr GSSize MaxItems = 25;
+constexpr GSSize MaxItems = 500;
 constexpr GSSize MaxDiscoverReferences = 100;
 constexpr GSSize MaxHistoryEntries = 25;
 constexpr GSSize ImpactClosure = 256;
 
-constexpr const char* CapabilitySchemaHash = "2d0676a3fb6c40100f07a7492d9a9e8eec1e29dc6646c31ba8d594dfe25a9d8e";
-constexpr const char* CapabilitySchemaV3Hash = "602487f50c363bc7c99cf96bb96a9f5d4a9331473dde8be8bcd2f884230b80b5";
+constexpr const char* CapabilitySchemaHash = "d7cdede420b0310588eb1c5d9c387204aad15cd6db6ce398976b8f6f8cc4298e";
+constexpr const char* CapabilitySchemaV3Hash = "71f8a282bf391acccaafa16a081541d7dbdf15472495f2f78cd918b9454ea4ce";
 
 constexpr const char* CreatePlacementFields[] = { "storyIndex" };
 constexpr GSSize CreatePlacementFieldCount = sizeof (CreatePlacementFields) / sizeof (CreatePlacementFields[0]);

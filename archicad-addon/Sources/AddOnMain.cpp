@@ -626,6 +626,10 @@ GSErrCode Initialize (void)
             elementCommands, "1.0.0",
             "Executes one typed native forward mutation and returns a factual receipt."
         );
+        err |= RegisterCommand<MutateNativeTransactionCommand> (
+            elementCommands, "1.0.0",
+            "Executes several typed native operations as one all-or-nothing Archicad undo step (D-357)."
+        );
         err |= RegisterCommand<NormalizeTextClusterCommand> (
             elementCommands, "1.0.0",
             "Atomically replaces one simulated multiline Text cluster with one wrapped Text element."

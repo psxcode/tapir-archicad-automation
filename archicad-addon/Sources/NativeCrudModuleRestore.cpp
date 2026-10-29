@@ -8,6 +8,7 @@
 // set and the module hotlink nodes are equal to the ones before it (R1); anything else is an unknown outcome.
 
 #include "NativeCrudInternal.hpp"
+#include "NativeUndoable.hpp"
 
 #include "MigrationHelper.hpp"
 #include "NativeDimensionCreateWire.hpp"
@@ -174,7 +175,7 @@ ModuleRestoreOutcome ExecuteModuleRestore (
         failureMessage = message;
         return error != NoError ? error : APIERR_GENERAL;
     };
-    const GSErrCode undoError = ACAPI_CallUndoableCommand ("Restore From Checkpoint", [&] () -> GSErrCode {
+    const GSErrCode undoError = NativeUndoableCommand ("Restore From Checkpoint", [&] () -> GSErrCode {
         API_HotlinkNode node = {};
         node.type = APIHotlink_Module;
         node.storyRangeType = APIHotlink_AllStories;

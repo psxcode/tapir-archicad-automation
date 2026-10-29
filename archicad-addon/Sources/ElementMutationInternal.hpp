@@ -10,7 +10,7 @@
 // namespace.  Nothing here is part of the MCP or GraphQL surface.
 namespace ElementMutationInternal {
 
-constexpr GSSize MaxMutationItems = 256;
+constexpr GSSize MaxMutationItems = 500;
 
 struct ElementTypeSpec {
     API_ElemTypeID typeID;

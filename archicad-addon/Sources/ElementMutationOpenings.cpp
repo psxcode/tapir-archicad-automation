@@ -1,4 +1,5 @@
 #include "ElementMutationInternal.hpp"
+#include "NativeUndoable.hpp"
 
 #include "ElementCommands.hpp"
 #include "ElementCreationCommands.hpp"
@@ -176,10 +177,11 @@ GS::ObjectState ExecuteDoorCreate (const GS::Array<GS::ObjectState>& items, GS::
     const auto& elements = response.AddList<GS::ObjectState> ("elements");
     GSErrCode callbackError = NoError;
     GS::UniString failureStage = "not-started";
-    if (items.GetSize () != 1) return CreateErrorResponse (APIERR_BADPARS, "Door typed CREATE accepts one exact template case per request.");
+    if (items.IsEmpty ()) return CreateErrorResponse (APIERR_BADPARS, "Door typed CREATE requires at least one item.");
 
-    const GSErrCode undoError = ACAPI_CallUndoableCommand ("Create Native Door from Exact Template", [&] () -> GSErrCode {
-        const GS::ObjectState& item = items[0];
+    // D-357: every item is created in the same undo scope; the first failure
+    // returns its error so Archicad discards the whole batch.
+    const auto createOne = [&] (const GS::ObjectState& item) -> GSErrCode {
         const GS::ObjectState* sourceId = item.Get ("cloneSourceElementId");
         const GS::ObjectState* payload = item.Get ("payload");
         if (sourceId == nullptr || payload == nullptr) return APIERR_BADPARS;
@@ -194,9 +196,9 @@ GS::ObjectState ExecuteDoorCreate (const GS::Array<GS::ObjectState>& items, GS::
         failureStage = "read-exact-door-template";
         GSErrCode error = sourceGuid == APINULLGuid ? APIERR_BADPARS : ACAPI_Element_Get (&source);
         if (error == NoError && (GetElemTypeId (source.header) != API_DoorID || source.header.guid != sourceGuid)) error = APIERR_BADID;
+        // D-357: a marker-bearing template is accepted; the created copy is
+        // placed without sub-elements, so it carries no marker of its own.
         const API_Guid sourceMarkerGuid = error == NoError ? source.door.openingBase.markGuid : APINULLGuid;
-        const bool sourceMarkerless = sourceMarkerGuid == APINULLGuid;
-        if (error == NoError && !sourceMarkerless) error = APIERR_BADPARS;
 
         API_Element host = {};
         if (error == NoError) {
@@ -215,7 +217,7 @@ GS::ObjectState ExecuteDoorCreate (const GS::Array<GS::ObjectState>& items, GS::
         }
         if (error != NoError) {
             callbackError = error;
-            elements (CreateFailedExecutionResult (error, "Exact markerless Door template, host story, or complete template memo was unavailable."));
+            elements (CreateFailedExecutionResult (error, "Exact Door template, host story, or complete template memo was unavailable."));
             return error;
         }
 
@@ -268,16 +270,23 @@ GS::ObjectState ExecuteDoorCreate (const GS::Array<GS::ObjectState>& items, GS::
                 failureStage = "verify-template-preserved";
                 error = ACAPI_Element_Get (&sourceAfter);
                 if (error == NoError && (!SameDoorSourceScalarState (source, sourceAfter)
-                    || sourceAfter.door.openingBase.markGuid != APINULLGuid)) error = APIERR_COMMANDFAILED;
+                    || sourceAfter.door.openingBase.markGuid != sourceMarkerGuid)) error = APIERR_COMMANDFAILED;
             }
             if (error == NoError) elements (CreateElementIdObjectState (created.header.guid));
         }
         if (error != NoError) {
             callbackError = error;
-            GS::ObjectState failed = CreateFailedExecutionResult (error, "Door typed CREATE failed exact markerless-template, host, or factual preservation postconditions.");
+            GS::ObjectState failed = CreateFailedExecutionResult (error, "Door typed CREATE failed exact template, host, or factual preservation postconditions.");
             failed.Add ("failureStage", failureStage);
             elements (failed);
             return error;
+        }
+        return NoError;
+    };
+    const GSErrCode undoError = NativeUndoableCommand ("Create Native Door from Exact Template", [&] () -> GSErrCode {
+        for (const GS::ObjectState& item : items) {
+            const GSErrCode itemError = createOne (item);
+            if (itemError != NoError) return itemError;
         }
         return NoError;
     });
@@ -300,7 +309,7 @@ GS::ObjectState ExecuteDoorUpdate (const GS::Array<GS::ObjectState>& items, cons
 #else
     (void) faultAfterFirstApplied;
 #endif
-    const GSErrCode undoError = ACAPI_CallUndoableCommand ("Update Native Doors", [&] () -> GSErrCode {
+    const GSErrCode undoError = NativeUndoableCommand ("Update Native Doors", [&] () -> GSErrCode {
         for (GSSize index = 0; index < static_cast<GSSize> (items.GetSize ()); ++index) {
             const GS::ObjectState& item = items[index];
             if (callbackError != NoError) {
@@ -315,8 +324,6 @@ GS::ObjectState ExecuteDoorUpdate (const GS::Array<GS::ObjectState>& items, cons
             GSErrCode error = guid == APINULLGuid ? APIERR_BADPARS : ACAPI_Element_Get (&element);
             if (error == NoError && (GetElemTypeId (element.header) != API_DoorID || element.header.guid != guid)) error = APIERR_BADID;
             const API_Element before = element;
-            // Marker-bearing and unresolved targets remain outside this packet.
-            if (error == NoError && before.door.openingBase.markGuid != APINULLGuid) error = APIERR_BADPARS;
             API_Element mask = {};
             ACAPI_ELEMENT_MASK_CLEAR (mask);
             bool changed = false;
@@ -340,9 +347,9 @@ GS::ObjectState ExecuteDoorUpdate (const GS::Array<GS::ObjectState>& items, cons
             if (error == NoError && item.Get ("oSide", flag)) { element.door.openingBase.oSide = flag; ACAPI_ELEMENT_MASK_SET (mask, API_WindowType, openingBase.oSide); changed = true; }
             if (error == NoError && !changed) error = APIERR_BADPARS;
             if (error == NoError) {
-                // This writer admits only markerless Doors. Use the established
-                // scalar element-change route; ChangeExt is needed for linked
-                // marker sub-elements, which are outside this packet.
+                // D-357: marker-bearing Doors are admitted. The scalar
+                // element-change route keeps the linked marker as is; the
+                // postcondition below requires the same markGuid afterwards.
                 failureStage = "change-door";
                 error = ACAPI_Element_Change (&element, &mask, nullptr, 0, true);
             }
@@ -466,11 +473,13 @@ GS::ObjectState ExecuteWindowCreate (const GS::Array<GS::ObjectState>& items, GS
 {
     GS::ObjectState response;
     const auto& created = response.AddList<GS::ObjectState> ("elements");
-    if (items.GetSize () != 1) return CreateErrorResponse (APIERR_BADPARS, "Window typed CREATE accepts one exact same-file template.");
+    if (items.IsEmpty ()) return CreateErrorResponse (APIERR_BADPARS, "Window typed CREATE requires at least one item.");
     GS::UniString failureStage = "not-started";
-    const GSErrCode undoError = ACAPI_CallUndoableCommand ("Create Native Window from Exact Markerless Template", [&] () -> GSErrCode {
-        const GS::ObjectState* sourceId = items[0].Get ("cloneSourceElementId");
-        const GS::ObjectState* payload = items[0].Get ("payload");
+    // D-357: every item is created in the same undo scope; the first failure
+    // returns its error so Archicad discards the whole batch.
+    const auto createOne = [&] (const GS::ObjectState& item) -> GSErrCode {
+        const GS::ObjectState* sourceId = item.Get ("cloneSourceElementId");
+        const GS::ObjectState* payload = item.Get ("payload");
         if (sourceId == nullptr || payload == nullptr) return APIERR_BADPARS;
         const API_Guid sourceGuid = GetGuidFromObjectState (*sourceId);
         const API_Guid hostGuid = payload->Get ("ownerWallId") == nullptr ? APINULLGuid : GetGuidFromObjectState (*payload->Get ("ownerWallId"));
@@ -481,7 +490,10 @@ GS::ObjectState ExecuteWindowCreate (const GS::Array<GS::ObjectState>& items, GS
         failureStage = "read-window-template";
         GSErrCode error = sourceGuid == APINULLGuid ? APIERR_BADPARS : ACAPI_Element_Get (&source);
         if (error == NoError && (GetElemTypeId (source.header) != API_WindowID || source.header.guid != sourceGuid
-            || source.window.openingBase.markGuid != APINULLGuid || !WindowNativeTopologySupported (source))) error = APIERR_BADPARS;
+            || !WindowNativeTopologySupported (source))) error = APIERR_BADPARS;
+        // D-357: a marker-bearing template is accepted; the created copy is
+        // placed without sub-elements, so it carries no marker of its own.
+        const API_Guid sourceMarkerGuid = error == NoError ? source.window.openingBase.markGuid : APINULLGuid;
         API_LibPart sourcePart = {};
         LibraryPartLocationGuard sourcePartGuard (sourcePart);
         if (error == NoError) {
@@ -557,7 +569,7 @@ GS::ObjectState ExecuteWindowCreate (const GS::Array<GS::ObjectState>& items, GS
                 sourceAfter.header.guid = sourceGuid;
                 failureStage = "verify-window-template-preserved";
                 error = ACAPI_Element_Get (&sourceAfter);
-                if (error == NoError && (!SameWindowSourceScalarState (source, sourceAfter) || sourceAfter.window.openingBase.markGuid != APINULLGuid)) error = APIERR_COMMANDFAILED;
+                if (error == NoError && (!SameWindowSourceScalarState (source, sourceAfter) || sourceAfter.window.openingBase.markGuid != sourceMarkerGuid)) error = APIERR_COMMANDFAILED;
                 API_LibPart sourcePartAfter = {};
                 LibraryPartLocationGuard sourcePartAfterGuard (sourcePartAfter);
                 if (error == NoError) {
@@ -570,6 +582,13 @@ GS::ObjectState ExecuteWindowCreate (const GS::Array<GS::ObjectState>& items, GS
             if (error == NoError) created (CreateElementIdObjectState (after.header.guid));
         }
         return error;
+    };
+    const GSErrCode undoError = NativeUndoableCommand ("Create Native Window from Exact Template", [&] () -> GSErrCode {
+        for (const GS::ObjectState& item : items) {
+            const GSErrCode itemError = createOne (item);
+            if (itemError != NoError) return itemError;
+        }
+        return NoError;
     });
     if (undoError != NoError) { response.Add ("transactionRolledBack", true); response.Add ("transactionError", undoError); response.Add ("failureStage", failureStage); }
     return response;
@@ -586,7 +605,7 @@ GS::ObjectState ExecuteWindowUpdate (const GS::Array<GS::ObjectState>& items, co
 #else
     (void) faultAfterFirstApplied;
 #endif
-    const GSErrCode undoError = ACAPI_CallUndoableCommand ("Update Native Windows", [&] () -> GSErrCode {
+    const GSErrCode undoError = NativeUndoableCommand ("Update Native Windows", [&] () -> GSErrCode {
         for (GSSize index = 0; index < static_cast<GSSize> (items.GetSize ()); ++index) {
             const GS::ObjectState& item = items[index];
             const GS::ObjectState* id = item.Get ("elementId");
@@ -605,7 +624,9 @@ GS::ObjectState ExecuteWindowUpdate (const GS::Array<GS::ObjectState>& items, co
                     || host.header.floorInd != element.header.floorInd)) error = APIERR_BADID;
             }
             const API_Element before = element;
-            if (error == NoError && (before.window.openingBase.markGuid != APINULLGuid || !WindowNativeTopologySupported (before))) error = APIERR_BADPARS;
+            // D-357: marker-bearing Windows are admitted; the postcondition
+            // requires the same markGuid afterwards.
+            if (error == NoError && !WindowNativeTopologySupported (before)) error = APIERR_BADPARS;
             API_LibPart libraryBefore = {};
             LibraryPartLocationGuard libraryBeforeGuard (libraryBefore);
             if (error == NoError) {
@@ -632,7 +653,7 @@ GS::ObjectState ExecuteWindowUpdate (const GS::Array<GS::ObjectState>& items, co
             if (error == NoError) { after.header.guid = guid; failureStage = "read-window-postcondition"; error = ACAPI_Element_Get (&after); }
             if (error == NoError && (after.header.guid != before.header.guid || after.header.floorInd != before.header.floorInd || after.header.layer != before.header.layer
                 || after.window.owner != before.window.owner || after.window.openingBase.libInd != before.window.openingBase.libInd
-                || after.window.openingBase.markGuid != APINULLGuid || after.window.fixPoint != before.window.fixPoint
+                || after.window.openingBase.markGuid != before.window.openingBase.markGuid || after.window.fixPoint != before.window.fixPoint
                 || after.window.openingBase.verticalLink.linkType != before.window.openingBase.verticalLink.linkType
                 || after.window.openingBase.verticalLink.linkValue != before.window.openingBase.verticalLink.linkValue
                 || after.window.directionType != before.window.directionType || after.window.reveal != before.window.reveal

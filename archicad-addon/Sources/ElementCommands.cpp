@@ -1,4 +1,5 @@
 #include "ElementCommands.hpp"
+#include "NativeUndoable.hpp"
 #include "BoundedRectangleReadDecision.hpp"
 #include "ElementGDLParameterCommands.hpp"
 #include "MigrationHelper.hpp"
@@ -2478,7 +2479,7 @@ GS::ObjectState SetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
     bool nativeCrudFaultInjected = false;
 #endif
     GSSize nativeCrudAppliedCount = 0;
-    const GSErrCode undoError = ACAPI_CallUndoableCommand ("SetDetailsOfElementsCommand", [&]() -> GSErrCode {
+    const GSErrCode undoError = NativeUndoableCommand ("SetDetailsOfElementsCommand", [&]() -> GSErrCode {
         for (const GS::ObjectState& elementWithDetails : sortedElements) {
             const GS::ObjectState* elementId = elementWithDetails.Get ("elementId");
             if (elementId == nullptr) {
@@ -5463,7 +5464,7 @@ GS::ObjectState DeleteElementsCommand::Execute (const GS::ObjectState& parameter
 
     GSErrCode err = NoError;
 
-    const GSErrCode undoErr = ACAPI_CallUndoableCommand ("DeleteElementsCommand", [&]() {
+    const GSErrCode undoErr = NativeUndoableCommand ("DeleteElementsCommand", [&]() {
         err = ACAPI_Element_Delete (elements.Transform<API_Guid> (GetGuidFromElementsArrayItem));
 
         return err;

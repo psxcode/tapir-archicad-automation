@@ -556,7 +556,9 @@ GS::Optional<GS::UniString> ReadRequestedGuids (
     if (!parameters.Get ("guids", guids) || guids.IsEmpty ())
         return GS::UniString ("guids must contain at least one exact GUID.");
     if (guids.GetSize () > MaxMutationItems)
-        return GS::UniString ("guids may contain at most 25 exact GUIDs.");
+        // Exact snapshot READS keep the generated read cap (MaxMutationItems);
+        // D-357 write operations use MaxNativeWriteItems instead.
+        return GS::UniString::Printf ("guids may contain at most %d exact GUIDs.", static_cast<int> (MaxMutationItems));
     for (const GS::UniString& value : guids) {
         const API_Guid guid = APIGuidFromString (value.ToCStr ());
         if (guid == APINULLGuid)

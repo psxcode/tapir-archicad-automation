@@ -1,4 +1,5 @@
 #include "ExtendedElementCommands.hpp"
+#include "NativeUndoable.hpp"
 
 #include "MigrationHelper.hpp"
 #include "NotificationCommands.hpp"
@@ -2704,18 +2705,22 @@ GS::ObjectState ExecuteCreateWithElements (const GS::String& commandName, Func&&
 {
     GS::Array<GS::ObjectState> results;
 
+    // D-357: inside a Native transaction the outer command owns the bracket.
+    const bool nestedInNativeTransaction = NativeUndoableScopeIsOpen ();
     API_NotifyElementType notification = {};
     notification.notifID = APINotifyElement_BeginEvents;
-    AddElementNotificationClientCommand::ElementEventHandlerProc (&notification);
+    if (!nestedInNativeTransaction)
+        AddElementNotificationClientCommand::ElementEventHandlerProc (&notification);
 
-    const GSErrCode undoErr = ACAPI_CallUndoableCommand (commandName, [&]() -> GSErrCode {
+    const GSErrCode undoErr = NativeUndoableCommand (commandName, [&]() -> GSErrCode {
         createFunc (results);
         return NoError;
     });
 
     notification = {};
     notification.notifID = APINotifyElement_EndEvents;
-    AddElementNotificationClientCommand::ElementEventHandlerProc (&notification);
+    if (!nestedInNativeTransaction)
+        AddElementNotificationClientCommand::ElementEventHandlerProc (&notification);
 
     GS::ObjectState response = CreateElementListResponse (results);
     if (undoErr != NoError) {
@@ -2733,7 +2738,7 @@ GS::ObjectState ExecuteModifyWithResults (const GS::String& commandName, Func&& 
 {
     GS::Array<GS::ObjectState> results;
 
-    const GSErrCode undoErr = ACAPI_CallUndoableCommand (commandName, [&]() -> GSErrCode {
+    const GSErrCode undoErr = NativeUndoableCommand (commandName, [&]() -> GSErrCode {
         modifyFunc (results);
         if (atomic) {
             for (const GS::ObjectState& result : results) {
@@ -9823,7 +9828,7 @@ GS::ObjectState ExecuteNativeDimensionCreateCandidate (const GS::ObjectState& pa
 	GSErrCode callbackError = APIERR_CANCEL, transactionError = APIERR_CANCEL;
 	bool dispatchAttempted = false, injectedFault = false, exactReadback = false, createdInCallback = false;
 	API_Guid knownGuid = APINULLGuid;
-	transactionError = ACAPI_CallUndoableCommand ("Create Native Static Measured Dimension Candidate", [&] () -> GSErrCode {
+	transactionError = NativeUndoableCommand ("Create Native Static Measured Dimension Candidate", [&] () -> GSErrCode {
 		if (!CaptureNativeDimensionCreateContext (expectedRunId, expectedProjectPath, expectedFileScopeKey, contextInsideBefore, contextInsideFacts)
 			|| !NativeDimensionCreateWire::ValidateExpectedContext (expected, contextInsideBefore).accepted
 			|| !NativeDimensionCreateWire::ValidateExpectedContext (contextBefore, contextInsideBefore).accepted)
