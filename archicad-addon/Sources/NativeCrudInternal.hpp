@@ -171,4 +171,23 @@ GS::Optional<GS::UniString> ValidateMutationItems (
     const GS::UniString& typeName,
     const GS::Array<GS::ObjectState>& items);
 
+// D-347 stage 3b (D-350): a CREATE whose items restore deleted elements from one checkpoint module.
+bool IsModuleRestoreRequest (const GS::Array<GS::ObjectState>& items);
+GS::Optional<GS::UniString> ValidateModuleRestoreItem (
+    const GS::UniString& typeName,
+    const GS::ObjectState& item,
+    const GS::ObjectState& first);
+struct ModuleRestoreOutcome {
+    /** Refused before anything was placed: the error response, nothing to record. */
+    GS::Optional<GS::ObjectState> refusal;
+    /** The command ran: created elements in item order, completion, rollback and moduleRestore evidence. */
+    GS::ObjectState mutationResult;
+    /** Archicad rolled the command back and the project's GUIDs and module nodes are as before it (R1). */
+    bool rollbackProven = false;
+};
+ModuleRestoreOutcome ExecuteModuleRestore (
+    const GS::UniString& operationId,
+    const GS::UniString& typeName,
+    const GS::Array<GS::ObjectState>& items);
+
 } // namespace NativeCrudInternal

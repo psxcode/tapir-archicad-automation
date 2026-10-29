@@ -506,6 +506,10 @@ GS::ObjectState BuildReceipt (
         bool groupModeRestored = false;
         if (mutationDiagnostics->Get ("groupModeRestored", groupModeRestored))
             transaction.Add ("groupModeRestored", groupModeRestored);
+        // D-347 stage 3b: the translation, the old-to-new pairs and the rollback proof of a module restore.
+        const GS::ObjectState* moduleRestore = mutationDiagnostics->Get ("moduleRestore");
+        if (moduleRestore != nullptr)
+            transaction.Add ("moduleRestore", *moduleRestore);
         Int32 groupModeRestoreError = 0;
         if (mutationDiagnostics->Get ("groupModeRestoreError", groupModeRestoreError))
             transaction.Add ("groupModeRestoreError", groupModeRestoreError);

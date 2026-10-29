@@ -12,6 +12,7 @@
 #include <cmath>
 #include <initializer_list>
 #include <limits>
+#include <string>
 #include <vector>
 
 using namespace NativeCrudInternal;
@@ -528,6 +529,71 @@ GS::Optional<GS::UniString> ValidateNativeCreatePlacement (
     return {};
 }
 
+bool IsModuleRestoreRequest (const GS::Array<GS::ObjectState>& items)
+{
+    for (const GS::ObjectState& item : items)
+        if (item.Get ("moduleRestore") != nullptr) return true;
+    return false;
+}
+
+namespace {
+
+bool ReadModuleBounds (const GS::ObjectState& restore, double (&bounds)[4])
+{
+    const GS::ObjectState* box = restore.Get ("bounds");
+    if (box == nullptr || !HasOnlyObjectStateFields (*box, { "minX", "minY", "maxX", "maxY" })) return false;
+    if (!box->Get ("minX", bounds[0]) || !box->Get ("minY", bounds[1]) || !box->Get ("maxX", bounds[2]) || !box->Get ("maxY", bounds[3]))
+        return false;
+    for (const double value : bounds)
+        if (!std::isfinite (value)) return false;
+    return bounds[0] <= bounds[2] && bounds[1] <= bounds[3];
+}
+
+bool IsLowerHex64 (const GS::UniString& value)
+{
+    if (value.GetLength () != 64) return false;
+    const std::string text (value.ToCStr (0, MaxUSize, CC_UTF8).Get ());
+    return text.size () == 64 && text.find_first_not_of ("0123456789abcdef") == std::string::npos;
+}
+
+} // namespace
+
+GS::Optional<GS::UniString> ValidateModuleRestoreItem (
+    const GS::UniString& typeName,
+    const GS::ObjectState& item,
+    const GS::ObjectState& first)
+{
+    if (typeName == "Door" || typeName == "Window" || typeName == "Zone")
+        return GS::UniString ("A module restore brings back drafting elements only, not Door, Window or Zone.");
+    const GS::ObjectState* restore = item.Get ("moduleRestore");
+    const GS::ObjectState* payload = item.Get ("payload");
+    const GS::ObjectState* absent = item.Get ("absentElementId");
+    GS::UniString modulePath;
+    GS::UniString sha256;
+    double bounds[4] = {};
+    if (restore == nullptr || !HasOnlyObjectStateFields (*restore, { "modulePath", "sha256", "bounds" })
+        || !restore->Get ("modulePath", modulePath) || !modulePath.ToLowerCase ().EndsWith (GS::UniString (".mod"))
+        || !restore->Get ("sha256", sha256) || !IsLowerHex64 (sha256) || !ReadModuleBounds (*restore, bounds))
+        return GS::UniString ("moduleRestore needs a .mod path, a lowercase SHA-256 and finite ordered bounds.");
+    if (payload == nullptr || !payload->GetFieldNames ().IsEmpty () || item.Get ("cloneSourceElementId") != nullptr || item.Get ("historySnapshotRef") != nullptr)
+        return GS::UniString ("A module restore item has an empty payload and no other source.");
+    if (absent == nullptr || GetGuidFromObjectState (*absent) == APINULLGuid)
+        return GS::UniString ("A module restore item names the deleted element in absentElementId.");
+    const GS::ObjectState* firstRestore = first.Get ("moduleRestore");
+    const GS::ObjectState* placement = item.Get ("placement");
+    const GS::ObjectState* firstPlacement = first.Get ("placement");
+    GS::UniString firstPath;
+    GS::UniString firstSha;
+    Int32 story = 0;
+    Int32 firstStory = 0;
+    if (firstRestore == nullptr || !firstRestore->Get ("modulePath", firstPath) || !firstRestore->Get ("sha256", firstSha)
+        || firstPath != modulePath || firstSha != sha256
+        || placement == nullptr || firstPlacement == nullptr || !placement->Get ("storyIndex", story) || !firstPlacement->Get ("storyIndex", firstStory)
+        || story != firstStory)
+        return GS::UniString ("Every item of a module restore names the same module, digest and story.");
+    return {};
+}
+
 GS::Optional<GS::UniString> ValidateMutationItems (
     const GS::UniString& operation,
     const GS::UniString& typeName,
@@ -536,10 +602,27 @@ GS::Optional<GS::UniString> ValidateMutationItems (
     if (items.IsEmpty () || items.GetSize () > MaxMutationItems)
         return GS::UniString ("items must contain between 1 and 25 entries.");
     GS::Array<API_Guid> seenGuids;
+    const bool moduleRestore = operation == "create" && IsModuleRestoreRequest (items);
+    if (moduleRestore) {
+        for (const GS::ObjectState& item : items)
+            if (item.Get ("moduleRestore") == nullptr)
+                return GS::UniString ("A module restore CREATE restores every item from the module.");
+    }
     for (const GS::ObjectState& item : items) {
         if (operation == "create") {
-            if (!HasOnlyObjectStateFields (item, { "payload", "placement", "cloneSourceElementId", "historySnapshotRef", "absentElementId" }))
-                return GS::UniString ("CREATE items accept only payload, placement, one source reference and absentElementId.");
+            if (!HasOnlyObjectStateFields (item, { "payload", "placement", "cloneSourceElementId", "historySnapshotRef", "absentElementId", "moduleRestore" }))
+                return GS::UniString ("CREATE items accept only payload, placement, one source reference, absentElementId and moduleRestore.");
+            // D-347 stage 3b: a module restore places one checkpoint module for all its items; each item
+            // names the deleted element it brings back and its recorded bounds.
+            if (moduleRestore) {
+                const GS::Optional<GS::UniString> moduleError = ValidateModuleRestoreItem (typeName, item, items[0]);
+                if (moduleError.HasValue ()) return moduleError;
+                const API_Guid absent = GetGuidFromObjectState (*item.Get ("absentElementId"));
+                if (seenGuids.Contains (absent))
+                    return GS::UniString ("A module restore names one deleted element twice.");
+                seenGuids.Push (absent);
+                continue;
+            }
             // D-347 stage 2b: a recreation names the deleted element it replaces; the command refuses
             // when that element exists, so an Undo between plan and write cannot yield a duplicate.
             if (item.Get ("absentElementId") != nullptr) {

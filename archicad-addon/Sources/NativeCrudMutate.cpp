@@ -427,6 +427,8 @@ GS::ObjectState MutateNativeElementsCommand::Execute (const GS::ObjectState& par
     if (!parameters.Get ("items", items)) return CreateErrorResponse (APIERR_BADPARS, "items is required.");
     const GS::Optional<GS::UniString> itemError = ValidateMutationItems (operation, typeName, items);
     if (itemError.HasValue ()) return ScopeError (itemError);
+    // D-347 stage 3b: the items carry no payload; the module holds the elements.
+    const bool moduleRestore = operation == "create" && IsModuleRestoreRequest (items);
     if (operation == "create") {
         const GS::Optional<GS::UniString> placementError = ValidateNativeCreatePlacement (typeName, items);
         if (placementError.HasValue ()) return ScopeError (placementError);
@@ -446,12 +448,12 @@ GS::ObjectState MutateNativeElementsCommand::Execute (const GS::ObjectState& par
         if (semanticMetadata->Get ("nativeCrudTestFaultAfterFirstApplied", faultRequested) && faultRequested)
             return CreateErrorResponse (APIERR_BADPARS, "Line test-fault metadata is unavailable to Native CRUD writes (D-307).");
     }
-    if (typeID == API_ZoneID && (operation == "create" || operation == "update")) {
+    if (typeID == API_ZoneID && (operation == "create" || operation == "update") && !moduleRestore) {
         const GS::Optional<GS::UniString> typedError = ValidateZoneTypedWriter (operation, items);
         if (typedError.HasValue ())
             return CreateErrorResponse (APIERR_BADPARS, typedError.Get ());
     }
-    if (typeID == API_ArcID && (operation == "create" || operation == "update")) {
+    if (typeID == API_ArcID && (operation == "create" || operation == "update") && !moduleRestore) {
         // The proven Arc fields use the typed payload validation and the
         // native undoable dispatcher.
         const GS::Optional<GS::UniString> typedError = ValidateArcTypedPayloads (operation, items);
@@ -462,7 +464,7 @@ GS::ObjectState MutateNativeElementsCommand::Execute (const GS::ObjectState& par
         if (semanticMetadata->Get ("nativeCrudTestFaultAfterFirstApplied", faultRequested) && faultRequested)
             return CreateErrorResponse (APIERR_BADPARS, "Arc test-fault metadata is unavailable to Native CRUD writes (D-307).");
     }
-    if (typeID == API_HatchID && (operation == "create" || operation == "update")) {
+    if (typeID == API_HatchID && (operation == "create" || operation == "update") && !moduleRestore) {
         if (HasNativeCrudTestFaultMetadata (semanticMetadata))
             return CreateErrorResponse (APIERR_BADPARS, "Hatch test-fault metadata is unavailable to Native CRUD writes (D-307).");
         const GS::Optional<GS::UniString> typedError = ValidateHatchTypedPayloads (operation, items);
@@ -585,7 +587,16 @@ GS::ObjectState MutateNativeElementsCommand::Execute (const GS::ObjectState& par
             return CreateErrorResponse (APIERR_BADID, impactTypeError.Get ());
     }
 
-    const GS::ObjectState mutationResult = DispatchMutation (operation, operationId, typeName, items, processControl, semanticMetadata);
+    GS::ObjectState mutationResult;
+    bool moduleRollbackProven = false;
+    if (moduleRestore) {
+        ModuleRestoreOutcome restored = ExecuteModuleRestore (operationId, typeName, items);
+        if (restored.refusal.HasValue ()) return restored.refusal.Get ();
+        mutationResult = restored.mutationResult;
+        moduleRollbackProven = restored.rollbackProven;
+    } else {
+        mutationResult = DispatchMutation (operation, operationId, typeName, items, processControl, semanticMetadata);
+    }
     bool dispatchComplete = true;
     mutationResult.Get ("mutationComplete", dispatchComplete);
     if (mutationResult.Get ("error") != nullptr || mutationResult.Get ("transactionRolledBack") != nullptr) dispatchComplete = false;
@@ -640,7 +651,9 @@ GS::ObjectState MutateNativeElementsCommand::Execute (const GS::ObjectState& par
     const bool complete = dispatchComplete && afterComplete;
     const GS::Array<GS::ObjectState>& primaryAfterIds = operation == "create" ? afterIds : requestedIds;
     const GS::Array<GS::ObjectState>& receiptImpactIds = hasImpactEnvelope ? impactIds : primaryAfterIds;
-    GS::ObjectState receipt = BuildReceipt (scope, operationId, operation, typeName, description, origin, requestHash, before, after, primaryAfterIds, receiptImpactIds, complete, dispatchComplete, semanticMetadata, operatorNote, &mutationResult, nullptr, nullptr, hasImpactEnvelope ? &impact : nullptr);
+    // D-350 R1: a module restore that did not complete is a known refusal only with the rollback proven.
+    const char* statusOverride = moduleRestore && !dispatchComplete && !moduleRollbackProven ? "unknown" : nullptr;
+    GS::ObjectState receipt = BuildReceipt (scope, operationId, operation, typeName, description, origin, requestHash, before, after, primaryAfterIds, receiptImpactIds, complete, dispatchComplete, semanticMetadata, operatorNote, &mutationResult, statusOverride, nullptr, hasImpactEnvelope ? &impact : nullptr);
     GS::ObjectState response;
     bool groupModeRestored = false;
     if (mutationResult.Get ("groupModeRestored", groupModeRestored))
