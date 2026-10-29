@@ -1218,7 +1218,7 @@ GSErrCode Initialize (void)
         );
         err |= RegisterCommand<SaveElementsAsModuleCommand> (
             developerCommands, "0.1.0",
-            "Developer-only history snapshot probe (D-345): saves exact elements into a new module file; not exposed through Production MCP."
+            "History checkpoint (D-347 stage 3, D-349): saves exact elements into a new module file before a destructive Native write; called by the Native coordinator, never an agent tool."
         );
         err |= RegisterCommand<PlaceModuleAsElementsCommand> (
             developerCommands, "0.1.0",

@@ -65,6 +65,7 @@ GS::Optional<GS::UniString> SaveElementsAsModuleCommand::GetResponseSchema () co
             "missing": { "type": "array" },
             "databaseSwitched": { "type": "boolean" },
             "storyBefore": { "type": "integer" },
+            "storyAfter": { "type": "integer" },
             "userOrigin": { "type": "object" },
             "elapsedMs": { "type": "number" }
         }
@@ -121,9 +122,16 @@ GS::ObjectState SaveElementsAsModuleCommand::Execute (const GS::ObjectState& par
     const bool storyGiven = parameters.Get ("storyIndex", storyIndex);
     API_StoryInfo storyInfo = {};
     short storyBefore = 0;
-    if (ACAPI_ProjectSetting_GetStorySettings (&storyInfo) == NoError) {
+    const bool storyKnown = ACAPI_ProjectSetting_GetStorySettings (&storyInfo) == NoError;
+    if (storyKnown) {
         storyBefore = storyInfo.actStory;
         BMKillHandle (reinterpret_cast<GSHandle*> (&storyInfo.data));
+    } else if (storyGiven) {
+        // D-349: without the story on screen it could not be shown again afterwards.
+        if (switchDatabase && ACAPI_Database_ChangeCurrentDatabase (&startingDatabase) != NoError) {
+            return CreateFailedExecutionResult (APIERR_GENERAL, "CHECKPOINT_CONTEXT_NOT_RESTORED: the database on screen did not come back");
+        }
+        return CreateFailedExecutionResult (APIERR_GENERAL, "Failed to read the story on screen");
     }
     const bool switchStory = storyGiven && storyIndex != storyBefore;
     if (switchStory) {
@@ -132,7 +140,18 @@ GS::ObjectState SaveElementsAsModuleCommand::Execute (const GS::ObjectState& par
         goTo.index = static_cast<short> (storyIndex);
         err = ACAPI_ProjectSetting_ChangeStorySettings (&goTo);
         if (err != NoError) {
-            if (switchDatabase) ACAPI_Database_ChangeCurrentDatabase (&startingDatabase);
+            // A failed GoTo may still have moved the story: verify it, and the database, before a plain refusal.
+            bool restored = !switchDatabase || ACAPI_Database_ChangeCurrentDatabase (&startingDatabase) == NoError;
+            API_StoryInfo storyNow = {};
+            if (ACAPI_ProjectSetting_GetStorySettings (&storyNow) == NoError) {
+                restored = restored && storyNow.actStory == storyBefore;
+                BMKillHandle (reinterpret_cast<GSHandle*> (&storyNow.data));
+            } else {
+                restored = false;
+            }
+            if (!restored) {
+                return CreateFailedExecutionResult (err, "CHECKPOINT_CONTEXT_NOT_RESTORED: the story or database on screen did not come back");
+            }
             return CreateFailedExecutionResult (err, "Failed to show the story of the elements");
         }
     }
@@ -160,14 +179,31 @@ GS::ObjectState SaveElementsAsModuleCommand::Execute (const GS::ObjectState& par
 #endif
     const double elapsedMs = ElapsedMs (start);
 
+    // D-349: the story and database on screen must come back; a caller writes nothing when they did not.
+    GSErrCode restoreErr = NoError;
     if (switchStory) {
         API_StoryCmdType goBack = {};
         goBack.action = APIStory_GoTo;
         goBack.index = storyBefore;
-        ACAPI_ProjectSetting_ChangeStorySettings (&goBack);
+        restoreErr = ACAPI_ProjectSetting_ChangeStorySettings (&goBack);
     }
     if (switchDatabase) {
-        ACAPI_Database_ChangeCurrentDatabase (&startingDatabase);
+        const GSErrCode databaseErr = ACAPI_Database_ChangeCurrentDatabase (&startingDatabase);
+        if (restoreErr == NoError) restoreErr = databaseErr;
+    }
+    short storyAfter = storyBefore;
+    if (storyKnown) {
+        API_StoryInfo storyInfoAfter = {};
+        if (ACAPI_ProjectSetting_GetStorySettings (&storyInfoAfter) == NoError) {
+            storyAfter = storyInfoAfter.actStory;
+            BMKillHandle (reinterpret_cast<GSHandle*> (&storyInfoAfter.data));
+        } else if (restoreErr == NoError) {
+            restoreErr = APIERR_GENERAL;
+        }
+    }
+    if (restoreErr == NoError && storyAfter != storyBefore) restoreErr = APIERR_GENERAL;
+    if (restoreErr != NoError) {
+        return CreateFailedExecutionResult (restoreErr, "CHECKPOINT_CONTEXT_NOT_RESTORED: the story or database on screen did not come back after the module save");
     }
     if (err != NoError) {
         return CreateFailedExecutionResult (err, "Failed to save the elements as a module file");
@@ -175,6 +211,7 @@ GS::ObjectState SaveElementsAsModuleCommand::Execute (const GS::ObjectState& par
     response.Add ("savedCount", static_cast<Int32> (heads.GetSize ()));
     response.Add ("databaseSwitched", switchDatabase);
     response.Add ("storyBefore", static_cast<Int32> (storyBefore));
+    response.Add ("storyAfter", static_cast<Int32> (storyAfter));
     response.Add ("userOrigin", GS::ObjectState ("x", userOrigin.x, "y", userOrigin.y, "z", userOrigin.z));
     response.Add ("elapsedMs", elapsedMs);
     return response;
