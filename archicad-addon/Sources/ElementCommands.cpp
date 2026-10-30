@@ -1721,6 +1721,8 @@ GS::ObjectState GetDetailsOfElementsCommand::Execute (const GS::ObjectState& par
                 }
                 typeSpecificDetails.Add ("dimensions", Create3DCoordinateObjectState ({elem.object.xRatio, elem.object.yRatio, zDimension}));
                 typeSpecificDetails.Add ("angle", elem.object.angle);
+                // A mirrored placement flips the object's local x before the rotation (a grid axis then runs the other way).
+                typeSpecificDetails.Add ("reflected", elem.object.reflected);
             } break;
 
             case API_DetailID:

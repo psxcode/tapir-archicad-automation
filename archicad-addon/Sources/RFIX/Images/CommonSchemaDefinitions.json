@@ -4100,6 +4100,10 @@
             },
             "angle": {
                 "type": "number"
+            },
+            "reflected": {
+                "type": "boolean",
+                "description": "The object is placed mirrored: its local x is flipped before the rotation."
             }
         },
         "additionalProperties": false,
